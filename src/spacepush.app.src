@@ -2,8 +2,8 @@
     {description, "Push notifications when a hackerspace opens or closes"},
     {vsn, "0.2.0"},
     {registered, [
-        spacepush_sup, spacepush_registry, spacepush_ratelimit,
-        spacepush_apns, spacepush_dispatcher, spacepush_poller
+        spacepush_sup, spacepush_ratelimit, spacepush_registry,
+        spacepush_outbox, spacepush_apns, spacepush_poller
     ]},
     {mod, {spacepush_app, []}},
     {applications, [kernel, stdlib, crypto, public_key, ssl, inets, gun, cowboy]},
@@ -12,17 +12,27 @@
         {aggregator_url, "https://api.spaceapi.io/"},
         {mainframe_url, "https://status.kreativitaet-trifft-technik.de/api/openState"},
         {poll_interval_ms, 60000},
-        %% A state must hold this long before anyone is notified.
-        {debounce_ms, 120000},
+        %% Aggregator data older than this counts as unknown.
+        {max_data_age_s, 900},
+        %% A new state must be seen this long before anyone is notified.
+        {debounce_s, 120},
+        {tracker_file, "data/tracker.bin"},
         %% HTTP API
         {http_ip, {127, 0, 0, 1}},
         {http_port, 8080},
         %% Use the first X-Forwarded-For address as client, only behind a trusted proxy.
         {trust_proxy, false},
         {rate_limit_per_minute, 30},
-        %% Device registrations
+        %% Device registrations; the apps re-register on every launch.
         {registry_file, "data/registry.dets"},
-        %% APNs token auth; without a key file notifications are only logged.
+        {max_registrations, 10000},
+        {registration_ttl_days, 60},
+        %% Deliveries
+        {outbox_file, "data/outbox.dets"},
+        {delivery_ttl_ms, 3600000},
+        {apns_max_in_flight, 20},
+        {apns_request_timeout_ms, 15000},
+        %% APNs token auth; without a key file deliveries are only logged.
         {apns_key_file, undefined},
         {apns_key_id, undefined},
         {apns_team_id, <<"7E3BJ546SA">>},

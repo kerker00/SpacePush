@@ -30,3 +30,9 @@ payload_encodes_as_json_test() ->
 every_known_state_has_a_key_test_() ->
     [?_assertMatch(<<"PUSH_STATE_", _/binary>>, spacepush_notification:loc_key(State))
      || State <- [open, closed, keyholder, member, open_plus, closing]].
+
+collapse_id_test() ->
+    Id = spacepush_notification:collapse_id({?MAINFRAME, <<"space">>}),
+    ?assertEqual(64, byte_size(Id)),
+    ?assertEqual(Id, spacepush_notification:collapse_id({?MAINFRAME, <<"space">>})),
+    ?assertNotEqual(Id, spacepush_notification:collapse_id({?MAINFRAME, <<"radstelle">>})).

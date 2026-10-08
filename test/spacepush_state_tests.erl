@@ -2,16 +2,20 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(MAINFRAME, <<"https://status.mainframe.io/api/spaceInfo">>).
+%% lastSeen of the fixture entries is 1791485450.
+-define(NOW, 1791485510).
+-define(MAX_AGE, 900).
+-define(DEBOUNCE, 120).
 
-fixture(Name) ->
-    {ok, Body} = file:read_file(filename:join([filename:dirname(?FILE), "fixtures", Name])),
-    Body.
+parse(Body) -> spacepush_state:parse_aggregator(Body, ?NOW, ?MAX_AGE).
 
 states(Observations) ->
     maps:from_list([{Name, State} || {_Topic, Name, State} <- Observations]).
 
+%% Parsing
+
 aggregator_test() ->
-    Observations = spacepush_state:parse_aggregator(fixture("aggregator.json")),
+    Observations = parse(spacepush_test_util:fixture("aggregator.json")),
     ?assertEqual(
         #{
             <<"Nerd2Nerd">> => open,
@@ -26,15 +30,47 @@ aggregator_test() ->
     ?assert(lists:all(fun({{_Url, Room}, _, _}) -> Room =:= <<"space">> end, Observations)).
 
 aggregator_skips_mainframe_test() ->
-    Observations = spacepush_state:parse_aggregator(fixture("aggregator.json")),
-    ?assertNot(lists:keymember(<<"Mainframe">>, 2, Observations)).
+    ?assertNot(lists:keymember(<<"Mainframe">>, 2, parse(spacepush_test_util:fixture("aggregator.json")))).
 
 aggregator_skips_broken_entries_test() ->
-    Body = <<"[42, {\"url\": \"https://a.example/\", \"data\": {\"space\": \"A\"}}, {\"url\": 1}, {\"data\": null}]">>,
-    ?assertEqual([{{<<"https://a.example/">>, <<"space">>}, <<"A">>, unknown}], spacepush_state:parse_aggregator(Body)).
+    Body = <<"[42, {\"url\": \"https://a.example/\", \"lastSeen\": 1791485450, \"data\": {\"space\": \"A\"}},"
+             " {\"url\": 1}, {\"data\": null}]">>,
+    ?assertEqual([{{<<"https://a.example/">>, <<"space">>}, <<"A">>, unknown}], parse(Body)).
+
+aggregator_accepts_items_object_test() ->
+    Body = <<"{\"items\": [{\"url\": \"https://a.example/\", \"lastSeen\": 1791485450,"
+             " \"data\": {\"space\": \"A\", \"state\": {\"open\": true}}}]}">>,
+    ?assertEqual([{{<<"https://a.example/">>, <<"space">>}, <<"A">>, open}], parse(Body)).
+
+entry(Extra) ->
+    Entry = maps:merge(
+        #{
+            <<"url">> => <<"https://a.example/">>,
+            <<"lastSeen">> => ?NOW - 60,
+            <<"data">> => #{<<"space">> => <<"A">>, <<"state">> => #{<<"open">> => true}}
+        },
+        Extra
+    ),
+    [{_Topic, _Name, State}] = parse(iolist_to_binary(json:encode([Entry]))),
+    State.
+
+fresh_data_counts_test() ->
+    ?assertEqual(open, entry(#{})).
+
+stale_data_is_unknown_test() ->
+    ?assertEqual(unknown, entry(#{<<"lastSeen">> => 1})).
+
+missing_last_seen_is_unknown_test() ->
+    ?assertEqual(unknown, entry(#{<<"lastSeen">> => null})).
+
+unreachable_endpoint_is_unknown_test() ->
+    ?assertEqual(unknown, entry(#{<<"validationResult">> => #{<<"reachable">> => false}})).
+
+invalid_schema_still_counts_test() ->
+    ?assertEqual(open, entry(#{<<"valid">> => false, <<"validationResult">> => #{<<"reachable">> => true}})).
 
 mainframe_test() ->
-    Observations = spacepush_state:parse_mainframe(fixture("mainframe-openstate.json")),
+    Observations = spacepush_state:parse_mainframe(spacepush_test_util:fixture("mainframe-openstate.json")),
     ?assertEqual(
         lists:sort([
             {{?MAINFRAME, <<"space">>}, <<"Mainframe">>, open_plus},
@@ -61,27 +97,55 @@ mainframe_state_test_() ->
         ]
     ].
 
-topic(Name) -> {<<"https://", Name/binary>>, <<"space">>}.
+%% Tracking
+
+-define(TOPIC, {<<"https://a.example/">>, <<"space">>}).
+
+%% Runs polls given as [{Second, State}] and returns the changes with the second they were reported.
+run(Polls) ->
+    {_Tracker, Reported} = lists:foldl(
+        fun({Second, State}, {Tracker, Acc}) ->
+            {Tracker1, Changes} = spacepush_state:track(Tracker, [{?TOPIC, <<"A">>, State}], Second, ?DEBOUNCE),
+            {Tracker1, Acc ++ [{Second, From, To} || {_, _, From, To} <- Changes]}
+        end,
+        {#{}, []},
+        Polls
+    ),
+    Reported.
 
 first_observation_is_no_change_test() ->
+    ?assertEqual([], run([{0, open}])).
+
+change_needs_debounce_test() ->
     ?assertEqual(
-        {#{topic(<<"a">>) => open}, []},
-        spacepush_state:changes(#{}, [{topic(<<"a">>), <<"A">>, open}])
+        [{240, open, closed}],
+        run([{0, open}, {120, closed}, {180, closed}, {240, closed}, {300, closed}])
     ).
 
-change_is_reported_test() ->
+flap_back_sends_nothing_test() ->
+    ?assertEqual([], run([{0, open}, {60, closed}, {120, open}, {180, open}, {240, open}])).
+
+%% closed -> keyholder at 60, keyholder -> member at 120: member must hold its own two minutes.
+new_candidate_restarts_wait_test() ->
     ?assertEqual(
-        {#{topic(<<"a">>) => closed}, [{topic(<<"a">>), <<"A">>, open, closed}]},
-        spacepush_state:changes(#{topic(<<"a">>) => open}, [{topic(<<"a">>), <<"A">>, closed}])
+        [{240, closed, member}],
+        run([{0, closed}, {60, keyholder}, {120, member}, {180, member}, {240, member}])
     ).
 
-same_state_is_no_change_test() ->
-    Known = #{topic(<<"a">>) => open},
-    ?assertEqual({Known, []}, spacepush_state:changes(Known, [{topic(<<"a">>), <<"A">>, open}])).
+unknown_cannot_confirm_test() ->
+    ?assertEqual(
+        [{300, open, closed}],
+        run([{0, open}, {60, closed}, {120, unknown}, {180, unknown}, {240, unknown}, {300, closed}])
+    ).
 
-unknown_keeps_last_known_state_test() ->
-    Known = #{topic(<<"a">>) => open},
-    {Known1, Changes1} = spacepush_state:changes(Known, [{topic(<<"a">>), <<"A">>, unknown}]),
-    ?assertEqual({Known, []}, {Known1, Changes1}),
-    {_, Changes2} = spacepush_state:changes(Known1, [{topic(<<"a">>), <<"A">>, closed}]),
-    ?assertEqual([{topic(<<"a">>), <<"A">>, open, closed}], Changes2).
+unknown_keeps_confirmed_state_test() ->
+    ?assertEqual([], run([{0, open}, {60, unknown}, {120, open}, {300, open}])).
+
+tracker_survives_restart_test() ->
+    Dir = spacepush_test_util:tmp_dir("tracker"),
+    File = filename:join(Dir, "tracker.bin"),
+    {Tracker, []} = spacepush_state:track(#{}, [{?TOPIC, <<"A">>, open}], 0, ?DEBOUNCE),
+    {Tracker1, []} = spacepush_state:track(Tracker, [{?TOPIC, <<"A">>, closed}], 60, ?DEBOUNCE),
+    ok = spacepush_store:save(File, Tracker1),
+    Restored = spacepush_store:load(File, #{}),
+    ?assertMatch({_, [{?TOPIC, _, open, closed}]}, spacepush_state:track(Restored, [{?TOPIC, <<"A">>, closed}], 180, ?DEBOUNCE)).

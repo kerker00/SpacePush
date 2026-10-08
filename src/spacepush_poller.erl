@@ -1,10 +1,10 @@
 -module(spacepush_poller).
 -moduledoc """
-Polls the SpaceAPI aggregator and Mainframe's openState endpoint and reports
-state changes to the dispatcher.
+Polls the SpaceAPI aggregator and Mainframe's openState endpoint, confirms
+state changes with `spacepush_state:track/4` and hands them to the outbox.
 
-The known states live only in memory. After a restart the first poll just
-records the current states, so a restart never sends notifications.
+The tracker is saved to disk, so a restart neither forgets a pending change
+nor misses one that happened while the service was down.
 """.
 -behaviour(gen_server).
 
@@ -19,8 +19,9 @@ start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 init([]) ->
+    File = env(tracker_file),
     self() ! poll,
-    {ok, #{known => #{}}}.
+    {ok, #{file => File, tracker => spacepush_store:load(File, #{})}}.
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -28,14 +29,19 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(poll, #{known := Known} = State) ->
+handle_info(poll, #{file := File, tracker := Tracker} = State) ->
+    Now = erlang:system_time(second),
+    MaxAge = env(max_data_age_s),
     Observations =
-        observe(env(aggregator_url), fun spacepush_state:parse_aggregator/1) ++
+        observe(env(aggregator_url), fun(Body) -> spacepush_state:parse_aggregator(Body, Now, MaxAge) end) ++
             observe(env(mainframe_url), fun spacepush_state:parse_mainframe/1),
-    {Known1, Changes} = spacepush_state:changes(Known, Observations),
-    lists:foreach(fun spacepush_dispatcher:state_changed/1, Changes),
+    {Tracker1, Changes} = spacepush_state:track(Tracker, Observations, Now, env(debounce_s)),
+    %% Enqueue before saving: a crash in between confirms the change again
+    %% after the restart instead of losing it.
+    ok = spacepush_outbox:enqueue(Changes),
+    Tracker1 =/= Tracker andalso spacepush_store:save(File, Tracker1),
     erlang:send_after(env(poll_interval_ms), self(), poll),
-    {noreply, State#{known := Known1}};
+    {noreply, State#{tracker := Tracker1}};
 handle_info(_Info, State) ->
     {noreply, State}.
 

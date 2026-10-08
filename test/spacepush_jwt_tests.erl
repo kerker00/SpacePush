@@ -25,11 +25,6 @@ signature_verifies_test() ->
 read_key_test() ->
     Key = new_key(),
     Pem = public_key:pem_encode([public_key:pem_entry_encode('PrivateKeyInfo', Key)]),
-    File = filename:join(filename:basedir(user_cache, "spacepush-tests"), "AuthKey_TEST.p8"),
-    ok = filelib:ensure_dir(File),
+    File = filename:join(spacepush_test_util:tmp_dir("jwt"), "AuthKey_TEST.p8"),
     ok = file:write_file(File, Pem),
-    try
-        ?assertEqual(Key#'ECPrivateKey'.privateKey, (spacepush_jwt:read_key(File))#'ECPrivateKey'.privateKey)
-    after
-        file:delete(File)
-    end.
+    ?assertEqual(Key#'ECPrivateKey'.privateKey, (spacepush_jwt:read_key(File))#'ECPrivateKey'.privateKey).
