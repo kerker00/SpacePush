@@ -23,6 +23,7 @@
         %% Use the first X-Forwarded-For address as client, only behind a trusted proxy.
         {trust_proxy, false},
         {rate_limit_per_minute, 30},
+        {http_body_timeout_ms, 10000},
         %% Device registrations; the apps re-register on every launch.
         {registry_file, "data/registry.dets"},
         {max_registrations, 10000},

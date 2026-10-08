@@ -8,7 +8,7 @@ Mainframe Oldenburg is read from its openState endpoint instead of the
 aggregator, because it reports several rooms and finer states.
 """.
 
--export([parse_aggregator/3, parse_mainframe/1, mainframe_state/1, track/4]).
+-export([parse_aggregator/3, parse_mainframe/1, mainframe_state/1, track/4, snapshot/1, restore/1]).
 
 -export_type([topic/0, state/0, observation/0, change/0, tracker/0]).
 
@@ -19,6 +19,7 @@ aggregator, because it reports several rooms and finer states.
 -type entry() :: #{confirmed := state(), candidate := none | {state(), Since :: integer()}}.
 -type tracker() :: #{topic() => entry()}.
 
+-define(STATES, [open, closed, keyholder, member, open_plus, closing]).
 -define(MAINFRAME_ENDPOINT, <<"https://status.mainframe.io/api/spaceInfo">>).
 -define(MAINFRAME_HOST, <<"status.mainframe.io">>).
 -define(SPACE_ROOM, <<"space">>).
@@ -130,3 +131,29 @@ step({Topic, Name, State}, {Tracker, Changes}, Now, Debounce) ->
         #{} ->
             {Tracker#{Topic => #{confirmed => State, candidate => none}}, Changes}
     end.
+
+-doc "Wraps the tracker in a versioned term for saving.".
+-spec snapshot(tracker()) -> {tracker, 1, tracker()}.
+snapshot(Tracker) ->
+    {tracker, 1, Tracker}.
+
+-doc """
+Reads a saved snapshot, keeping only well-formed entries. Anything else,
+including an unknown format version, gives an empty tracker.
+""".
+-spec restore(term()) -> tracker().
+restore({tracker, 1, Tracker}) when is_map(Tracker) ->
+    maps:filter(fun valid_entry/2, Tracker);
+restore(_) ->
+    #{}.
+
+valid_entry({Endpoint, Room}, #{confirmed := Confirmed, candidate := Candidate}) when
+    is_binary(Endpoint), is_binary(Room)
+->
+    lists:member(Confirmed, ?STATES) andalso valid_candidate(Candidate);
+valid_entry(_Topic, _Entry) ->
+    false.
+
+valid_candidate(none) -> true;
+valid_candidate({State, Since}) when is_integer(Since) -> lists:member(State, ?STATES);
+valid_candidate(_) -> false.

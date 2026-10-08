@@ -20,7 +20,7 @@ An Erlang/OTP application that:
 | `spacepush_registry` | Device registrations in `data/registry.dets`, with an ETS topic index |
 | `spacepush_ratelimit` | Requests per client and minute for the HTTP API |
 
-Pending changes and deliveries are on disk, so a restart of a process or of the whole service loses no work.
+Pending changes and deliveries are synced to disk before they count as accepted, so a restart of a process or of the whole service, even an abrupt one, loses no work. Persistent formats carry a version; older records are migrated on start.
 
 ## Requirements
 
@@ -48,7 +48,7 @@ Register a device (replaces an earlier registration of the same token):
       ]
     }
 
-`environment` is `sandbox` for development builds and `production` for App Store and TestFlight builds. `room` defaults to `space`; only Mainframe has other rooms. Answers `204`.
+`environment` is `sandbox` for development builds and `production` for App Store and TestFlight builds. `room` defaults to `space`; only Mainframe has other rooms. Answers `204`, or `400` for invalid input, `408` if the body does not arrive within 10 seconds, `413` for a body over 16 KB, `429` when rate-limited and `503` when the registry is full.
 
 Remove a device:
 

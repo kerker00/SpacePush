@@ -9,7 +9,9 @@ Registration body:
  "subscriptions": [{"endpoint": "https://status.mainframe.io/api/spaceInfo", "room": "radstelle"}]}
 ```
 
-`room` is optional and defaults to `"space"`. Answers 204 on success.
+`room` is optional and defaults to `"space"`. Answers 204 on success, 413 for
+a body over 16 KB, 408 if the body does not arrive within `http_body_timeout_ms`, 429
+when the client sent too many requests and 503 when the registry is full.
 """.
 -behaviour(cowboy_handler).
 
@@ -34,23 +36,49 @@ handle(Method, Token, Req) ->
     end.
 
 handle_valid(<<"PUT">>, Token, Req0) ->
-    case cowboy_req:read_body(Req0, #{length => ?MAX_BODY, period => 5000}) of
+    case read_body(Req0) of
         {ok, Body, Req} ->
             case parse_registration(Body) of
                 {ok, Environment, Topics} ->
-                    ok = spacepush_registry:register(Token, Environment, Topics),
-                    cowboy_req:reply(204, Req);
+                    case spacepush_registry:register(Token, Environment, Topics) of
+                        ok -> cowboy_req:reply(204, Req);
+                        {error, full} -> error_reply(503, <<"registry_full">>, Req)
+                    end;
                 {error, Reason} ->
                     error_reply(400, Reason, Req)
             end;
-        {more, _Partial, Req} ->
-            error_reply(413, <<"body_too_large">>, Req)
+        {error, too_large, Req} ->
+            error_reply(413, <<"body_too_large">>, Req);
+        {error, timeout, Req} ->
+            error_reply(408, <<"body_timeout">>, Req)
     end;
 handle_valid(<<"DELETE">>, Token, Req) ->
     ok = spacepush_registry:unregister(Token),
     cowboy_req:reply(204, Req);
 handle_valid(_Method, _Token, Req) ->
     cowboy_req:reply(405, #{<<"allow">> => <<"PUT, DELETE">>}, Req).
+
+%% Cowboy's `length` only sets how much to read per call, so the total size and
+%% the overall time are checked here. A declared length over the limit is
+%% rejected before reading.
+read_body(Req) ->
+    case cowboy_req:body_length(Req) of
+        Length when is_integer(Length), Length > ?MAX_BODY -> {error, too_large, Req};
+        _ ->
+            {ok, Timeout} = application:get_env(spacepush, http_body_timeout_ms),
+            read_body(Req, [], 0, erlang:monotonic_time(millisecond) + Timeout)
+    end.
+
+read_body(Req0, Acc, Size, Deadline) ->
+    Period = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    {Status, Data, Req} = cowboy_req:read_body(Req0, #{length => ?MAX_BODY + 1, period => Period}),
+    Size1 = Size + byte_size(Data),
+    if
+        Size1 > ?MAX_BODY -> {error, too_large, Req};
+        Status =:= ok -> {ok, iolist_to_binary(lists:reverse(Acc, [Data])), Req};
+        Period =:= 0 -> {error, timeout, Req};
+        true -> read_body(Req, [Data | Acc], Size1, Deadline)
+    end.
 
 -doc "APNs device tokens are hex strings, currently 64 characters long.".
 -spec valid_token(term()) -> boolean().

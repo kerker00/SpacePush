@@ -25,7 +25,7 @@ outbox_test_() ->
             fun newer_state_replaces_pending/0,
             fun late_result_cannot_complete_successor/0,
             fun retry_postpones/0,
-            fun in_flight_is_excluded/0,
+            fun in_flight_key_holds_back_successor/0,
             fun expired_is_dropped/0,
             fun survives_restart/0
         ]}.
@@ -72,10 +72,16 @@ retry_postpones() ->
     ok = spacepush_outbox:complete(Key, Id),
     ?assertEqual([], spacepush_outbox:due(Later, [], 10)).
 
-in_flight_is_excluded() ->
+in_flight_key_holds_back_successor() ->
     ok = spacepush_outbox:enqueue([change(open)]),
-    [#{id := Id}] = spacepush_outbox:due(now_ms(), [], 10),
-    ?assertEqual([], spacepush_outbox:due(now_ms(), [Id], 10)).
+    [#{key := Key, id := OpenId}] = spacepush_outbox:due(now_ms(), [], 10),
+    ok = spacepush_outbox:enqueue([change(closed)]),
+    ?assertEqual([], spacepush_outbox:due(now_ms(), [Key], 10)),
+    %% The late result for "open" leaves "closed" in place, which is due once the key is free.
+    ok = spacepush_outbox:complete(Key, OpenId),
+    ?assertMatch([#{key := Key}], spacepush_outbox:due(now_ms(), [], 10)),
+    [Closed] = spacepush_outbox:due(now_ms(), [], 10),
+    ?assertEqual(<<"closed">>, state(Closed)).
 
 expired_is_dropped() ->
     application:set_env(spacepush, delivery_ttl_ms, 1000),

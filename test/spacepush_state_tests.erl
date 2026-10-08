@@ -146,6 +146,14 @@ tracker_survives_restart_test() ->
     File = filename:join(Dir, "tracker.bin"),
     {Tracker, []} = spacepush_state:track(#{}, [{?TOPIC, <<"A">>, open}], 0, ?DEBOUNCE),
     {Tracker1, []} = spacepush_state:track(Tracker, [{?TOPIC, <<"A">>, closed}], 60, ?DEBOUNCE),
-    ok = spacepush_store:save(File, Tracker1),
-    Restored = spacepush_store:load(File, #{}),
+    ok = spacepush_store:save(File, spacepush_state:snapshot(Tracker1)),
+    Restored = spacepush_state:restore(spacepush_store:load(File, none)),
     ?assertMatch({_, [{?TOPIC, _, open, closed}]}, spacepush_state:track(Restored, [{?TOPIC, <<"A">>, closed}], 180, ?DEBOUNCE)).
+
+restore_keeps_valid_entries_test() ->
+    Good = #{confirmed => open, candidate => {closed, 60}},
+    Tracker = #{?TOPIC => Good, {<<"https://b.example/">>, <<"space">>} => #{confirmed => party, candidate => none}, bad => Good},
+    ?assertEqual(#{?TOPIC => Good}, spacepush_state:restore(spacepush_state:snapshot(Tracker))).
+
+restore_rejects_unknown_formats_test_() ->
+    [?_assertEqual(#{}, spacepush_state:restore(Term)) || Term <- [none, #{}, {tracker, 2, #{}}, {tracker, 1, []}]].

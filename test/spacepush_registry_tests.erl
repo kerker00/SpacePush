@@ -23,6 +23,9 @@ registry_test_() ->
             fun invalid_token_respects_timestamp/0,
             fun capacity/0,
             fun survives_restart/0,
+            fun migrates_prototype_records/0,
+            fun drops_unknown_records/0,
+            fun lookup_returns_current_registration/0,
             fun expires_old_registrations/0
         ]}.
 
@@ -93,3 +96,30 @@ expires_old_registrations() ->
     application:set_env(spacepush, registration_ttl_days, 0),
     start(),
     ?assertEqual([], spacepush_registry:subscribers(?A)).
+
+%% Writes records straight into the DETS file while the registry is stopped.
+with_raw_records(Records) ->
+    stop(),
+    {ok, File} = application:get_env(spacepush, registry_file),
+    {ok, Table} = dets:open_file(raw_registry, [{file, File}, {type, set}]),
+    ok = dets:insert(Table, Records),
+    ok = dets:close(Table),
+    start().
+
+migrates_prototype_records() ->
+    Seconds = erlang:system_time(second),
+    with_raw_records([{token(1), sandbox, [?A], Seconds}]),
+    ?assertEqual([{token(1), sandbox, Seconds * 1000}], spacepush_registry:subscribers(?A)),
+    stop(),
+    start(),
+    ?assertEqual([{token(1), sandbox, Seconds * 1000}], spacepush_registry:subscribers(?A)).
+
+drops_unknown_records() ->
+    with_raw_records([{token(1), {registration, 99, sandbox, [?A], 1}}, {token(2), garbage}]),
+    ?assertEqual([], spacepush_registry:subscribers(?A)),
+    ?assertEqual(error, spacepush_registry:lookup(token(1))).
+
+lookup_returns_current_registration() ->
+    ?assertEqual(error, spacepush_registry:lookup(token(1))),
+    ok = spacepush_registry:register(token(1), production, [?A]),
+    ?assertMatch({ok, production, [?A], _}, spacepush_registry:lookup(token(1))).

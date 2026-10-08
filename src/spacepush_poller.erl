@@ -20,8 +20,11 @@ start_link() ->
 
 init([]) ->
     File = env(tracker_file),
+    %% Safe decoding needs the tracker's atoms to exist, so load their module first.
+    {module, spacepush_state} = code:ensure_loaded(spacepush_state),
+    Tracker = spacepush_state:restore(spacepush_store:load(File, none)),
     self() ! poll,
-    {ok, #{file => File, tracker => spacepush_store:load(File, #{})}}.
+    {ok, #{file => File, tracker => Tracker}}.
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -36,10 +39,11 @@ handle_info(poll, #{file := File, tracker := Tracker} = State) ->
         observe(env(aggregator_url), fun(Body) -> spacepush_state:parse_aggregator(Body, Now, MaxAge) end) ++
             observe(env(mainframe_url), fun spacepush_state:parse_mainframe/1),
     {Tracker1, Changes} = spacepush_state:track(Tracker, Observations, Now, env(debounce_s)),
-    %% Enqueue before saving: a crash in between confirms the change again
-    %% after the restart instead of losing it.
+    %% The outbox is on disk before the tracker records the change as confirmed:
+    %% a crash in between confirms the change again after the restart instead
+    %% of losing it.
     ok = spacepush_outbox:enqueue(Changes),
-    Tracker1 =/= Tracker andalso spacepush_store:save(File, Tracker1),
+    Tracker1 =/= Tracker andalso spacepush_store:save(File, spacepush_state:snapshot(Tracker1)),
     erlang:send_after(env(poll_interval_ms), self(), poll),
     {noreply, State#{tracker := Tracker1}};
 handle_info(_Info, State) ->

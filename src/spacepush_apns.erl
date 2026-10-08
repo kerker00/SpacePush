@@ -4,8 +4,14 @@ Sends due deliveries from the outbox to APNs over HTTP/2 with token-based
 authentication.
 
 Keeps one connection per APNs environment, as Apple recommends, and renews
-the provider token before it expires after an hour. At most
-`apns_max_in_flight` requests are open at a time, each with a deadline.
+the provider token before it expires after an hour. Requests are only sent on
+a connection that is up, so a request that times out was never queued inside
+gun. At most `apns_max_in_flight` requests are open at a time, each with a
+deadline, and at most one per device and topic.
+
+Right before sending, the delivery is checked against the current
+registration: if the device unregistered or dropped the topic, it is
+discarded; otherwise it goes to the device's current environment.
 What happens to a delivery depends on the result (see `classify/2`):
 
 - `delivered` and `drop`: removed from the outbox
@@ -92,12 +98,14 @@ handle_info({gun_error, _Conn, Ref, Reason}, State) ->
 handle_info({gun_error, _Conn, Reason}, State) ->
     ?LOG_WARNING(#{msg => apns_connection_error, reason => Reason}),
     {noreply, State};
-handle_info({gun_down, _Conn, _Protocol, Reason, KilledStreams}, State) ->
-    {noreply, fail_requests(KilledStreams, Reason, State)};
+handle_info({gun_up, Connection, _Protocol}, State) ->
+    {noreply, dispatch(set_up(Connection, true, State))};
+handle_info({gun_down, Connection, _Protocol, Reason, KilledStreams}, State) ->
+    {noreply, fail_requests(KilledStreams, Reason, set_up(Connection, false, State))};
 handle_info({'DOWN', _MonitorRef, process, Connection, Reason}, #{connections := Connections} = State) ->
     ?LOG_WARNING(#{msg => apns_connection_closed, reason => Reason}),
     Lost = [Ref || Ref := #{connection := Pid} <- maps:get(in_flight, State), Pid =:= Connection],
-    Remaining = maps:filter(fun(_Environment, Pid) -> Pid =/= Connection end, Connections),
+    Remaining = maps:filter(fun(_Environment, #{pid := Pid}) -> Pid =/= Connection end, Connections),
     {noreply, fail_requests(Lost, Reason, State#{connections := Remaining})};
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -105,22 +113,45 @@ handle_info(_Info, State) ->
 dispatch(#{in_flight := InFlight, max_in_flight := Max} = State) ->
     case Max - map_size(InFlight) of
         Free when Free > 0 ->
-            Ids = [Id || _Ref := #{delivery := #{id := Id}} <- InFlight],
-            Due = spacepush_outbox:due(erlang:system_time(millisecond), Ids, Free),
-            lists:foldl(fun send/2, State, Due);
+            Keys = [Key || _Ref := #{delivery := #{key := Key}} <- InFlight],
+            Due = spacepush_outbox:due(erlang:system_time(millisecond), Keys, Free),
+            lists:foldl(fun prepare/2, State, Due);
         _ ->
             State
     end.
 
-send(#{key := Key, id := Id, token := Token, payload := Payload}, #{key := undefined} = State) ->
+%% Checks a due delivery against the current registration and sends it once
+%% the connection for its environment is up.
+prepare(#{key := {Token, Topic} = Key, id := Id} = Delivery, State) ->
+    case spacepush_registry:lookup(Token) of
+        {ok, Environment, Topics, Version} ->
+            case lists:member(Topic, Topics) of
+                true -> send_when_up(Delivery#{environment := Environment, version := Version}, State);
+                false -> discard(Key, Id, State)
+            end;
+        error ->
+            discard(Key, Id, State)
+    end.
+
+discard(Key, Id, State) ->
+    ?LOG_INFO(#{msg => delivery_discarded, reason => no_longer_subscribed}),
+    spacepush_outbox:complete(Key, Id),
+    State.
+
+send_when_up(#{key := Key, id := Id, token := Token, payload := Payload}, #{key := undefined} = State) ->
     ?LOG_INFO(#{msg => dry_run_delivery, token => Token, payload => Payload}),
     spacepush_outbox:complete(Key, Id),
     State;
-send(Delivery, State0) ->
-    #{environment := Environment, token := Token, payload := Payload, collapse_id := CollapseId, expires := Expires} =
-        Delivery,
-    {ProviderToken, State1} = provider_token(State0),
-    {Connection, State2} = connection(Environment, State1),
+send_when_up(#{environment := Environment} = Delivery, State0) ->
+    %% Not up yet: the delivery stays due and is picked up again after gun_up.
+    case connection(Environment, State0) of
+        {up, Connection, State1} -> send(Delivery, Connection, State1);
+        {down, State1} -> State1
+    end.
+
+send(Delivery, Connection, State0) ->
+    #{token := Token, payload := Payload, collapse_id := CollapseId, expires := Expires} = Delivery,
+    {ProviderToken, State2} = provider_token(State0),
     #{topic := Topic, request_timeout_ms := Timeout, in_flight := InFlight} = State2,
     Headers = [
         {<<"authorization">>, <<"bearer ", ProviderToken/binary>>},
@@ -212,10 +243,13 @@ provider_token(#{provider_token := Current, key := Key, key_id := KeyId, team_id
             {Token, State#{provider_token := {Token, Now}}}
     end.
 
+%% Opens the connection for an environment on first use; gun reconnects on its own.
 connection(Environment, #{connections := Connections} = State) ->
     case Connections of
-        #{Environment := Pid} ->
-            {Pid, State};
+        #{Environment := #{pid := Pid, up := true}} ->
+            {up, Pid, State};
+        #{Environment := #{up := false}} ->
+            {down, State};
         #{} ->
             Host = host(Environment),
             {ok, Pid} = gun:open(Host, 443, #{
@@ -224,8 +258,19 @@ connection(Environment, #{connections := Connections} = State) ->
                 tls_opts => spacepush_tls:client_opts(Host)
             }),
             monitor(process, Pid),
-            {Pid, State#{connections := Connections#{Environment => Pid}}}
+            {down, State#{connections := Connections#{Environment => #{pid => Pid, up => false}}}}
     end.
+
+set_up(Connection, Up, #{connections := Connections} = State) ->
+    State#{
+        connections := maps:map(
+            fun
+                (_Environment, #{pid := Pid} = Info) when Pid =:= Connection -> Info#{up := Up};
+                (_Environment, Info) -> Info
+            end,
+            Connections
+        )
+    }.
 
 host(sandbox) -> "api.sandbox.push.apple.com";
 host(production) -> "api.push.apple.com".

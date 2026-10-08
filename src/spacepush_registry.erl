@@ -8,12 +8,16 @@ answers `subscribers/1` without going through this process.
 
 The number of registrations is capped, and registrations that were not
 renewed within `registration_ttl_days` expire. The apps renew on every launch.
+
+On disk a registration is `{Token, {registration, 1, Environment, Topics, Version}}`.
+Records of the unversioned prototype format, which stored seconds, are
+migrated on start.
 """.
 -behaviour(gen_server).
 
 -include_lib("kernel/include/logger.hrl").
 
--export([start_link/0, register/3, unregister/1, unregister_if/4, subscribers/1]).
+-export([start_link/0, register/3, unregister/1, unregister_if/4, subscribers/1, lookup/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(DETS, spacepush_registry).
@@ -48,6 +52,14 @@ the meantime keeps its new registration.
 unregister_if(Token, Environment, Version, InvalidSince) ->
     gen_server:call(?MODULE, {unregister_if, Token, Environment, Version, InvalidSince}).
 
+-doc "The current registration of a token, read from ETS.".
+-spec lookup(binary()) -> {ok, environment(), [spacepush_state:topic()], version()} | error.
+lookup(Token) ->
+    case ets:lookup(?REGISTRATIONS, Token) of
+        [{Token, Environment, Topics, Version}] -> {ok, Environment, Topics, Version};
+        [] -> error
+    end.
+
 -spec subscribers(spacepush_state:topic()) -> [subscriber()].
 subscribers(Topic) ->
     [
@@ -63,10 +75,7 @@ init([]) ->
     {ok, ?DETS} = dets:open_file(?DETS, [{file, File}, {type, set}]),
     ets:new(?REGISTRATIONS, [named_table, protected, set, {read_concurrency, true}]),
     ets:new(?INDEX, [named_table, protected, bag, {read_concurrency, true}]),
-    dets:traverse(?DETS, fun(Registration) ->
-        insert_ets(Registration),
-        continue
-    end),
+    load(),
     remove_expired(),
     erlang:send_after(?EXPIRY_CHECK_MS, self(), remove_expired),
     {ok, #{}}.
@@ -107,14 +116,38 @@ handle_info(_Info, State) ->
 terminate(_Reason, _State) ->
     dets:close(?DETS).
 
+%% Fills ETS from DETS, migrating or dropping records in other formats.
+load() ->
+    Records = dets:foldl(fun(Record, Acc) -> [Record | Acc] end, [], ?DETS),
+    lists:foreach(
+        fun
+            ({Token, {registration, 1, Environment, Topics, Version}}) ->
+                insert_ets({Token, Environment, Topics, Version});
+            ({Token, Environment, Topics, UpdatedAt}) when is_binary(Token), is_integer(UpdatedAt) ->
+                ?LOG_INFO(#{msg => registration_migrated}),
+                ok = write({Token, Environment, Topics, UpdatedAt * 1000}),
+                insert_ets({Token, Environment, Topics, UpdatedAt * 1000});
+            (Record) ->
+                ?LOG_WARNING(#{msg => registration_dropped, record => Record}),
+                ok = dets:delete(?DETS, element(1, Record))
+        end,
+        Records
+    ),
+    ok = dets:sync(?DETS).
+
 store({Token, _Environment, _Topics, _Version} = Registration) ->
-    ok = dets:insert(?DETS, Registration),
+    ok = write(Registration),
+    ok = dets:sync(?DETS),
     delete_ets(Token),
     insert_ets(Registration),
     ok.
 
+write({Token, Environment, Topics, Version}) ->
+    dets:insert(?DETS, {Token, {registration, 1, Environment, Topics, Version}}).
+
 remove(Token) ->
     ok = dets:delete(?DETS, Token),
+    ok = dets:sync(?DETS),
     delete_ets(Token),
     ok.
 
