@@ -1,0 +1,364 @@
+[
+  {
+    "url": "https://api.nerd2nerd.org/status.json",
+    "valid": true,
+    "lastSeen": 1791485450,
+    "data": {
+      "api": "0.13",
+      "contact": {
+        "email": "info@nerd2nerd.org",
+        "irc": "irc://irc.nerd2nerd.org:6697/#geeks",
+        "ml": "nerd2nerd@nerd2nerd.org",
+        "phone": "+4993135823240"
+      },
+      "ext_ccc": "erfa",
+      "feeds": {
+        "calendar": {
+          "type": "ical",
+          "url": "https://api.nerd2nerd.org/calendar.ics"
+        }
+      },
+      "issue_report_channels": [
+        "email"
+      ],
+      "location": {
+        "address": "Schönleinstraße 5, 97080 Würzburg, Germany",
+        "lat": 49.801756,
+        "lon": 9.92884
+      },
+      "logo": "https://www.nerd2nerd.org/n2n-logo.png",
+      "space": "Nerd2Nerd",
+      "state": {
+        "lastchange": 1791464821,
+        "open": true
+      },
+      "url": "http://www.nerd2nerd.org"
+    }
+  },
+  {
+    "url": "https://spaceapi.0x08.in/",
+    "valid": true,
+    "lastSeen": 1791485455,
+    "data": {
+      "api_compatibility": [
+        "14"
+      ],
+      "contact": {
+        "matrix": "#b4ck5p4c3:matrix.org",
+        "phone": "+7 812 507 92 41"
+      },
+      "feeds": {
+        "blog": {
+          "url": "https://t.me/b4cksp4ce_l1ve"
+        },
+        "wiki": {
+          "url": "https://wiki.0x08.in"
+        }
+      },
+      "links": [
+        {
+          "name": "Telegram Chat",
+          "url": "https://t.me/b4cksp4ce_chat"
+        }
+      ],
+      "location": {
+        "address": "Lanskoe shosse, 14/1, 197343, Saint-Petersburg, Russia",
+        "lat": 59.993811,
+        "lon": 30.309332,
+        "timezone": "Europe/Moscow"
+      },
+      "logo": "https://0x08.in/icons/safari-pinned-tab.svg",
+      "projects": [
+        "https://github.com/b4ck5p4c3"
+      ],
+      "space": "B4CKSP4CE",
+      "url": "https://0x08.in"
+    }
+  },
+  {
+    "url": "https://raw.githubusercontent.com/MKMakerSpace/spaceapi-endpoint/main/spaceapi.json",
+    "valid": true,
+    "lastSeen": 1791485451,
+    "data": {
+      "api": "0.13",
+      "api_compatibility": [
+        "14"
+      ],
+      "contact": {
+        "facebook": "https://www.facebook.com/MKMakerspace",
+        "ml": "https://groups.google.com/g/milton-keynes-makerspace"
+      },
+      "issue_report_channels": [
+        "ml"
+      ],
+      "location": {
+        "address": "30 Burners Lane, Kiln Farm, Milton Keynes MK11 3HB",
+        "lat": 52.041439,
+        "lon": -0.76056
+      },
+      "logo": "https://mkmakerspace.co.uk/wp-content/uploads/2016/11/mkmakerspace-mis-website-logo-1.png",
+      "projects": [
+        "http://github.com/mkmakerspace",
+        "https://mkmakerspace.co.uk/"
+      ],
+      "space": "Milton Keynes Makerspace",
+      "state": {
+        "message": "Check Slack for opening",
+        "open": null
+      },
+      "url": "https://mkmakerspace.co.uk"
+    }
+  },
+  {
+    "url": "http://blog.attraktor.org/spaceapi/spaceapi.json",
+    "valid": false,
+    "lastSeen": 1791485450
+  },
+  {
+    "url": "https://gateway.hackem.cc/api/space",
+    "valid": true,
+    "lastSeen": 1791485454,
+    "data": {
+      "api": "0.13",
+      "api_compatibility": [
+        "14"
+      ],
+      "contact": {
+        "email": "hacker.embassy@proton.me",
+        "matrix": "#hacker-embassy:matrix.org",
+        "telegram": "@hacker_embassy"
+      },
+      "feeds": {
+        "calendar": {
+          "type": "ical",
+          "url": "https://calendar.google.com/calendar/ical/9cdc565d78854a899cbbc7cb6dfcb8fa411001437ae0f66bce0a82b5e7679d5e@group.calendar.google.com/public/basic.ics"
+        }
+      },
+      "issue_report_channels": [
+        "email"
+      ],
+      "links": [
+        {
+          "name": "Wiki",
+          "url": "https://lore.hackem.cc/"
+        },
+        {
+          "name": "Status of public services",
+          "url": "https://uptime.hackem.cc/status/external"
+        },
+        {
+          "name": "Instagram",
+          "url": "https://www.instagram.com/hackerembassy"
+        }
+      ],
+      "location": {
+        "address": "Baghramyan ave. 60, Yerevan, Armenia",
+        "lat": 40.194336,
+        "lon": 44.497607,
+        "timezone": "Asia/Yerevan"
+      },
+      "logo": "https://gateway.hackem.cc/static/hackemlogo.jpg",
+      "membership_plans": [
+        {
+          "billing_interval": "monthly",
+          "currency": "USD",
+          "name": "Membership",
+          "value": 100
+        }
+      ],
+      "projects": [
+        "https://github.com/hackerembassy"
+      ],
+      "sensors": {
+        "people_now_present": [
+          {
+            "value": 5
+          }
+        ]
+      },
+      "space": "Hacker Embassy",
+      "state": {
+        "message": "closed for public",
+        "open": false,
+        "trigger_person": "ShimaOnly"
+      },
+      "url": "https://hackem.cc/"
+    }
+  },
+  {
+    "url": "https://apollo.open-resource.org/status.php",
+    "valid": true,
+    "lastSeen": 1791485455,
+    "data": {
+      "address": "",
+      "api": "0.12",
+      "contact": {
+        "irc": "irc://irc.freenode.net/apollo",
+        "ml": "talk@apollo.open-resource.org"
+      },
+      "feeds": [
+        {
+          "name": "blog",
+          "type": "application/rss+xml",
+          "url": "https://apollo.open-resource.org/mission:log:feed"
+        }
+      ],
+      "icon": {
+        "closed": "https://apollo.open-resource.org/images/icons/apollo-spaceapi-closed.png",
+        "open": "https://apollo.open-resource.org/images/icons/apollo-spaceapi-open.png"
+      },
+      "lastchange": 1320586506,
+      "lat": 48.11219,
+      "logo": "https://apollo.open-resource.org/lib/tpl/apollo/images/apollo-logo.png",
+      "lon": 11.70218,
+      "open": false,
+      "space": "Apollo-NG",
+      "url": "https://apollo.open-resource.org"
+    }
+  },
+  {
+    "url": "https://luxeria.ch/spaceapi.json",
+    "valid": true,
+    "lastSeen": 1791485452,
+    "data": {
+      "api_compatibility": [
+        "15"
+      ],
+      "contact": {
+        "email": "vorstand@luxeria.ch",
+        "irc": "irc://irc.libera.chat/luxeria",
+        "telegram": "https://t.me/luxeria_irc",
+        "twitter": "@LuXeria_Luzern"
+      },
+      "feeds": {
+        "blog": {
+          "type": "rss",
+          "url": "https://luxeria.ch/feed.xml"
+        },
+        "wiki": {
+          "type": "rss",
+          "url": "https://wiki.luxeria.ch/feed.php"
+        }
+      },
+      "issue_report_channels": [
+        "email"
+      ],
+      "links": [
+        {
+          "description": "Our Jitsi room used for weekly meetings",
+          "name": "Jitsi",
+          "url": "https://meet.luxeria.ch/LuxeriaTreffen"
+        }
+      ],
+      "location": {
+        "address": "LABOR Luzern, Degenstrasse 3, 6010 Kriens",
+        "lat": 47.03599,
+        "lon": 8.277263
+      },
+      "logo": "https://luxeria.ch/img/luxeria.png",
+      "projects": [
+        "https://wiki.luxeria.ch/",
+        "https://github.com/luxeria"
+      ],
+      "space": "LuXeria",
+      "state": {
+        "message": "The weekly meeting takes place every Wednesday from approx. 20:00 in the following Jitsi meeting room: https://meet.luxeria.ch/LuxeriaTreffen"
+      },
+      "url": "https://luxeria.ch/"
+    }
+  },
+  {
+    "url": "https://status.mainframe.io/api/spaceInfo",
+    "valid": true,
+    "lastSeen": 1791485452,
+    "data": {
+      "api_compatibility": [
+        "14",
+        "15"
+      ],
+      "contact": {
+        "email": "vorstand@kreativitaet-trifft-technik.de",
+        "issue_mail": "hc@kreativitaet-trifft-technik.de",
+        "ml": "https://mailman.ktt-ol.de/postorius/lists/diskussion.lists.ktt-ol.de/"
+      },
+      "feeds": {
+        "calendar": {
+          "type": "application/calendar",
+          "url": "https://www.kreativitaet-trifft-technik.de/calendar/ical/markusframer@gmail.com/public/basic.ics"
+        }
+      },
+      "location": {
+        "address": "Bahnhofsplatz 10, 26122 Oldenburg, Germany",
+        "lat": 53.14402,
+        "lon": 8.21988
+      },
+      "logo": "https://status.mainframe.io/assets/images/mainframe.png",
+      "power_consumption": [
+        {
+          "description": "Value changed 1 sec. ago.",
+          "location": "Hackspace, front",
+          "name": "current consumption front",
+          "unit": "W",
+          "value": 532.73
+        },
+        {
+          "description": "Value changed 1 sec. ago.",
+          "location": "Hackspace, back",
+          "name": "current consumption back",
+          "unit": "W",
+          "value": 1030.07
+        },
+        {
+          "description": "Value changed 0 sec. ago.",
+          "location": "Hackspace, machining",
+          "name": "current consumption machining",
+          "unit": "W",
+          "value": 47.62
+        }
+      ],
+      "projects": [
+        "https://github.com/ktt-ol/"
+      ],
+      "sensors": {
+        "network_connections": [
+          {
+            "location": "Inside",
+            "name": "deviceCount",
+            "value": 118
+          },
+          {
+            "description": "0: no internet connection, 1: everything is fine",
+            "name": "internetStatus",
+            "value": 1
+          }
+        ],
+        "people_now_present": [
+          {
+            "names": [
+              "Juniper",
+              "NiMs",
+              "Patrick alias MarvinGS",
+              "Pluto",
+              "Tamlin",
+              "ami",
+              "halb9",
+              "larsh404"
+            ],
+            "value": 8
+          }
+        ]
+      },
+      "space": "Mainframe",
+      "state": {
+        "icon": {
+          "closed": "https://www.kreativitaet-trifft-technik.de/media/img/mainframe-closed.svg",
+          "open": "https://www.kreativitaet-trifft-technik.de/media/img/mainframe-open.svg"
+        },
+        "lastchange": 1791483594,
+        "message": "Open!",
+        "open": true
+      },
+      "url": "https://mainframe.io/"
+    }
+  }
+]

@@ -1,54 +1,80 @@
-spacepush
-=====
+# SpacePush
 
-Not even an alpha 
+Sends push notifications to the [SpaceState](https://github.com/kerker00/SpaceState) apps when a hackerspace opens or closes.
 
-An OTP application that provides apple push notification server. The goal is to keep the application as simple as even possible. This means also to make use of as little dependencies as possible. 
+An Erlang/OTP application that:
 
+- polls the [SpaceAPI](https://spaceapi.io) aggregator (`api.spaceapi.io`) for the state of every listed space,
+- also polls Mainframe Oldenburg's `openState` endpoint for its rooms (Radstelle, 3D Lab, Machining) and finer states (members only, closing, …),
+- waits until a new state has held for two minutes, so short flaps send nothing,
+- sends the notification over APNs HTTP/2 with token-based authentication to every device that subscribed to that space or room.
 
-Build
------
+## Requirements
 
-    $ rebar compile
+- Erlang/OTP 28
+- rebar3
 
-Structure
---- 
-each push notification channel will for each device token will open an ssl connection to the APNS (Apple Push Notification Service) server an will keep it open. This is the recommended behavior by Apple Inc. 
-Therefor each incoming new token/device will create a new process that handles the connection.    
+## Run locally
 
-<center> ![Abstract Structure of SpacePush](https://raw.githubusercontent.com/GrafixMafia/SpacePush/master/doc/struct_small.png "Abstract Structure of SpacePush")
-</center>
+    rebar3 shell
 
-Dependencies
---- 
-The spacepush application dependens on the following applications/libs:
+Without an APNs key, notifications are only logged. Device registrations are stored in `data/registry.dets`.
 
-* jiffy - a json coding and decoding lib that doesn't has any further dependencies ([on GitHub](https://github.com/davisp/jiffy))
+## API
 
+Register a device (replaces an earlier registration of the same token):
 
-Features 
---- 
-will send configurable push notifications to apple devices
+    PUT /v1/devices/<hex device token>
+    Content-Type: application/json
 
-Not a Feature yet
---- 
-This application does not make use of the new introduced HTTP/2 APNS API. This is because the Erlang http client does not support the „new“ HTTP protocol yet.
-There is no android push support. I would be happy to support these devices to, but i don’t have any Android device and i do not plan to own one. So if you would like to see Android support, i welcome you to send pull requests!  
+    {
+      "environment": "sandbox",
+      "subscriptions": [
+        {"endpoint": "https://status.mainframe.io/api/spaceInfo", "room": "radstelle"},
+        {"endpoint": "https://api.nerd2nerd.org/status.json"}
+      ]
+    }
 
- 
+`environment` is `sandbox` for development builds and `production` for App Store and TestFlight builds. `room` defaults to `space`; only Mainframe has other rooms. Answers `204`.
 
-Credits
----
+Remove a device:
 
-License
----
+    DELETE /v1/devices/<hex device token>
 
-The MIT License (MIT)
+`GET /health` answers `200` for uptime checks. Requests are limited per client (30 per minute by default).
 
-Copyright (c) 2015 GrafixMafia
+## Notifications
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+The alert title is the space name (and the room for Mainframe rooms). The body is a localization key the apps resolve:
 
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+| State | Key |
+| --- | --- |
+| open | `PUSH_STATE_OPEN` |
+| closed | `PUSH_STATE_CLOSED` |
+| keyholder | `PUSH_STATE_KEYHOLDER` |
+| member | `PUSH_STATE_MEMBER` |
+| open+ | `PUSH_STATE_OPEN_PLUS` |
+| closing | `PUSH_STATE_CLOSING` |
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+The payload also carries `endpoint`, `room` and `state`.
+
+## Configuration
+
+All settings live in the `spacepush` application environment (see `src/spacepush.app.src` for defaults and `config/sys.config` for local development):
+
+| Key | Purpose |
+| --- | --- |
+| `apns_key_file` | Path to the `.p8` key; `undefined` only logs notifications |
+| `apns_key_id`, `apns_team_id` | Key ID and team ID from the Apple Developer account |
+| `apns_topic` | App bundle ID |
+| `http_ip`, `http_port` | Listener; defaults to `127.0.0.1:8080` behind a reverse proxy |
+| `trust_proxy` | Rate-limit by `X-Forwarded-For`; enable only behind a trusted proxy |
+| `poll_interval_ms`, `debounce_ms` | Polling interval and how long a state must hold |
+
+## Tests
+
+    rebar3 eunit
+
+## License
+
+MIT, see [LICENSE](LICENSE).

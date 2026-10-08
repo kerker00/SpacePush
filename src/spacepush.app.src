@@ -1,12 +1,33 @@
-{application, spacepush,
- [
- {description, "An OTP application"},
-  {vsn, "0.1.0"},
-  {registered, []},
-  {applications,
-   [kernel,
-    stdlib
-   ]},
-  {mod, {spacepush_app, []}},
-  {env,[]}
- ]}.
+{application, spacepush, [
+    {description, "Push notifications when a hackerspace opens or closes"},
+    {vsn, "0.2.0"},
+    {registered, [
+        spacepush_sup, spacepush_registry, spacepush_ratelimit,
+        spacepush_apns, spacepush_dispatcher, spacepush_poller
+    ]},
+    {mod, {spacepush_app, []}},
+    {applications, [kernel, stdlib, crypto, public_key, ssl, inets, gun, cowboy]},
+    {env, [
+        %% Sources
+        {aggregator_url, "https://api.spaceapi.io/"},
+        {mainframe_url, "https://status.kreativitaet-trifft-technik.de/api/openState"},
+        {poll_interval_ms, 60000},
+        %% A state must hold this long before anyone is notified.
+        {debounce_ms, 120000},
+        %% HTTP API
+        {http_ip, {127, 0, 0, 1}},
+        {http_port, 8080},
+        %% Use the first X-Forwarded-For address as client, only behind a trusted proxy.
+        {trust_proxy, false},
+        {rate_limit_per_minute, 30},
+        %% Device registrations
+        {registry_file, "data/registry.dets"},
+        %% APNs token auth; without a key file notifications are only logged.
+        {apns_key_file, undefined},
+        {apns_key_id, undefined},
+        {apns_team_id, <<"7E3BJ546SA">>},
+        {apns_topic, <<"net.grafixmafia.spacestate">>}
+    ]},
+    {licenses, ["MIT"]},
+    {links, [{"GitHub", "https://github.com/kerker00/SpacePush"}]}
+]}.
