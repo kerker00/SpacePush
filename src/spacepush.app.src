@@ -1,12 +1,44 @@
-{application, spacepush,
- [
- {description, "An OTP application"},
-  {vsn, "0.1.0"},
-  {registered, []},
-  {applications,
-   [kernel,
-    stdlib
-   ]},
-  {mod, {spacepush_app, []}},
-  {env,[]}
- ]}.
+{application, spacepush, [
+    {description, "Push notifications when a hackerspace opens or closes"},
+    {vsn, "0.2.0"},
+    {registered, [
+        spacepush_sup, spacepush_ratelimit, spacepush_registry,
+        spacepush_outbox, spacepush_apns, spacepush_poller
+    ]},
+    {mod, {spacepush_app, []}},
+    {applications, [kernel, stdlib, crypto, public_key, ssl, inets, gun, cowboy]},
+    {env, [
+        %% Sources
+        {aggregator_url, "https://api.spaceapi.io/"},
+        {mainframe_url, "https://status.kreativitaet-trifft-technik.de/api/openState"},
+        {poll_interval_ms, 60000},
+        %% Aggregator data older than this counts as unknown.
+        {max_data_age_s, 900},
+        %% A new state must be seen this long before anyone is notified.
+        {debounce_s, 120},
+        {tracker_file, "data/tracker.bin"},
+        %% HTTP API
+        {http_ip, {127, 0, 0, 1}},
+        {http_port, 8080},
+        %% Use the first X-Forwarded-For address as client, only behind a trusted proxy.
+        {trust_proxy, false},
+        {rate_limit_per_minute, 30},
+        {http_body_timeout_ms, 10000},
+        %% Device registrations; the apps re-register on every launch.
+        {registry_file, "data/registry.dets"},
+        {max_registrations, 10000},
+        {registration_ttl_days, 60},
+        %% Deliveries
+        {outbox_file, "data/outbox.dets"},
+        {delivery_ttl_ms, 3600000},
+        {apns_max_in_flight, 20},
+        {apns_request_timeout_ms, 15000},
+        %% APNs token auth; without a key file deliveries are only logged.
+        {apns_key_file, undefined},
+        {apns_key_id, undefined},
+        {apns_team_id, <<"7E3BJ546SA">>},
+        {apns_topic, <<"net.grafixmafia.spacestate">>}
+    ]},
+    {licenses, ["MIT"]},
+    {links, [{"GitHub", "https://github.com/kerker00/SpacePush"}]}
+]}.
