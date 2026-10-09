@@ -293,14 +293,16 @@ Build the new version into its own directory under `~/opt` as in steps 1 and 2, 
 
 Remote shell into the running node, for inspection (`Ctrl-G q` leaves without stopping it):
 
+    export VMARGS_PATH=~/spacepush/vm.args RELX_CONFIG_PATH=~/spacepush/sys.config
     ~/spacepush/release/bin/spacepush remote_console
 
-The release script reads `vm.args` and `sys.config` from `VMARGS_PATH` and `RELX_CONFIG_PATH`, which the service sets; export both before calling it by hand.
+The release script reads `vm.args` and `sys.config` from these two variables; the service sets them itself. The node must be named `spacepush@localhost` in `vm.args`: with a plain `-sname spacepush` it is `spacepush@<host>`, the host name resolves to the public address, where the distribution does not listen, and `remote_console` reports "Node is not running!".
 
 ### Troubleshooting
 
 | Symptom | Cause and fix |
 | --- | --- |
+| `remote_console` says "Node is not running!" although the service runs | `vm.args` still has `-sname spacepush`. Change it to `-sname spacepush@localhost` and restart the service. |
 | `/v1/directory` answers `directory_unavailable` | The list could not be loaded. Check the log for `directory_fetch_failed`; `too_large` means `directory_max_bytes` is too small. |
 | `config ok` check fails with `enoent` | A key file is not where `apns_keys` (or `apns_key_file`) says; compare `ls ~/spacepush/secrets` with the paths in `sys.config`. |
 | `uberspace web backend list` says the backend is not OK | SpacePush is not running or listens on the wrong interface or port; it must listen on `0.0.0.0:52184`. |
