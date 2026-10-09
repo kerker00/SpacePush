@@ -120,6 +120,31 @@ All settings live in the `spacepush` application environment (see `src/spacepush
 | `apns_max_in_flight`, `apns_request_timeout_ms` | Concurrent APNs requests and their deadline |
 | `registry_file`, `outbox_file`, `tracker_file`, `directory_file` | Where state is kept on disk |
 
+## Deploy on Uberspace 7
+
+Uberspace 7 runs CentOS 7, whose Erlang and OpenSSL are too old, so both are built once in the home directory. Templates for the configuration and the service are in `deploy/uberspace/`.
+
+1. **OpenSSL 3.5** (static, ~10 min) into `~/opt/openssl-3.5.9`:
+
+        ./Configure linux-x86_64 --prefix=$HOME/opt/openssl-3.5.9 --libdir=lib no-shared no-tests -fPIC
+        make -j2 && make install_sw
+
+2. **Erlang/OTP 28** (~30 min) into `~/opt/otp-28.5.0.7`, linked against it:
+
+        ./configure --prefix=$HOME/opt/otp-28.5.0.7 --with-ssl=$HOME/opt/openssl-3.5.9 --disable-dynamic-ssl-lib \
+          --without-javac --without-wx --without-odbc --without-observer --without-debugger --without-et
+        make -j2 && make install
+
+3. **rebar3** in `~/bin`, with the new Erlang first in `PATH`.
+4. **Release**: `rebar3 as prod release` in a checkout, then copy `_build/prod/rel/spacepush` to `~/spacepush/release`. It contains the Erlang runtime.
+5. **Configuration**: `~/spacepush/sys.config` and `~/spacepush/vm.args` from the templates, the APNs key in `~/spacepush/secrets/` (mode 600), data in `~/spacepush/data/`.
+6. **Service**: `deploy/uberspace/spacepush.ini` to `~/etc/services.d/`, then `supervisorctl reread && supervisorctl update`.
+7. **Web backend**: `uberspace web backend set push.grafixmafia.net --http --port 52184`; the port stays closed to the outside, Uberspace's proxy forwards HTTPS to it.
+
+Check with `curl https://push.grafixmafia.net/health`. Logs: `supervisorctl tail -f spacepush`.
+
+To update: build a new release, copy it to `~/spacepush/release.new`, then `supervisorctl stop spacepush`, swap the directories and `supervisorctl start spacepush`. Data, configuration and key live outside the release.
+
 ## Tests
 
     rebar3 eunit
