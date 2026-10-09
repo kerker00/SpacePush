@@ -1,0 +1,7 @@
+## Copy to ~/spacepush/vm.args and set a long random cookie, e.g. from
+##   openssl rand -hex 32
+## The cookie guards the Erlang distribution; keep the file readable only by you.
+-sname spacepush
+-setcookie COOKIE
+## Accept distribution connections (remote console) only from this host.
+-kernel inet_dist_use_interface {127,0,0,1}

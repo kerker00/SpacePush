@@ -1,39 +1,27 @@
-%%%-------------------------------------------------------------------
-%% @doc spacepush top level supervisor.
-%% @end
-%%%-------------------------------------------------------------------
-
 -module(spacepush_sup).
-
 -behaviour(supervisor).
 
-%% API
 -export([start_link/0]).
-
-%% Supervisor callbacks
 -export([init/1]).
 
--define(SERVER, ?MODULE).
-
-%% Helper macro for declaring children of supervisor
--define(CHILD(I, Type), {I, {I, start_link, []}, permanent, 5000, Type, [I]}).
-
-%%====================================================================
-%% API functions
-%%====================================================================
-
 start_link() ->
-    supervisor:start_link({local, ?SERVER}, ?MODULE, []).
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
-%%====================================================================
-%% Supervisor callbacks
-%%====================================================================
-
-%% Child :: {Id,StartFunc,Restart,Shutdown,Type,Modules}
+%% Ordered so that each process finds the ones it calls already running.
+%% rest_for_one restarts everything after a crashed process, so the sender
+%% never holds requests for an outbox or registry that was restarted.
+%% Pending work survives in the outbox and the tracker file.
 init([]) ->
-    SpacepushServ = ?CHILD(spacepush_serv, worker),
-    {ok, { {one_for_all, 0, 1}, [SpacepushServ]} }.
+    Children = [
+        worker(spacepush_ratelimit),
+        worker(spacepush_registry),
+        worker(spacepush_directory),
+        worker(spacepush_cache),
+        worker(spacepush_outbox),
+        worker(spacepush_apns),
+        worker(spacepush_poller)
+    ],
+    {ok, {#{strategy => rest_for_one, intensity => 5, period => 60}, Children}}.
 
-%%====================================================================
-%% Internal functions
-%%====================================================================
+worker(Module) ->
+    #{id => Module, start => {Module, start_link, []}}.
