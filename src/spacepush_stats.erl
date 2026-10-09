@@ -3,45 +3,48 @@
 Usage statistics for monitoring, served by `GET /v1/stats`.
 
 Counts events per day (requests, registrations, deliveries, fetches, state
-changes) and the distinct app installs per day, ISO week and month. Days
+changes) and the active app installs per day, ISO week and month. Days
 follow the server's local time.
 
-Installs are counted by the random ID the apps send in `X-SpaceState-Install`.
-SpacePush never keeps that ID: it stores an HMAC of it under a secret salt,
-only for the last `?INSTALL_DAYS` days, and keeps just the counts after that.
-Client addresses are not recorded at all.
+Installs are counted without identifying them: an app sends
+`X-SpaceState-First: day, week, month` (or a part of it) with its first request
+of each period, and SpacePush adds one per named period. The app versions,
+platforms and OS versions are tallied per ISO week from those week reports.
+No ID and no client address is recorded.
 
 Recording is a cast, so a caller never waits for or fails because of this
 process. Everything is saved to `stats_file` every minute and on shutdown.
 
-On disk: `{stats, 1, Salt, Days, Installs, Uniques, LastSuccess, Processed}`.
+On disk: `{stats, 2, Days, Weeks, LastSuccess}`. Format 1 files, which held
+hashed install IDs, are migrated on start and keep only their counters.
 """.
 -behaviour(gen_server).
 
 -export([start_link/0, request/2, rate_limited/1, count/1, count/2, duration/2, success/1, report/1]).
--export([install_id/1, user_agent/1, periods_closed_by/1, week_label/1]).
+-export([first_periods/1, user_agent/1, week_label/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(TICK_MS, 60000).
-%% Long enough to compute every week and month that ends within it.
--define(INSTALL_DAYS, 40).
--define(COUNTER_DAYS, 400).
+%% Long enough for the 13 months before the current one.
+-define(COUNTER_DAYS, 430).
 -define(MAX_REPORT_DAYS, 400).
+-define(HISTORY_WEEKS, 12).
 
 -type install() :: {Version :: binary(), Os :: binary(), OsVersion :: binary()}.
+-type period() :: day | week | month.
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 -doc """
 Records an API request of `Kind` (such as `<<"directory">>`). Requests from
-the apps carry their install ID; widgets and other clients are only counted.
+the apps may open a day, week or month; widgets and other clients are only counted.
 """.
 -spec request(binary(), cowboy_req:req()) -> ok.
 request(Kind, Req) ->
     Client = user_agent(cowboy_req:header(<<"user-agent">>, Req)),
-    Install = install_id(cowboy_req:header(<<"x-spacestate-install">>, Req)),
-    gen_server:cast(?MODULE, {request, today(), Kind, Client, Install}).
+    First = first_periods(cowboy_req:header(<<"x-spacestate-first">>, Req)),
+    gen_server:cast(?MODULE, {request, today(), Kind, Client, First}).
 
 -spec rate_limited(read | write) -> ok.
 rate_limited(Bucket) ->
@@ -72,16 +75,13 @@ success(Source) ->
 report(Days) ->
     gen_server:call(?MODULE, {report, min(max(Days, 1), ?MAX_REPORT_DAYS)}).
 
--doc "The install ID if it is a UUID, lowercased; anything else is ignored.".
--spec install_id(term()) -> binary() | none.
-install_id(Id) when is_binary(Id), byte_size(Id) =:= 36 ->
-    Pattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
-    case re:run(Id, Pattern, [{capture, none}]) of
-        match -> string:lowercase(Id);
-        nomatch -> none
-    end;
-install_id(_) ->
-    none.
+-doc "The periods named in `X-SpaceState-First`, such as `day, week`; unknown names are ignored.".
+-spec first_periods(term()) -> [period()].
+first_periods(Header) when is_binary(Header), byte_size(Header) =< 64 ->
+    Names = [string:trim(Name) || Name <- binary:split(Header, <<",">>, [global])],
+    [Period || {Name, Period} <- [{<<"day">>, day}, {<<"week">>, week}, {<<"month">>, month}], lists:member(Name, Names)];
+first_periods(_) ->
+    [].
 
 -doc """
 Reads the apps' user agent, `SpaceState/2.0.0 (iOS 26.0)` or
@@ -98,21 +98,6 @@ user_agent(Agent) when is_binary(Agent), byte_size(Agent) =< 256 ->
 user_agent(_) ->
     other.
 
--doc "The periods that end with `Date`: always its day, plus its ISO week on Sundays and its month on its last day.".
--spec periods_closed_by(calendar:date()) -> [{binary(), [calendar:date()]}].
-periods_closed_by({Year, Month, Day} = Date) ->
-    Week =
-        case calendar:day_of_the_week(Date) of
-            7 -> [{week_label(Date), [add_days(Date, -N) || N <- lists:seq(6, 0, -1)]}];
-            _ -> []
-        end,
-    MonthPeriod =
-        case calendar:last_day_of_the_month(Year, Month) of
-            Day -> [{month_label(Date), [{Year, Month, D} || D <- lists:seq(1, Day)]}];
-            _ -> []
-        end,
-    [{day_label(Date), [Date]} | Week ++ MonthPeriod].
-
 -spec week_label(calendar:date()) -> binary().
 week_label(Date) ->
     {Year, Week} = calendar:iso_week_number(Date),
@@ -124,21 +109,21 @@ init([]) ->
     Today = today(),
     State0 =
         case spacepush_store:load(File, none) of
-            {stats, 1, Salt, Days, Installs, Uniques, LastSuccess, Processed} ->
-                #{salt => Salt, days => Days, installs => Installs, uniques => Uniques,
-                  last_success => LastSuccess, processed => Processed};
+            {stats, 2, Days, Weeks, LastSuccess} ->
+                #{days => Days, weeks => Weeks, last_success => LastSuccess};
+            %% Format 1 kept hashed install IDs; only the counters are carried over.
+            {stats, 1, _Salt, Days, _Installs, _Uniques, LastSuccess, _Processed} ->
+                #{days => Days, weeks => #{}, last_success => LastSuccess};
             _ ->
-                #{salt => crypto:strong_rand_bytes(32), days => #{}, installs => #{}, uniques => #{},
-                  last_success => #{}, processed => add_days(Today, -1)}
+                #{days => #{}, weeks => #{}, last_success => #{}}
         end,
     erlang:send_after(?TICK_MS, self(), tick),
-    {ok, close_days(State0#{file => File, dirty => true}, Today)}.
+    {ok, prune(State0#{file => File, dirty => true}, Today)}.
 
-handle_call({report, Days}, _From, State0) ->
-    State = close_days(State0, today()),
+handle_call({report, Days}, _From, State) ->
     {reply, build_report(Days, State), State}.
 
-handle_cast({request, Date, Kind, Client, Install}, State) ->
+handle_cast({request, Date, Kind, Client, First}, State) ->
     State1 = add(Date, <<"requests.", Kind/binary>>, 1, State),
     State2 =
         case Client of
@@ -146,7 +131,7 @@ handle_cast({request, Date, Kind, Client, Install}, State) ->
             other -> add(Date, <<"requests.other">>, 1, State1);
             {app, _} -> State1
         end,
-    {noreply, record_install(Date, Client, Install, State2)};
+    {noreply, record_first(Date, Client, First, State2)};
 handle_cast({count, Date, Key, N}, State) ->
     {noreply, add(Date, Key, N, State)};
 handle_cast({duration, Date, Key, Ms}, State) ->
@@ -157,22 +142,40 @@ handle_cast({success, Source, At}, #{last_success := LastSuccess} = State) ->
 
 handle_info(tick, State) ->
     erlang:send_after(?TICK_MS, self(), tick),
-    {noreply, save(close_days(State, today()))};
+    {noreply, save(prune(State, today()))};
 handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, State) ->
     save(State).
 
-%% Only app requests with a valid install ID count as installs.
-record_install(Date, {app, Info}, Install, #{salt := Salt, installs := Installs} = State) when is_binary(Install) ->
-    Hash = binary:part(crypto:mac(hmac, sha256, Salt, Install), 0, 16),
-    Day = maps:get(Date, Installs, #{}),
-    State#{installs := Installs#{Date => Day#{Hash => Info}}, dirty := true};
-record_install(Date, {app, _Info}, none, State) ->
-    add(Date, <<"requests.without_install">>, 1, State);
-record_install(_Date, _Client, _Install, State) ->
+%% Only the apps report the periods they open; a week report also tallies their version.
+record_first(Date, {app, Info}, First, State0) ->
+    lists:foldl(
+        fun(Period, State) ->
+            State1 = add(Date, <<"installs.", (atom_to_binary(Period))/binary>>, 1, State),
+            case Period of
+                week -> tally_week(week_label(Date), Info, State1);
+                _ -> State1
+            end
+        end,
+        State0,
+        First
+    );
+record_first(_Date, _Client, _First, State) ->
     State.
+
+tally_week(Label, {Version, Os, OsVersion}, #{weeks := Weeks} = State) ->
+    Week0 = maps:get(Label, Weeks, #{}),
+    Week = lists:foldl(
+        fun({Group, Key}, Acc) ->
+            Counts = maps:get(Group, Acc, #{}),
+            Acc#{Group => Counts#{Key => maps:get(Key, Counts, 0) + 1}}
+        end,
+        Week0,
+        [{<<"versions">>, Version}, {<<"platforms">>, Os}, {<<"os_versions">>, <<Os/binary, " ", OsVersion/binary>>}]
+    ),
+    State#{weeks := Weeks#{Label => Week}, dirty := true}.
 
 add(Date, Key, N, State) ->
     update(Date, Key, fun(Value) -> Value + N end, State).
@@ -181,67 +184,40 @@ update(Date, Key, Fun, #{days := Days} = State) ->
     Counters = maps:get(Date, Days, #{}),
     State#{days := Days#{Date => Counters#{Key => Fun(maps:get(Key, Counters, 0))}}, dirty := true}.
 
-%% Stores the distinct installs of every period that ended before `Today`,
-%% then drops install hashes and counters that are no longer needed.
-close_days(#{processed := Processed} = State0, Today) ->
-    First = later(add_days(Processed, 1), add_days(Today, -?COUNTER_DAYS)),
-    Closed = dates(First, add_days(Today, -1)),
-    State1 = lists:foldl(fun close_day/2, State0, Closed),
-    State2 =
-        case Closed of
-            [] -> State1;
-            _ -> State1#{processed := lists:last(Closed), dirty := true}
-        end,
-    prune(State2, Today).
-
-close_day(Date, #{uniques := Uniques, installs := Installs} = State) ->
-    New = maps:from_list([{Label, distinct(PeriodDates, Installs)} || {Label, PeriodDates} <- periods_closed_by(Date)]),
-    State#{uniques := maps:merge(Uniques, New)}.
-
-prune(#{installs := Installs, days := Days} = State, Today) ->
-    InstallCutoff = add_days(Today, -?INSTALL_DAYS),
+%% Drops counters and weekly tallies that are no longer reported.
+prune(#{days := Days, weeks := Weeks} = State, Today) ->
     CounterCutoff = add_days(Today, -?COUNTER_DAYS),
+    Recent = [week_label(add_days(Today, -7 * N)) || N <- lists:seq(0, ?HISTORY_WEEKS)],
     State#{
-        installs := maps:filter(fun(Date, _) -> Date >= InstallCutoff end, Installs),
-        days := maps:filter(fun(Date, _) -> Date >= CounterCutoff end, Days)
+        days := maps:filter(fun(Date, _) -> Date >= CounterCutoff end, Days),
+        weeks := maps:with(Recent, Weeks)
     }.
-
-distinct(Dates, Installs) ->
-    map_size(union(Dates, Installs)).
-
-union(Dates, Installs) ->
-    lists:foldl(fun(Date, Acc) -> maps:merge(Acc, maps:get(Date, Installs, #{})) end, #{}, Dates).
 
 save(#{dirty := false} = State) ->
     State;
-save(#{file := File, salt := Salt, days := Days, installs := Installs, uniques := Uniques,
-       last_success := LastSuccess, processed := Processed} = State) ->
-    spacepush_store:save(File, {stats, 1, Salt, Days, Installs, Uniques, LastSuccess, Processed}),
+save(#{file := File, days := Days, weeks := Weeks, last_success := LastSuccess} = State) ->
+    spacepush_store:save(File, {stats, 2, Days, Weeks, LastSuccess}),
     State#{dirty := false}.
 
-build_report(Days, #{days := Counters, installs := Installs, uniques := Uniques, last_success := LastSuccess}) ->
+build_report(Days, #{days := Counters, weeks := Weeks, last_success := LastSuccess}) ->
     Today = today(),
     Monday = add_days(Today, 1 - calendar:day_of_the_week(Today)),
     {Year, Month, _} = Today,
-    Recent = union(dates(add_days(Today, -6), Today), Installs),
+    Sum = fun(Period, Dates) -> installs(Period, Dates, Counters) end,
+    ThisWeek = maps:get(week_label(Today), Weeks, #{}),
     #{
         <<"generated_at">> => rfc3339(erlang:system_time(millisecond)),
         <<"service">> => service(),
         <<"devices">> => devices(),
         <<"outbox">> => #{<<"pending">> => spacepush_outbox:pending()},
         <<"installs">> => #{
-            <<"today">> => distinct([Today], Installs),
-            <<"this_week">> => distinct(dates(Monday, Today), Installs),
-            <<"this_month">> => distinct(dates({Year, Month, 1}, Today), Installs),
-            <<"days">> => history(<<"-">>, 10, Uniques),
-            <<"weeks">> => history(<<"-W">>, 12, Uniques),
-            <<"months">> => history(<<>>, 13, Uniques),
-            <<"last_7_days">> => #{
-                <<"installs">> => map_size(Recent),
-                <<"versions">> => tally(fun({Version, _Os, _OsVersion}) -> Version end, Recent),
-                <<"platforms">> => tally(fun({_Version, Os, _OsVersion}) -> Os end, Recent),
-                <<"os_versions">> => tally(fun({_Version, Os, OsVersion}) -> <<Os/binary, " ", OsVersion/binary>> end, Recent)
-            }
+            <<"today">> => Sum(day, [Today]),
+            <<"this_week">> => Sum(week, dates(Monday, Today)),
+            <<"this_month">> => Sum(month, dates({Year, Month, 1}, Today)),
+            <<"days">> => history(day, past_days(Today, 10), Counters),
+            <<"weeks">> => history(week, past_weeks(Monday, ?HISTORY_WEEKS), Counters),
+            <<"months">> => history(month, past_months(Today, 13), Counters),
+            <<"this_week_by">> => maps:merge(#{<<"versions">> => #{}, <<"platforms">> => #{}, <<"os_versions">> => #{}}, ThisWeek)
         },
         <<"last_success">> => maps:map(fun(_Source, At) -> rfc3339(At) end, LastSuccess),
         <<"days">> => [
@@ -256,20 +232,32 @@ devices() ->
     Names = maps:from_list([{Endpoint, Name} || #{endpoint := Endpoint, name := Name} <- spacepush_directory:entries()]),
     Summary#{<<"subscriptions">> := [S#{<<"name">> => maps:get(E, Names, null)} || #{<<"endpoint">> := E} = S <- Subscriptions]}.
 
-%% The newest `Count` closed periods whose label has the given shape:
-%% days `2026-10-09`, weeks `2026-W41`, months `2026-10`.
-history(Separator, Count, Uniques) ->
-    Labels = [Label || Label := _ <- Uniques, kind(Label) =:= Separator],
-    Newest = lists:sublist(lists:reverse(lists:sort(Labels)), Count),
-    [#{<<"period">> => Label, <<"installs">> => maps:get(Label, Uniques)} || Label <- Newest].
+installs(Period, Dates, Counters) ->
+    Key = <<"installs.", (atom_to_binary(Period))/binary>>,
+    lists:sum([maps:get(Key, maps:get(Date, Counters, #{}), 0) || Date <- Dates]).
 
-kind(<<_Year:4/binary, "-W", _Week:2/binary>>) -> <<"-W">>;
-kind(<<_Year:4/binary, "-", _Month:2/binary, "-", _Day:2/binary>>) -> <<"-">>;
-kind(<<_Year:4/binary, "-", _Month:2/binary>>) -> <<>>;
-kind(_) -> undefined.
+%% Past periods, newest first, as `{Label, Dates}`; only those the service has counters for.
+history(Period, Periods, Counters) ->
+    [
+        #{<<"period">> => Label, <<"installs">> => installs(Period, Dates, Counters)}
+     || {Label, Dates} <- Periods, lists:any(fun(Date) -> maps:is_key(Date, Counters) end, Dates)
+    ].
 
-tally(Key, Installs) ->
-    maps:fold(fun(_Hash, Info, Acc) -> maps:update_with(Key(Info), fun(N) -> N + 1 end, 1, Acc) end, #{}, Installs).
+past_days(Today, Count) ->
+    [{day_label(Date), [Date]} || N <- lists:seq(1, Count), Date <- [add_days(Today, -N)]].
+
+past_weeks(Monday, Count) ->
+    [{week_label(Start), dates(Start, add_days(Start, 6))} || N <- lists:seq(1, Count), Start <- [add_days(Monday, -7 * N)]].
+
+past_months({Year, Month, _Day}, Count) ->
+    [
+        {month_label({Y, M, 1}), dates({Y, M, 1}, {Y, M, calendar:last_day_of_the_month(Y, M)})}
+     || N <- lists:seq(1, Count), {Y, M} <- [month_before(Year, Month, N)]
+    ].
+
+month_before(Year, Month, N) ->
+    Index = Year * 12 + Month - 1 - N,
+    {Index div 12, Index rem 12 + 1}.
 
 with_average(#{<<"poll.ms_sum">> := Sum, <<"poll.rounds">> := Rounds} = Counters) when Rounds > 0 ->
     Counters#{<<"poll.ms_avg">> => Sum div Rounds};
@@ -292,9 +280,6 @@ today() ->
 
 add_days(Date, N) ->
     calendar:gregorian_days_to_date(calendar:date_to_gregorian_days(Date) + N).
-
-later(A, B) when A >= B -> A;
-later(_A, B) -> B.
 
 %% Empty when `From` is after `To`, for example after the clock was set back.
 dates(From, To) ->
