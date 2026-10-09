@@ -10,14 +10,15 @@ Every request:
   loopback, private or link-local addresses; TLS is still verified against
   the host name,
 - does not follow redirects, which could lead to internal addresses,
-- reads the body in chunks and aborts beyond `max_body_bytes`,
+- reads the body in chunks and aborts beyond a size limit: `max_body_bytes`
+  for spaces, `directory_max_bytes` for the aggregator's list,
 - gives up after `fetch_timeout_ms` in total.
 
 The function doing the request is configurable (`http_get`), so tests can
 replace the network.
 """.
 
--export([get/1, many/2, http_get/1, public_address/1]).
+-export([get/1, get/2, many/2, http_get/2, public_address/1]).
 
 %% get/1 is this module's fetch, not the process dictionary.
 -compile({no_auto_import, [get/1]}).
@@ -27,10 +28,16 @@ replace the network.
 -type result() :: {ok, binary()} | {error, term()}.
 -export_type([result/0]).
 
+-doc "Fetches a space's document, limited to `max_body_bytes`.".
 -spec get(binary() | string()) -> result().
 get(Url) ->
+    {ok, MaxBytes} = application:get_env(spacepush, max_body_bytes),
+    get(Url, MaxBytes).
+
+-spec get(binary() | string(), pos_integer()) -> result().
+get(Url, MaxBytes) ->
     {Module, Function} = application:get_env(spacepush, http_get, {?MODULE, http_get}),
-    Module:Function(unicode:characters_to_list(Url)).
+    Module:Function(unicode:characters_to_list(Url), MaxBytes).
 
 -doc "Fetches all URLs, at most `Concurrency` at a time, and returns each result.".
 -spec many([binary()], pos_integer()) -> #{binary() => result()}.
@@ -54,10 +61,9 @@ many(Urls, Concurrency, Running, Results) ->
     end.
 
 -doc "The default `http_get`: a real request with gun.".
--spec http_get(string()) -> result().
-http_get(Url) ->
+-spec http_get(string(), pos_integer()) -> result().
+http_get(Url, MaxBytes) ->
     {ok, Timeout} = application:get_env(spacepush, fetch_timeout_ms),
-    {ok, MaxBytes} = application:get_env(spacepush, max_body_bytes),
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
     case uri_string:parse(Url) of
         #{scheme := Scheme, host := Host} = Parsed when Scheme =:= "https"; Scheme =:= "http" ->

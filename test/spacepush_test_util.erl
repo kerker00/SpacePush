@@ -2,7 +2,7 @@
 -moduledoc "Helpers shared by the test modules.".
 
 -export([tmp_dir/1, fixture/1, setup_env/1, enqueue_in_fresh_node/1]).
--export([fake_responses/1, fake_get/1, fake_calls/1]).
+-export([fake_responses/1, fake_get/2, fake_calls/1]).
 
 -doc "An empty directory inside `_build`, so tests never write outside the project.".
 tmp_dir(Name) ->
@@ -35,14 +35,20 @@ fake_responses(Responses) ->
     persistent_term:put({?MODULE, responses}, Responses),
     persistent_term:put({?MODULE, calls}, counters:new(1, [])).
 
-fake_get(Url) ->
+%% Applies the size limit like the real fetch, so tests catch a limit that is too small.
+fake_get(Url, MaxBytes) ->
     counters:add(persistent_term:get({?MODULE, calls}), 1, 1),
-    case maps:get(list_to_binary(Url), persistent_term:get({?MODULE, responses}), {error, not_found}) of
-        {delay, Ms, Result} ->
-            timer:sleep(Ms),
-            Result;
-        Result ->
-            Result
+    Result =
+        case maps:get(list_to_binary(Url), persistent_term:get({?MODULE, responses}), {error, not_found}) of
+            {delay, Ms, Delayed} ->
+                timer:sleep(Ms),
+                Delayed;
+            Immediate ->
+                Immediate
+        end,
+    case Result of
+        {ok, Body} when byte_size(Body) > MaxBytes -> {error, too_large};
+        _ -> Result
     end.
 
 -doc "How many requests `fake_get/1` answered since the last `fake_responses/1`.".

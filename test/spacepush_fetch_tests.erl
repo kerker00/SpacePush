@@ -54,10 +54,17 @@ public_address_test_() ->
 %% These are refused before any connection is made, so they need no network.
 refuses_internal_targets_test_() ->
     {setup, fun() -> spacepush_test_util:setup_env("fetch_internal") end, [
-        ?_assertEqual({error, non_public_address}, spacepush_fetch:http_get("http://127.0.0.1:8080/v1/directory")),
-        ?_assertEqual({error, non_public_address}, spacepush_fetch:http_get("https://[::1]/")),
-        ?_assertEqual({error, non_public_address}, spacepush_fetch:http_get("http://169.254.169.254/latest/meta-data/")),
-        ?_assertEqual({error, non_public_address}, spacepush_fetch:http_get("http://localhost/")),
-        ?_assertEqual({error, invalid_url}, spacepush_fetch:http_get("file:///etc/passwd")),
-        ?_assertEqual({error, invalid_url}, spacepush_fetch:http_get("gopher://example.org/"))
+        ?_assertEqual({error, non_public_address}, spacepush_fetch:http_get("http://127.0.0.1:8080/v1/directory", 1000)),
+        ?_assertEqual({error, non_public_address}, spacepush_fetch:http_get("https://[::1]/", 1000)),
+        ?_assertEqual({error, non_public_address}, spacepush_fetch:http_get("http://169.254.169.254/latest/meta-data/", 1000)),
+        ?_assertEqual({error, non_public_address}, spacepush_fetch:http_get("http://localhost/", 1000)),
+        ?_assertEqual({error, invalid_url}, spacepush_fetch:http_get("file:///etc/passwd", 1000)),
+        ?_assertEqual({error, invalid_url}, spacepush_fetch:http_get("gopher://example.org/", 1000))
     ]}.
+
+size_limit_applies_test() ->
+    spacepush_test_util:setup_env("fetch_limit"),
+    Big = binary:copy(<<"x">>, 300000),
+    spacepush_test_util:fake_responses(#{url(1) => {ok, Big}}),
+    ?assertEqual({error, too_large}, spacepush_fetch:get(url(1))),
+    ?assertEqual({ok, Big}, spacepush_fetch:get(url(1), 4194304)).

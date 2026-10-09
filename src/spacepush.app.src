@@ -12,6 +12,7 @@
         {aggregator_url, "https://api.spaceapi.io/"},
         {directory_refresh_ms, 3600000},
         {directory_file, "data/directory.bin"},
+        {directory_max_bytes, 4194304},
         %% Aggregator states older than this are not shown.
         {max_data_age_s, 900},
         %% Fetching spaces directly: those subscribed or asked for within the window.

@@ -13,7 +13,8 @@ directory_test_() ->
         [
             fun loads_the_aggregator_list/0,
             fun keeps_the_saved_list_when_the_aggregator_fails/0,
-            fun starts_empty_without_list/0
+            fun starts_empty_without_list/0,
+            fun loads_a_list_larger_than_a_space_document/0
         ]}.
 
 aggregator() ->
@@ -49,3 +50,13 @@ starts_empty_without_list() ->
     start(),
     ?assertNot(spacepush_directory:loaded()),
     ?assertNot(spacepush_directory:known(?MAINFRAME)).
+
+%% The real aggregator list is far above the 256 KB allowed for a single space.
+loads_a_list_larger_than_a_space_document() ->
+    {ok, [Entry | _]} = {ok, json:decode(spacepush_test_util:fixture("aggregator.json"))},
+    Entries = [Entry#{<<"url">> => <<"https://s", (integer_to_binary(N))/binary, ".example/">>} || N <- lists:seq(1, 600)],
+    Body = iolist_to_binary(json:encode(Entries)),
+    ?assert(byte_size(Body) > 262144),
+    spacepush_test_util:fake_responses(#{aggregator() => {ok, Body}}),
+    start(),
+    ?assertEqual(600, length(spacepush_directory:entries())).

@@ -50,7 +50,8 @@ handle_cast(_Msg, State) ->
 
 handle_info(refresh, #{file := File} = State) ->
     Url = env(aggregator_url),
-    case spacepush_fetch:get(Url) of
+    %% The list of all spaces is far larger than a single space's document.
+    case spacepush_fetch:get(Url, env(directory_max_bytes)) of
         {ok, Body} ->
             try spacepush_state:parse_directory(Body, erlang:system_time(second), env(max_data_age_s)) of
                 [] ->
