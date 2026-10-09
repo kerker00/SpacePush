@@ -60,10 +60,12 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info(poll, #{file := File, tracker := Tracker, backoff := Backoff, round := Round} = State) ->
+    Started = erlang:monotonic_time(millisecond),
     MainframeUrl = unicode:characters_to_binary(env(mainframe_url)),
     Due = [MainframeUrl | due(needed(), Backoff, Round)],
     Fetched = spacepush_fetch:many(Due, env(fetch_concurrency)),
     Results = maps:map(fun(Url, Result) -> store(Url, Result) end, Fetched),
+    record_fetches(MainframeUrl, Results),
     Observations = lists:append([
         Observations
      || Url := {ok, Observations} <- Results, Url =/= spacepush_state:mainframe_endpoint()
@@ -74,11 +76,37 @@ handle_info(poll, #{file := File, tracker := Tracker, backoff := Backoff, round 
     %% of losing it.
     ok = spacepush_outbox:enqueue(Changes),
     Tracker1 =/= Tracker andalso spacepush_store:save(File, spacepush_state:snapshot(Tracker1)),
+    record_changes(Changes),
     Backoff1 = after_round(maps:map(fun(_Url, Result) -> backoff_result(Result) end, Results), Backoff, Round),
+    spacepush_stats:count(<<"poll.rounds">>),
+    spacepush_stats:duration(<<"poll">>, erlang:monotonic_time(millisecond) - Started),
     erlang:send_after(env(poll_interval_ms), self(), poll),
     {noreply, State#{tracker := Tracker1, backoff := Backoff1, round := Round + 1}};
 handle_info(_Info, State) ->
     {noreply, State}.
+
+%% Mainframe's openState is counted apart from the spaces' documents.
+record_fetches(MainframeUrl, Results) ->
+    {Mainframe, Spaces} = maps:fold(
+        fun(Url, Result, {M, S}) when Url =:= MainframeUrl -> {[Result | M], S};
+           (_Url, Result, {M, S}) -> {M, [Result | S]}
+        end,
+        {[], []},
+        Results
+    ),
+    record_fetches(<<"mainframe">>, Mainframe, <<"mainframe">>),
+    record_fetches(<<"spaces">>, Spaces, <<"spaces">>).
+
+record_fetches(Prefix, Results, Source) ->
+    Ok = length([ok || {ok, _Observations} <- Results]),
+    spacepush_stats:count(<<Prefix/binary, ".fetch_ok">>, Ok),
+    spacepush_stats:count(<<Prefix/binary, ".fetch_failed">>, length(Results) - Ok),
+    Ok > 0 andalso spacepush_stats:success(Source).
+
+record_changes(Changes) ->
+    Mainframe = spacepush_state:mainframe_endpoint(),
+    spacepush_stats:count(<<"changes.total">>, length(Changes)),
+    spacepush_stats:count(<<"changes.mainframe">>, length([C || {{Endpoint, _Room}, _, _, _} = C <- Changes, Endpoint =:= Mainframe])).
 
 %% Subscribed or recently requested, and listed in the directory.
 needed() ->

@@ -45,13 +45,14 @@ Register a device (replaces an earlier registration of the same token):
 
     {
       "environment": "sandbox",
+      "platform": "ios",
       "subscriptions": [
         {"endpoint": "https://status.mainframe.io/api/spaceInfo", "room": "radstelle"},
         {"endpoint": "https://api.nerd2nerd.org/status.json"}
       ]
     }
 
-`environment` is `sandbox` for development builds and `production` for App Store and TestFlight builds. `room` defaults to `space`; only Mainframe has other rooms. Every endpoint must be listed in the SpaceAPI directory. Answers `204`, or `400` for invalid input or an unknown endpoint, `408` if the body does not arrive within 10 seconds, `413` for a body over 16 KB, `429` when rate-limited and `503` when the registry is full or the directory is not loaded yet.
+`environment` is `sandbox` for development builds and `production` for App Store and TestFlight builds. `platform` (`ios` or `macos`) is optional and only used for the statistics. `room` defaults to `space`; only Mainframe has other rooms. Every endpoint must be listed in the SpaceAPI directory. Answers `204`, or `400` for invalid input or an unknown endpoint, `408` if the body does not arrive within 10 seconds, `413` for a body over 16 KB, `429` when rate-limited and `503` when the registry is full or the directory is not loaded yet.
 
 Remove a device:
 
@@ -66,6 +67,21 @@ Read the current state, in the shapes the apps already decode:
 Unknown endpoints answer `404`; a space that cannot be fetched and has nothing cached answers `502`, and too many spaces fetched at once `503`.
 
 `GET /health` answers `200` for uptime checks. Requests are limited per client and minute: 30 writes and 300 reads by default. At most 10 000 devices can be registered; registrations not renewed within 60 days expire, and the apps renew on every launch.
+
+## Statistics
+
+For monitoring, SpacePush keeps daily usage statistics and serves them as JSON on the server itself:
+
+    curl -s http://127.0.0.1:<port>/v1/stats?days=14
+
+The endpoint answers only requests from a loopback address that did not pass a proxy (no `X-Forwarded-For`); through the public domain it answers `404`. It reports:
+
+- **Devices:** registered devices in total, per APNs environment, per platform and per subscribed space or room.
+- **Installs:** distinct app installs today, this week and this month, the last 10 days, 12 weeks and 13 months, and the app versions, platforms and OS versions of the last 7 days.
+- **Per day** (`days`): requests per endpoint, widget and other requests, rate-limited requests, new, renewed, removed, expired and invalid registrations, deliveries by APNs result, fetches of the spaces and of Mainframe, directory refreshes, poll rounds with their duration, and confirmed state changes.
+- **Current state:** pending deliveries, last successful fetch per source, version, uptime, memory and process count.
+
+Installs are counted by a random ID the apps create on first launch and send as `X-SpaceState-Install`, together with a user agent such as `SpaceState/2.0.0 (iOS 26.0)`. SpacePush stores only an HMAC of the ID under a secret salt, for 40 days, and keeps just the counts after that. Client addresses are not recorded. Daily counters are kept for 400 days. Days follow the server's local time.
 
 ## Security
 
@@ -118,7 +134,7 @@ All settings live in the `spacepush` application environment (see `src/spacepush
 | `max_registrations`, `registration_ttl_days` | Cap and expiry for device registrations |
 | `delivery_ttl_ms` | How long a delivery is retried (also sent as `apns-expiration`) |
 | `apns_max_in_flight`, `apns_request_timeout_ms` | Concurrent APNs requests and their deadline |
-| `registry_file`, `outbox_file`, `tracker_file`, `directory_file` | Where state is kept on disk |
+| `registry_file`, `outbox_file`, `tracker_file`, `directory_file`, `stats_file` | Where state is kept on disk |
 
 ## Deploy on Uberspace 7
 
@@ -270,6 +286,7 @@ Build the new version into its own directory under `~/opt` as in steps 1 and 2, 
     supervisorctl status spacepush        # running?
     supervisorctl tail -f spacepush       # log; the level is notice, so only noteworthy events appear
     supervisorctl restart spacepush
+    curl -s http://127.0.0.1:52184/v1/stats | python3 -m json.tool    # usage statistics, see Statistics
 
 Remote shell into the running node, for inspection (`Ctrl-G q` leaves without stopping it):
 

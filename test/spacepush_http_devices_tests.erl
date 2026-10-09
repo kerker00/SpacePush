@@ -20,6 +20,17 @@ duplicate_subscriptions_collapse_test() ->
     Body = registration(<<"production">>, [#{<<"endpoint">> => ?ENDPOINT}, #{<<"endpoint">> => ?ENDPOINT}]),
     ?assertEqual({ok, production, [{?ENDPOINT, <<"space">>}]}, spacepush_http_devices:parse_registration(Body)).
 
+platform_test_() ->
+    Body = fun(Platform) ->
+        iolist_to_binary(json:encode(#{<<"environment">> => <<"sandbox">>, <<"subscriptions">> => [], <<"platform">> => Platform}))
+    end,
+    [
+        ?_assertEqual({ok, sandbox, [], <<"ios">>}, spacepush_http_devices:registration(Body(<<"ios">>))),
+        ?_assertEqual({ok, sandbox, [], <<"macos">>}, spacepush_http_devices:registration(Body(<<"macos">>))),
+        ?_assertEqual({ok, sandbox, [], <<"unknown">>}, spacepush_http_devices:registration(registration(<<"sandbox">>, []))),
+        ?_assertEqual({error, <<"invalid_platform">>}, spacepush_http_devices:registration(Body(<<"windows">>)))
+    ].
+
 invalid_registrations_test_() ->
     Cases = [
         {<<"invalid_json">>, <<"{nope">>},

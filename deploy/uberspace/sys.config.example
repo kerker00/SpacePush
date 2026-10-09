@@ -13,6 +13,7 @@
         {registry_file, "/home/USER/spacepush/data/registry.dets"},
         {outbox_file, "/home/USER/spacepush/data/outbox.dets"},
         {tracker_file, "/home/USER/spacepush/data/tracker.bin"},
+        {stats_file, "/home/USER/spacepush/data/stats.bin"},
 
         {apns_key_file, "/home/USER/spacepush/secrets/AuthKey_KEYID.p8"},
         {apns_key_id, <<"KEYID">>}
