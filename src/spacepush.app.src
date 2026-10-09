@@ -37,7 +37,7 @@
         {apns_key_file, undefined},
         {apns_key_id, undefined},
         {apns_team_id, <<"7E3BJ546SA">>},
-        {apns_topic, <<"net.grafixmafia.spacestate">>}
+        {apns_topic, <<"net.grafixmafia.spacepush">>}
     ]},
     {licenses, ["MIT"]},
     {links, [{"GitHub", "https://github.com/kerker00/SpacePush"}]}
