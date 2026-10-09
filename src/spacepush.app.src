@@ -1,6 +1,6 @@
 {application, spacepush, [
     {description, "Push notifications when a hackerspace opens or closes"},
-    {vsn, "0.3.0"},
+    {vsn, "2.0.0"},
     {registered, [
         spacepush_sup, spacepush_ratelimit, spacepush_registry, spacepush_directory,
         spacepush_cache, spacepush_outbox, spacepush_apns, spacepush_poller
