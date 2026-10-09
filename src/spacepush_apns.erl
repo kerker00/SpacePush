@@ -3,8 +3,12 @@
 Sends due deliveries from the outbox to APNs over HTTP/2 with token-based
 authentication.
 
-Keeps one connection per APNs environment, as Apple recommends, and renews
-the provider token before it expires after an hour. Requests are only sent on
+Keeps one connection per APNs environment, as Apple recommends. Each
+environment signs with its own key from `apns_keys`, or with the shared
+`apns_key_file` when `apns_keys` is not set; an environment without a key
+only logs its deliveries. Provider tokens are kept per environment and
+renewed before they expire after an hour, but at most every 20 minutes, as
+Apple requires. Requests are only sent on
 a connection that is up, so a request that times out was never queued inside
 gun. At most `apns_max_in_flight` requests are open at a time, each with a
 deadline, and at most one per device and topic.
@@ -18,23 +22,30 @@ What happens to a delivery depends on the result (see `classify/2`):
 - `invalid_token`: removed, together with the registration it was sent for
 - `retry` and `renew_token` (429, 5xx, timeout, lost connection, expired
   provider token): retried with exponential backoff until it expires
+- `invalid_provider_token` (wrong key, key ID or team, or a key not valid
+  for this environment): logged as a configuration error; the environment
+  pauses for 20 minutes and then tries once more with a fresh token
 
-Without a configured key file, deliveries are only logged.
+Without any key, deliveries are only logged.
 """.
 -behaviour(gen_server).
 
 -include_lib("kernel/include/logger.hrl").
 
--export([start_link/0, wake/0, classify/2, backoff_ms/1]).
+-export([start_link/0, wake/0, classify/2, backoff_ms/1, key_config/3, token_usable/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
-%% Apple rejects provider tokens older than an hour.
+%% Apple rejects provider tokens older than an hour, and refreshing them more
+%% often than every 20 minutes.
 -define(TOKEN_LIFETIME_S, 50 * 60).
+-define(MIN_TOKEN_AGE_S, 20 * 60).
+-define(INVALID_KEY_PAUSE_MS, 20 * 60 * 1000).
 -define(TICK_MS, 1000).
 -define(BASE_BACKOFF_MS, 5000).
 -define(MAX_BACKOFF_MS, 300000).
 
--type result() :: delivered | invalid_token | renew_token | retry | drop.
+-type result() :: delivered | invalid_token | renew_token | invalid_provider_token | retry | drop.
+-type environment() :: spacepush_registry:environment().
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
@@ -49,7 +60,8 @@ wake() ->
 classify(200, _Reason) -> delivered;
 classify(410, _Reason) -> invalid_token;
 classify(400, Reason) when Reason =:= <<"BadDeviceToken">>; Reason =:= <<"DeviceTokenNotForTopic">> -> invalid_token;
-classify(403, Reason) when Reason =:= <<"ExpiredProviderToken">>; Reason =:= <<"InvalidProviderToken">> -> renew_token;
+classify(403, <<"ExpiredProviderToken">>) -> renew_token;
+classify(403, <<"InvalidProviderToken">>) -> invalid_provider_token;
 classify(Status, _Reason) when Status =:= 429; Status >= 500 -> retry;
 classify(_Status, _Reason) -> drop.
 
@@ -57,24 +69,46 @@ classify(_Status, _Reason) -> drop.
 backoff_ms(Attempts) ->
     min(?BASE_BACKOFF_MS bsl min(Attempts, 16), ?MAX_BACKOFF_MS).
 
+-doc """
+The key file and key ID per environment: `apns_keys` if set, otherwise the
+shared `apns_key_file` and `apns_key_id` for both.
+""".
+-spec key_config(#{environment() => {file:filename_all(), binary()}} | undefined, file:filename_all() | undefined, binary() | undefined) ->
+    #{environment() => {file:filename_all(), binary()}}.
+key_config(Keys, _File, _KeyId) when is_map(Keys) -> maps:with([sandbox, production], Keys);
+key_config(undefined, undefined, _KeyId) -> #{};
+key_config(undefined, File, KeyId) -> #{sandbox => {File, KeyId}, production => {File, KeyId}}.
+
+-doc """
+Whether a provider token issued at `IssuedAt` can still be used at `Now`
+(seconds): it must be younger than 50 minutes, and after APNs reported it
+expired, it is replaced only once it is at least 20 minutes old.
+""".
+-spec token_usable(integer(), integer(), boolean()) -> boolean().
+token_usable(IssuedAt, Now, RenewRequested) ->
+    Age = Now - IssuedAt,
+    Age < ?TOKEN_LIFETIME_S andalso not (RenewRequested andalso Age >= ?MIN_TOKEN_AGE_S).
+
 init([]) ->
-    Key =
-        case env(apns_key_file) of
-            undefined ->
-                ?LOG_WARNING("No APNs key configured, deliveries are only logged"),
-                undefined;
-            File ->
-                spacepush_jwt:read_key(File)
-        end,
+    Keys = maps:map(
+        fun(_Environment, {File, KeyId}) -> #{key => spacepush_jwt:read_key(File), key_id => KeyId} end,
+        key_config(env(apns_keys), env(apns_key_file), env(apns_key_id))
+    ),
+    case lists:sort(maps:keys(Keys)) of
+        [] -> ?LOG_WARNING("No APNs key configured, deliveries are only logged");
+        [production, sandbox] -> ok;
+        [Only] -> ?LOG_WARNING(#{msg => apns_key_missing, configured => Only})
+    end,
     erlang:send_after(?TICK_MS, self(), tick),
     {ok, #{
-        key => Key,
-        key_id => env(apns_key_id),
+        keys => Keys,
         team_id => env(apns_team_id),
         topic => env(apns_topic),
         max_in_flight => env(apns_max_in_flight),
         request_timeout_ms => env(apns_request_timeout_ms),
-        provider_token => undefined,
+        tokens => #{},
+        renew => #{},
+        paused => #{},
         connections => #{},
         in_flight => #{}
     }}.
@@ -139,21 +173,30 @@ discard(Key, Id, State) ->
     spacepush_outbox:complete(Key, Id),
     State.
 
-send_when_up(#{key := Key, id := Id, token := Token, payload := Payload}, #{key := undefined} = State) ->
-    ?LOG_INFO(#{msg => dry_run_delivery, token => Token, payload => Payload}),
-    spacepush_stats:count(<<"push.dry_run">>),
-    spacepush_outbox:complete(Key, Id),
-    State;
-send_when_up(#{environment := Environment} = Delivery, State0) ->
-    %% Not up yet: the delivery stays due and is picked up again after gun_up.
-    case connection(Environment, State0) of
-        {up, Connection, State1} -> send(Delivery, Connection, State1);
-        {down, State1} -> State1
+send_when_up(#{key := Key, id := Id, environment := Environment} = Delivery, #{keys := Keys, paused := Paused} = State0) ->
+    Now = erlang:system_time(millisecond),
+    case {Keys, Paused} of
+        {#{Environment := _}, #{Environment := Until}} when Until > Now ->
+            %% The key was rejected: wait for the pause instead of asking APNs again.
+            spacepush_outbox:retry(Key, Id, Until),
+            State0;
+        {#{Environment := _}, _} ->
+            %% Not up yet: the delivery stays due and is picked up again after gun_up.
+            case connection(Environment, State0) of
+                {up, Connection, State1} -> send(Delivery, Connection, State1);
+                {down, State1} -> State1
+            end;
+        _ ->
+            #{token := Token, payload := Payload} = Delivery,
+            ?LOG_INFO(#{msg => dry_run_delivery, environment => Environment, token => Token, payload => Payload}),
+            spacepush_stats:count(<<"push.dry_run">>),
+            spacepush_outbox:complete(Key, Id),
+            State0
     end.
 
 send(Delivery, Connection, State0) ->
-    #{token := Token, payload := Payload, collapse_id := CollapseId, expires := Expires} = Delivery,
-    {ProviderToken, State2} = provider_token(State0),
+    #{token := Token, payload := Payload, collapse_id := CollapseId, expires := Expires, environment := Environment} = Delivery,
+    {ProviderToken, State2} = provider_token(Environment, State0),
     #{topic := Topic, request_timeout_ms := Timeout, in_flight := InFlight} = State2,
     Headers = [
         {<<"authorization">>, <<"bearer ", ProviderToken/binary>>},
@@ -198,9 +241,12 @@ finish(#{delivery := Delivery, status := Status, body := Body}, State) ->
             spacepush_outbox:complete(Key, Id),
             State;
         renew_token ->
-            ?LOG_WARNING(#{msg => apns_rejected_provider_token, reason => Reason}),
+            ?LOG_WARNING(#{msg => apns_provider_token_expired, environment => Environment}),
             schedule_retry(Delivery),
-            State#{provider_token := undefined};
+            #{renew := Renew} = State,
+            State#{renew := Renew#{Environment => true}};
+        invalid_provider_token ->
+            pause(Environment, Delivery, State);
         retry ->
             ?LOG_WARNING(#{msg => apns_temporary_failure, status => Status, reason => Reason}),
             schedule_retry(Delivery),
@@ -238,15 +284,44 @@ error_details(Body) ->
         error:_ -> {undefined, undefined}
     end.
 
-provider_token(#{provider_token := Current, key := Key, key_id := KeyId, team_id := TeamId} = State) ->
-    Now = erlang:system_time(second),
-    case Current of
-        {Token, IssuedAt} when Now - IssuedAt < ?TOKEN_LIFETIME_S ->
-            {Token, State};
+%% A wrong key does not fix itself, so the environment waits 20 minutes, which
+%% also keeps the next token within Apple's limit, and logs once per pause.
+pause(Environment, #{key := Key, id := Id}, #{paused := Paused, tokens := Tokens} = State) ->
+    Now = erlang:system_time(millisecond),
+    Until = Now + ?INVALID_KEY_PAUSE_MS,
+    case Paused of
+        #{Environment := Previous} when Previous > Now ->
+            ok;
         _ ->
-            Token = spacepush_jwt:token(KeyId, TeamId, Key, Now),
-            {Token, State#{provider_token := {Token, Now}}}
+            #{keys := #{Environment := #{key_id := KeyId}}, team_id := TeamId} = State,
+            ?LOG_ERROR(#{
+                msg => apns_key_rejected,
+                environment => Environment,
+                key_id => KeyId,
+                team_id => TeamId,
+                hint => "check that the key is valid for this environment and belongs to the team"
+            })
+    end,
+    spacepush_outbox:retry(Key, Id, Until),
+    State#{paused := Paused#{Environment => Until}, tokens := maps:remove(Environment, Tokens)}.
+
+provider_token(Environment, #{tokens := Tokens, renew := Renew} = State) ->
+    Now = erlang:system_time(second),
+    RenewRequested = maps:get(Environment, Renew, false),
+    case Tokens of
+        #{Environment := {Token, IssuedAt}} ->
+            case token_usable(IssuedAt, Now, RenewRequested) of
+                true -> {Token, State};
+                false -> new_token(Environment, Now, State)
+            end;
+        #{} ->
+            new_token(Environment, Now, State)
     end.
+
+new_token(Environment, Now, #{keys := Keys, team_id := TeamId, tokens := Tokens, renew := Renew} = State) ->
+    #{Environment := #{key := Key, key_id := KeyId}} = Keys,
+    Token = spacepush_jwt:token(KeyId, TeamId, Key, Now),
+    {Token, State#{tokens := Tokens#{Environment => {Token, Now}}, renew := maps:remove(Environment, Renew)}}.
 
 %% Opens the connection for an environment on first use; gun reconnects on its own.
 connection(Environment, #{connections := Connections} = State) ->

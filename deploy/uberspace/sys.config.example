@@ -15,8 +15,12 @@
         {tracker_file, "/home/USER/spacepush/data/tracker.bin"},
         {stats_file, "/home/USER/spacepush/data/stats.bin"},
 
-        {apns_key_file, "/home/USER/spacepush/secrets/AuthKey_KEYID.p8"},
-        {apns_key_id, <<"KEYID">>}
+        %% One key per APNs environment. A key valid for both ("Sandbox & Production")
+        %% can instead be set once with apns_key_file and apns_key_id.
+        {apns_keys, #{
+            sandbox => {"/home/USER/spacepush/secrets/AuthKey_SANDBOXKEYID.p8", <<"SANDBOXKEYID">>},
+            production => {"/home/USER/spacepush/secrets/AuthKey_PRODKEYID.p8", <<"PRODKEYID">>}
+        }}
     ]},
     {kernel, [{logger_level, notice}]}
 ].

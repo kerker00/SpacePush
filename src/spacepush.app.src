@@ -47,7 +47,10 @@
         {notification_cooldown_ms, 300000},
         {apns_max_in_flight, 20},
         {apns_request_timeout_ms, 15000},
-        %% APNs token auth; without a key file deliveries are only logged.
+        %% APNs token auth. apns_keys sets a key per environment,
+        %% #{sandbox => {File, KeyId}, production => {File, KeyId}}; otherwise
+        %% apns_key_file and apns_key_id serve both. Without a key deliveries are only logged.
+        {apns_keys, undefined},
         {apns_key_file, undefined},
         {apns_key_id, undefined},
         {apns_team_id, <<"7E3BJ546SA">>},

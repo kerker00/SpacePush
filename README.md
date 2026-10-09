@@ -118,8 +118,9 @@ All settings live in the `spacepush` application environment (see `src/spacepush
 
 | Key | Purpose |
 | --- | --- |
-| `apns_key_file` | Path to the `.p8` key; `undefined` only logs notifications |
-| `apns_key_id`, `apns_team_id` | Key ID and team ID from the Apple Developer account |
+| `apns_keys` | One `.p8` key per APNs environment: `#{sandbox => {File, KeyId}, production => {File, KeyId}}`. An environment without a key only logs its notifications |
+| `apns_key_file`, `apns_key_id` | One key for both environments ("Sandbox & Production"), used when `apns_keys` is not set; `undefined` only logs notifications |
+| `apns_team_id` | Team ID from the Apple Developer account |
 | `apns_topic` | App bundle ID |
 | `http_ip`, `http_port` | Listener; defaults to `127.0.0.1:8080` behind a reverse proxy |
 | `trust_proxy` | Rate-limit by `X-Forwarded-For`; enable only behind a trusted proxy |
@@ -214,11 +215,11 @@ The release contains the Erlang runtime (`erts-…`), so it runs on its own.
     mkdir -p ~/spacepush/data ~/spacepush/secrets && chmod 700 ~/spacepush/secrets
     cp ~/spacepush/src/deploy/uberspace/sys.config.example ~/spacepush/sys.config
     cp ~/spacepush/src/deploy/uberspace/vm.args.example ~/spacepush/vm.args
-    sed -i "s#/home/USER/#$HOME/#g; s#AuthKey_KEYID#AuthKey_<key id>#; s#<<\"KEYID\">>#<<\"<key id>\">>#" ~/spacepush/sys.config
+    sed -i "s#/home/USER/#$HOME/#g; s#SANDBOXKEYID#<sandbox key id>#g; s#PRODKEYID#<production key id>#g" ~/spacepush/sys.config
     sed -i "s#^-setcookie COOKIE#-setcookie $(openssl rand -hex 32)#" ~/spacepush/vm.args
     chmod 600 ~/spacepush/sys.config ~/spacepush/vm.args
 
-Upload the key **from the Mac**, naming the target file in full (newer `scp` fails with `dest open …: Failure` on a directory target):
+APNs keys are created per environment (Sandbox, Production) or for both. The template expects one per environment; with a single key for both, replace `apns_keys` by `apns_key_file` and `apns_key_id`. Upload each key **from the Mac**, naming the target file in full (newer `scp` fails with `dest open …: Failure` on a directory target):
 
     scp AuthKey_<key id>.p8 <user>@<host>.uberspace.de:spacepush/secrets/AuthKey_<key id>.p8
 
@@ -228,8 +229,10 @@ Then on the host:
     erl -noshell -pa ~/spacepush/release/lib/*/ebin -eval '
       {ok, [Config]} = file:consult(os:getenv("HOME") ++ "/spacepush/sys.config"),
       Env = proplists:get_value(spacepush, Config),
-      spacepush_jwt:read_key(proplists:get_value(apns_key_file, Env)),
-      io:format("config ok, key ok~n"), halt().'
+      Get = fun(Key) -> proplists:get_value(Key, Env) end,
+      Keys = spacepush_apns:key_config(Get(apns_keys), Get(apns_key_file), Get(apns_key_id)),
+      [spacepush_jwt:read_key(File) || {File, _KeyId} <- maps:values(Keys)],
+      io:format("config ok, keys ok for ~p~n", [maps:keys(Keys)]), halt().'
 
 Never commit the filled-in `sys.config`, `vm.args` or the key. The cookie in `vm.args` is a secret too.
 
@@ -299,10 +302,10 @@ The release script reads `vm.args` and `sys.config` from `VMARGS_PATH` and `RELX
 | Symptom | Cause and fix |
 | --- | --- |
 | `/v1/directory` answers `directory_unavailable` | The list could not be loaded. Check the log for `directory_fetch_failed`; `too_large` means `directory_max_bytes` is too small. |
-| `config ok` check fails with `enoent` | The key file is not where `apns_key_file` says; compare `ls ~/spacepush/secrets` with the path in `sys.config`. |
+| `config ok` check fails with `enoent` | A key file is not where `apns_keys` (or `apns_key_file`) says; compare `ls ~/spacepush/secrets` with the paths in `sys.config`. |
 | `uberspace web backend list` says the backend is not OK | SpacePush is not running or listens on the wrong interface or port; it must listen on `0.0.0.0:52184`. |
 | Warning about a post-quantum key exchange when connecting | Informational, from a newer SSH client; Uberspace 7's server does not offer it. |
-| Notifications never arrive | Log entries `apns_rejected_*` point to the key, key ID or topic (`apns_topic` must be the apps' bundle ID). |
+| Notifications never arrive | `apns_key_rejected` names the environment whose key APNs refused: the key is not valid for that environment (Sandbox or Production) or belongs to another team. Sending for it pauses 20 minutes. Other `apns_rejected_*` entries point to the topic (`apns_topic` must be the apps' bundle ID). |
 
 ## Tests
 
