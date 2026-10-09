@@ -1,44 +1,13 @@
 -module(spacepush_stats_tests).
 -include_lib("eunit/include/eunit.hrl").
 
--define(INSTALL_A, <<"0f8fad5b-d9cb-469f-a165-70867728950e">>).
--define(INSTALL_B, <<"7c9e6679-7425-40de-944b-e07fc1f90ae7">>).
 -define(APP, <<"SpaceState/2.0.0 (iOS 26.0)">>).
 
-install_id_test_() ->
+first_week_label_test_() ->
     [
-        ?_assertEqual(?INSTALL_A, spacepush_stats:install_id(?INSTALL_A)),
-        ?_assertEqual(?INSTALL_A, spacepush_stats:install_id(string:uppercase(?INSTALL_A))),
-        ?_assertEqual(none, spacepush_stats:install_id(<<"not-a-uuid">>)),
-        ?_assertEqual(none, spacepush_stats:install_id(<<"0f8fad5b-d9cb-469f-a165-70867728950z">>)),
-        ?_assertEqual(none, spacepush_stats:install_id(undefined))
-    ].
-
-user_agent_test_() ->
-    [
-        ?_assertEqual({app, {<<"2.0.0">>, <<"iOS">>, <<"26.0">>}}, spacepush_stats:user_agent(?APP)),
-        ?_assertEqual(
-            {widget, {<<"2.0.0">>, <<"macOS">>, <<"26.1">>}},
-            spacepush_stats:user_agent(<<"SpaceStateWidget/2.0.0 (macOS 26.1) CFNetwork/3826 Darwin/25.0.0">>)
-        ),
-        ?_assertEqual(other, spacepush_stats:user_agent(<<"SpaceState/1 CFNetwork/3826 Darwin/25.0.0">>)),
-        ?_assertEqual(other, spacepush_stats:user_agent(<<"curl/8.7.1">>)),
-        ?_assertEqual(other, spacepush_stats:user_agent(undefined))
-    ].
-
-periods_test_() ->
-    Labels = fun(Date) -> [Label || {Label, _Dates} <- spacepush_stats:periods_closed_by(Date)] end,
-    [
-        ?_assertEqual([<<"2026-10-08">>], Labels({2026, 10, 8})),
-        %% A Sunday closes its ISO week, Monday to Sunday.
-        ?_assertEqual([<<"2026-10-11">>, <<"2026-W41">>], Labels({2026, 10, 11})),
-        ?_assertEqual(
-            {2026, 10, 5},
-            hd(proplists:get_value(<<"2026-W41">>, spacepush_stats:periods_closed_by({2026, 10, 11})))
-        ),
-        ?_assertEqual([<<"2026-10-31">>, <<"2026-10">>], Labels({2026, 10, 31})),
+        ?_assertEqual(<<"2026-W41">>, spacepush_stats:week_label({2026, 10, 11})),
         %% The ISO week of 2027-01-03 belongs to 2026.
-        ?_assertEqual([<<"2027-01-03">>, <<"2026-W53">>], Labels({2027, 1, 3}))
+        ?_assertEqual(<<"2026-W53">>, spacepush_stats:week_label({2027, 1, 3}))
     ].
 
 server_test_() ->
@@ -47,7 +16,8 @@ server_test_() ->
         fun ignores_installs_of_other_clients/0,
         fun counts_events/0,
         fun survives_restart/0,
-        fun closes_past_periods/0,
+        fun reports_past_periods/0,
+        fun migrates_format_1/0,
         fun reports_devices/0
     ]}.
 
@@ -65,35 +35,37 @@ stop() ->
 req(Headers) ->
     #{headers => Headers, peer => {{127, 0, 0, 1}, 4711}}.
 
-app(Install) ->
-    req(#{<<"user-agent">> => ?APP, <<"x-spacestate-install">> => Install}).
+app(First) ->
+    req(#{<<"user-agent">> => ?APP, <<"x-spacestate-first">> => First}).
+
+app() ->
+    req(#{<<"user-agent">> => ?APP}).
 
 today(Report) ->
     hd(maps:get(<<"days">>, Report)).
 
 counts_requests_and_installs() ->
-    spacepush_stats:request(<<"directory">>, app(?INSTALL_A)),
-    spacepush_stats:request(<<"directory">>, app(?INSTALL_A)),
-    spacepush_stats:request(<<"space">>, app(?INSTALL_B)),
+    spacepush_stats:request(<<"directory">>, app(<<"day, week, month">>)),
+    spacepush_stats:request(<<"directory">>, app()),
+    spacepush_stats:request(<<"space">>, app(<<"day">>)),
     Report = spacepush_stats:report(7),
     ?assertMatch(#{<<"requests.directory">> := 2, <<"requests.space">> := 1}, today(Report)),
     ?assertEqual(7, length(maps:get(<<"days">>, Report))),
     Installs = maps:get(<<"installs">>, Report),
-    ?assertMatch(#{<<"today">> := 2, <<"this_week">> := 2, <<"this_month">> := 2}, Installs),
+    ?assertMatch(#{<<"today">> := 2, <<"this_week">> := 1, <<"this_month">> := 1}, Installs),
     ?assertMatch(
-        #{<<"installs">> := 2, <<"versions">> := #{<<"2.0.0">> := 2}, <<"os_versions">> := #{<<"iOS 26.0">> := 2}},
-        maps:get(<<"last_7_days">>, Installs)
+        #{<<"versions">> := #{<<"2.0.0">> := 1}, <<"platforms">> := #{<<"iOS">> := 1}, <<"os_versions">> := #{<<"iOS 26.0">> := 1}},
+        maps:get(<<"this_week_by">>, Installs)
     ).
 
 ignores_installs_of_other_clients() ->
-    spacepush_stats:request(<<"directory">>, req(#{<<"x-spacestate-install">> => ?INSTALL_A})),
-    spacepush_stats:request(<<"directory">>, req(#{<<"user-agent">> => <<"SpaceStateWidget/2.0.0 (iOS 26.0)">>})),
-    spacepush_stats:request(<<"directory">>, req(#{<<"user-agent">> => ?APP})),
+    spacepush_stats:request(<<"directory">>, req(#{<<"x-spacestate-first">> => <<"day">>})),
+    spacepush_stats:request(<<"directory">>, req(#{<<"user-agent">> => <<"SpaceStateWidget/2.0.0 (iOS 26.0)">>, <<"x-spacestate-first">> => <<"day">>})),
+    %% Earlier app builds sent an install ID instead; it is ignored.
+    spacepush_stats:request(<<"directory">>, req(#{<<"user-agent">> => ?APP, <<"x-spacestate-install">> => <<"0f8fad5b-d9cb-469f-a165-70867728950e">>})),
     Report = spacepush_stats:report(1),
-    ?assertMatch(
-        #{<<"requests.directory">> := 3, <<"requests.other">> := 1, <<"requests.widget">> := 1, <<"requests.without_install">> := 1},
-        today(Report)
-    ),
+    ?assertMatch(#{<<"requests.directory">> := 3, <<"requests.other">> := 1, <<"requests.widget">> := 1}, today(Report)),
+    ?assertNot(maps:is_key(<<"installs.day">>, today(Report))),
     ?assertMatch(#{<<"today">> := 0}, maps:get(<<"installs">>, Report)).
 
 counts_events() ->
@@ -114,31 +86,47 @@ counts_events() ->
     ?assert(is_binary(iolist_to_binary(json:encode(Report)))).
 
 survives_restart() ->
-    spacepush_stats:request(<<"directory">>, app(?INSTALL_A)),
+    spacepush_stats:request(<<"directory">>, app(<<"day, week">>)),
     spacepush_stats:count(<<"push.delivered">>),
     gen_server:stop(spacepush_stats),
     start(spacepush_stats),
-    spacepush_stats:request(<<"directory">>, app(?INSTALL_A)),
+    spacepush_stats:request(<<"directory">>, app(<<"day">>)),
     Report = spacepush_stats:report(1),
     ?assertMatch(#{<<"requests.directory">> := 2, <<"push.delivered">> := 1}, today(Report)),
-    ?assertMatch(#{<<"today">> := 1}, maps:get(<<"installs">>, Report)).
+    Installs = maps:get(<<"installs">>, Report),
+    ?assertMatch(#{<<"today">> := 2, <<"this_week">> := 1}, Installs),
+    ?assertMatch(#{<<"versions">> := #{<<"2.0.0">> := 1}}, maps:get(<<"this_week_by">>, Installs)).
 
-%% Writes a file as if the service had run on earlier days, then lets it close them.
-closes_past_periods() ->
+%% Writes a file as if the service had run on earlier days.
+reports_past_periods() ->
     gen_server:stop(spacepush_stats),
-    Today = date(),
-    Day = fun(N) -> calendar:gregorian_days_to_date(calendar:date_to_gregorian_days(Today) - N) end,
-    Info = {<<"2.0.0">>, <<"iOS">>, <<"26.0">>},
-    Installs = #{Day(3) => #{<<"a">> => Info, <<"b">> => Info}, Day(2) => #{<<"a">> => Info}},
+    Day = fun(N) -> calendar:gregorian_days_to_date(calendar:date_to_gregorian_days(date()) - N) end,
+    Days = #{Day(3) => #{<<"installs.day">> => 2}, Day(2) => #{<<"installs.day">> => 1}, Day(1) => #{<<"requests.space">> => 4}},
     {ok, File} = application:get_env(spacepush, stats_file),
-    spacepush_store:save(File, {stats, 1, <<"salt">>, #{}, Installs, #{}, #{}, Day(5)}),
+    spacepush_store:save(File, {stats, 2, Days, #{}, #{}}),
     start(spacepush_stats),
-    Days = maps:get(<<"days">>, maps:get(<<"installs">>, spacepush_stats:report(1))),
-    Label = fun(Date) -> list_to_binary(io_lib:format("~4..0B-~2..0B-~2..0B", tuple_to_list(Date))) end,
+    History = maps:get(<<"days">>, maps:get(<<"installs">>, spacepush_stats:report(1))),
     ?assertEqual(
-        [{Label(Day(1)), 0}, {Label(Day(2)), 1}, {Label(Day(3)), 2}, {Label(Day(4)), 0}],
-        [{Period, N} || #{<<"period">> := Period, <<"installs">> := N} <- Days]
+        [{label(Day(1)), 0}, {label(Day(2)), 1}, {label(Day(3)), 2}],
+        [{Period, N} || #{<<"period">> := Period, <<"installs">> := N} <- History]
     ).
+
+%% Format 1 held hashed install IDs; only its counters survive.
+migrates_format_1() ->
+    gen_server:stop(spacepush_stats),
+    Yesterday = calendar:gregorian_days_to_date(calendar:date_to_gregorian_days(date()) - 1),
+    Installs = #{Yesterday => #{<<"hash">> => {<<"2.0.0">>, <<"iOS">>, <<"26.0">>}}},
+    {ok, File} = application:get_env(spacepush, stats_file),
+    spacepush_store:save(File, {stats, 1, <<"salt">>, #{Yesterday => #{<<"push.delivered">> => 3}}, Installs, #{}, #{}, Yesterday}),
+    start(spacepush_stats),
+    Report = spacepush_stats:report(2),
+    ?assertMatch([_Today, #{<<"push.delivered">> := 3}], maps:get(<<"days">>, Report)),
+    gen_server:stop(spacepush_stats),
+    ?assertMatch({stats, 2, _Days, #{}, #{}}, spacepush_store:load(File, none)),
+    start(spacepush_stats).
+
+label(Date) ->
+    list_to_binary(io_lib:format("~4..0B-~2..0B-~2..0B", tuple_to_list(Date))).
 
 reports_devices() ->
     Topic = {<<"https://a.example/">>, <<"space">>},

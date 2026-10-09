@@ -77,11 +77,11 @@ For monitoring, SpacePush keeps daily usage statistics and serves them as JSON o
 The endpoint answers only requests from a loopback address that did not pass a proxy (no `X-Forwarded-For`); through the public domain it answers `404`. It reports:
 
 - **Devices:** registered devices in total, per APNs environment, per platform and per subscribed space or room.
-- **Installs:** distinct app installs today, this week and this month, the last 10 days, 12 weeks and 13 months, and the app versions, platforms and OS versions of the last 7 days.
+- **Installs:** active app installs today, this week and this month, the last 10 days, 12 weeks and 13 months, and the app versions, platforms and OS versions of this week.
 - **Per day** (`days`): requests per endpoint, widget and other requests, rate-limited requests, new, renewed, removed, expired and invalid registrations, deliveries by APNs result, fetches of the spaces and of Mainframe, directory refreshes, poll rounds with their duration, and confirmed state changes.
 - **Current state:** pending deliveries, last successful fetch per source, version, uptime, memory and process count.
 
-Installs are counted by a random ID the apps create on first launch and send as `X-SpaceState-Install`, together with a user agent such as `SpaceState/2.0.0 (iOS 26.0)`. SpacePush stores only an HMAC of the ID under a secret salt, for 40 days, and keeps just the counts after that. Client addresses are not recorded. Daily counters are kept for 400 days. Days follow the server's local time.
+Installs are counted without an identifier. With its first request of a day, ISO week and month, the app sends `X-SpaceState-First` naming the periods it opens, such as `day, week, month`, together with a user agent such as `SpaceState/2.0.0 (iOS 26.0)`; SpacePush adds one per named period. Widgets send no such header. Client addresses are not recorded. Daily counters are kept for 430 days, weekly version tallies for 13 weeks. Days follow the server's local time.
 
 ## Security
 
