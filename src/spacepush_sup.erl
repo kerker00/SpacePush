@@ -15,6 +15,8 @@ init([]) ->
     Children = [
         worker(spacepush_ratelimit),
         worker(spacepush_registry),
+        worker(spacepush_directory),
+        worker(spacepush_cache),
         worker(spacepush_outbox),
         worker(spacepush_apns),
         worker(spacepush_poller)

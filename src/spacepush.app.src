@@ -1,28 +1,40 @@
 {application, spacepush, [
     {description, "Push notifications when a hackerspace opens or closes"},
-    {vsn, "0.2.0"},
+    {vsn, "0.3.0"},
     {registered, [
-        spacepush_sup, spacepush_ratelimit, spacepush_registry,
-        spacepush_outbox, spacepush_apns, spacepush_poller
+        spacepush_sup, spacepush_ratelimit, spacepush_registry, spacepush_directory,
+        spacepush_cache, spacepush_outbox, spacepush_apns, spacepush_poller
     ]},
     {mod, {spacepush_app, []}},
     {applications, [kernel, stdlib, crypto, public_key, ssl, inets, gun, cowboy]},
     {env, [
-        %% Sources
+        %% Directory: the list of spaces and the allowlist of endpoints, loaded hourly.
         {aggregator_url, "https://api.spaceapi.io/"},
+        {directory_refresh_ms, 3600000},
+        {directory_file, "data/directory.bin"},
+        {directory_max_bytes, 4194304},
+        %% Aggregator states older than this are not shown.
+        {max_data_age_s, 900},
+        %% Fetching spaces directly: those subscribed or asked for within the window.
         {mainframe_url, "https://status.kreativitaet-trifft-technik.de/api/openState"},
         {poll_interval_ms, 60000},
-        %% Aggregator data older than this counts as unknown.
-        {max_data_age_s, 900},
+        {watch_window_ms, 600000},
+        {fetch_concurrency, 10},
+        {fetch_timeout_ms, 10000},
+        {max_body_bytes, 262144},
+        {cache_max_age_ms, 60000},
+        {on_demand_fetch_limit, 20},
         %% A new state must be seen this long before anyone is notified.
         {debounce_s, 120},
         {tracker_file, "data/tracker.bin"},
         %% HTTP API
         {http_ip, {127, 0, 0, 1}},
         {http_port, 8080},
-        %% Use the first X-Forwarded-For address as client, only behind a trusted proxy.
+        {http_max_connections, 1024},
+        %% Use the last X-Forwarded-For address as client, only behind a trusted proxy.
         {trust_proxy, false},
         {rate_limit_per_minute, 30},
+        {read_rate_limit_per_minute, 300},
         {http_body_timeout_ms, 10000},
         %% Device registrations; the apps re-register on every launch.
         {registry_file, "data/registry.dets"},
@@ -31,6 +43,8 @@
         %% Deliveries
         {outbox_file, "data/outbox.dets"},
         {delivery_ttl_ms, 3600000},
+        %% At most one notification per topic within this time; later changes wait and are merged.
+        {notification_cooldown_ms, 300000},
         {apns_max_in_flight, 20},
         {apns_request_timeout_ms, 15000},
         %% APNs token auth; without a key file deliveries are only logged.

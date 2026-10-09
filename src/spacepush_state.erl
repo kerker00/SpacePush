@@ -1,16 +1,17 @@
 -module(spacepush_state).
 -moduledoc """
-Turns SpaceAPI aggregator and Mainframe openState responses into observed
-states, and decides when an observed change counts as confirmed.
+Reads the SpaceAPI directory, single SpaceAPI documents and Mainframe's
+openState response, and decides when an observed change counts as confirmed.
 
 A topic is `{Endpoint, Room}`. Ordinary spaces only have the room `<<"space">>`.
-Mainframe Oldenburg is read from its openState endpoint instead of the
-aggregator, because it reports several rooms and finer states.
+Mainframe Oldenburg's state comes from its openState endpoint instead of its
+SpaceAPI document, because it reports several rooms and finer states.
 """.
 
--export([parse_aggregator/3, parse_mainframe/1, mainframe_state/1, track/4, snapshot/1, restore/1]).
+-export([parse_directory/3, parse_space/2, parse_mainframe/1, mainframe_endpoint/0, mainframe_state/1]).
+-export([track/4, snapshot/1, restore/1]).
 
--export_type([topic/0, state/0, observation/0, change/0, tracker/0]).
+-export_type([topic/0, state/0, observation/0, change/0, tracker/0, directory_entry/0]).
 
 -type topic() :: {Endpoint :: binary(), Room :: binary()}.
 -type state() :: open | closed | keyholder | member | open_plus | closing | unknown.
@@ -18,47 +19,82 @@ aggregator, because it reports several rooms and finer states.
 -type change() :: {topic(), Name :: binary(), From :: state(), To :: state()}.
 -type entry() :: #{confirmed := state(), candidate := none | {state(), Since :: integer()}}.
 -type tracker() :: #{topic() => entry()}.
+-type directory_entry() :: #{
+    endpoint := binary(),
+    name := binary() | null,
+    address := binary() | null,
+    lat := number() | null,
+    lon := number() | null,
+    open := boolean() | null,
+    last_seen := number() | null
+}.
 
 -define(STATES, [open, closed, keyholder, member, open_plus, closing]).
 -define(MAINFRAME_ENDPOINT, <<"https://status.mainframe.io/api/spaceInfo">>).
--define(MAINFRAME_HOST, <<"status.mainframe.io">>).
 -define(SPACE_ROOM, <<"space">>).
 
--doc """
-Reads every space from an api.spaceapi.io response, except Mainframe.
+-spec mainframe_endpoint() -> binary().
+mainframe_endpoint() -> ?MAINFRAME_ENDPOINT.
 
-The open flag only counts while the aggregator reached the endpoint recently;
-otherwise the state is `unknown`. `valid` is ignored on purpose: a schema error
-in an unrelated field does not make the open flag wrong.
+-doc """
+Reads the list of spaces from an api.spaceapi.io response.
+
+Every listed endpoint is kept, also without data: the list is the allowlist of
+endpoints SpacePush fetches. Name, address and open flag are only for display;
+the flag counts only while the aggregator reached the endpoint recently.
+`valid` is ignored on purpose: a schema error in an unrelated field does not
+make the open flag wrong.
 """.
--spec parse_aggregator(binary(), Now :: integer(), MaxAge :: integer()) -> [observation()].
-parse_aggregator(Body, Now, MaxAge) ->
-    [
-        Observation
-     || Entry <- entries(json:decode(Body)),
-        {ok, Observation} <- [aggregator_entry(Entry, Now, MaxAge)]
-    ].
+-spec parse_directory(binary(), Now :: integer(), MaxAge :: integer()) -> [directory_entry()].
+parse_directory(Body, Now, MaxAge) ->
+    [Entry || Raw <- entries(json:decode(Body)), {ok, Entry} <- [directory_entry(Raw, Now, MaxAge)]].
 
 %% The service answers with an array; its OpenAPI document describes an object with `items`.
 entries(Entries) when is_list(Entries) -> Entries;
 entries(#{<<"items">> := Entries}) when is_list(Entries) -> Entries.
 
-aggregator_entry(#{<<"url">> := Url, <<"data">> := #{<<"space">> := Name} = Data} = Entry, Now, MaxAge) when
-    is_binary(Url), is_binary(Name)
-->
-    case is_mainframe(Url) of
-        true ->
-            skip;
-        false ->
-            State =
-                case fresh(Entry, Now, MaxAge) of
-                    true -> open_flag(Data);
-                    false -> unknown
-                end,
-            {ok, {{Url, ?SPACE_ROOM}, Name, State}}
-    end;
-aggregator_entry(_, _, _) ->
+directory_entry(#{<<"url">> := Url} = Raw, Now, MaxAge) when is_binary(Url) ->
+    Data = map_or_empty(maps:get(<<"data">>, Raw, #{})),
+    Location = map_or_empty(maps:get(<<"location">>, Data, #{})),
+    Open =
+        case fresh(Raw, Now, MaxAge) andalso open_flag(Data) of
+            open -> true;
+            closed -> false;
+            _ -> null
+        end,
+    {ok, #{
+        endpoint => Url,
+        name => binary_or_null(maps:get(<<"space">>, Data, null)),
+        address => binary_or_null(maps:get(<<"address">>, Location, null)),
+        lat => number_or_null(maps:get(<<"lat">>, Location, null)),
+        lon => number_or_null(maps:get(<<"lon">>, Location, null)),
+        open => Open,
+        last_seen => number_or_null(maps:get(<<"lastSeen">>, Raw, null))
+    }};
+directory_entry(_Raw, _Now, _MaxAge) ->
     skip.
+
+map_or_empty(Map) when is_map(Map) -> Map;
+map_or_empty(_) -> #{}.
+
+binary_or_null(Value) when is_binary(Value) -> Value;
+binary_or_null(_) -> null.
+
+number_or_null(Value) when is_number(Value) -> Value;
+number_or_null(_) -> null.
+
+-doc """
+Reads a space's own SpaceAPI document. Fails for anything that is not a JSON
+object with a `space` name, so only usable documents reach the cache.
+""".
+-spec parse_space(binary(), binary()) -> observation().
+parse_space(Endpoint, Body) ->
+    case json:decode(Body) of
+        #{<<"space">> := Name} = Data when is_binary(Name) ->
+            {{Endpoint, ?SPACE_ROOM}, Name, open_flag(Data)};
+        _ ->
+            error(not_a_space)
+    end.
 
 fresh(#{<<"validationResult">> := #{<<"reachable">> := false}}, _Now, _MaxAge) -> false;
 fresh(#{<<"lastSeen">> := LastSeen}, Now, MaxAge) when is_number(LastSeen) -> Now - LastSeen =< MaxAge;
@@ -72,12 +108,6 @@ open_flag(_) -> unknown.
 
 bool_state(true) -> open;
 bool_state(false) -> closed.
-
-is_mainframe(Url) ->
-    case uri_string:parse(Url) of
-        #{host := Host} -> string:lowercase(Host) =:= ?MAINFRAME_HOST;
-        _ -> false
-    end.
 
 -doc "Reads the rooms from Mainframe's openState response.".
 -spec parse_mainframe(binary()) -> [observation()].

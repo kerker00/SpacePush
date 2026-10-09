@@ -1,0 +1,21 @@
+%% Production configuration for SpacePush on Uberspace 7.
+%% Copy to ~/spacepush/sys.config and replace USER and the key placeholders.
+%% Do not commit the filled-in copy.
+[
+    {spacepush, [
+        %% Uberspace's web backend connects to this port; it is not reachable from outside.
+        {http_ip, {0, 0, 0, 0}},
+        {http_port, 52184},
+        %% Requests arrive through Uberspace's proxy, which appends the client address.
+        {trust_proxy, true},
+
+        {directory_file, "/home/USER/spacepush/data/directory.bin"},
+        {registry_file, "/home/USER/spacepush/data/registry.dets"},
+        {outbox_file, "/home/USER/spacepush/data/outbox.dets"},
+        {tracker_file, "/home/USER/spacepush/data/tracker.bin"},
+
+        {apns_key_file, "/home/USER/spacepush/secrets/AuthKey_KEYID.p8"},
+        {apns_key_id, <<"KEYID">>}
+    ]},
+    {kernel, [{logger_level, notice}]}
+].

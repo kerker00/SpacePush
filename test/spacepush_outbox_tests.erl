@@ -12,6 +12,7 @@ outbox_test_() ->
         fun() ->
             spacepush_test_util:setup_env("outbox"),
             application:set_env(spacepush, delivery_ttl_ms, 3600000),
+            application:set_env(spacepush, notification_cooldown_ms, 300000),
             start(spacepush_registry),
             start(spacepush_outbox),
             ok = spacepush_registry:register(token(1), sandbox, [?A])
@@ -27,7 +28,9 @@ outbox_test_() ->
             fun retry_postpones/0,
             fun in_flight_key_holds_back_successor/0,
             fun expired_is_dropped/0,
-            fun survives_restart/0
+            fun survives_restart/0,
+            fun sent_topic_waits_for_cooldown/0,
+            fun changes_within_cooldown_merge/0
         ]}.
 
 start(Module) ->
@@ -94,3 +97,22 @@ survives_restart() ->
     gen_server:stop(spacepush_outbox),
     start(spacepush_outbox),
     ?assertMatch([#{token := _}], spacepush_outbox:due(now_ms(), [], 10)).
+
+%% After a notification went out, the next one for the topic waits for the cooldown.
+sent_topic_waits_for_cooldown() ->
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [#{key := Key, id := Id}] = spacepush_outbox:due(now_ms(), [], 10),
+    ok = spacepush_outbox:complete(Key, Id),
+    ok = spacepush_outbox:enqueue([change(closed)]),
+    ?assertEqual([], spacepush_outbox:due(now_ms(), [], 10)),
+    ?assertMatch([#{key := Key}], spacepush_outbox:due(now_ms() + 300000, [], 10)).
+
+%% A space flapping open/closed/open within the cooldown yields one pending notification, the latest.
+changes_within_cooldown_merge() ->
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [#{key := Key, id := Id}] = spacepush_outbox:due(now_ms(), [], 10),
+    ok = spacepush_outbox:complete(Key, Id),
+    ok = spacepush_outbox:enqueue([change(closed)]),
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [Pending] = spacepush_outbox:due(now_ms() + 300000, [], 10),
+    ?assertEqual(<<"open">>, state(Pending)).

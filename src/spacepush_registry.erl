@@ -17,7 +17,7 @@ migrated on start.
 
 -include_lib("kernel/include/logger.hrl").
 
--export([start_link/0, register/3, unregister/1, unregister_if/4, subscribers/1, lookup/1]).
+-export([start_link/0, register/3, unregister/1, unregister_if/4, subscribers/1, lookup/1, subscribed_endpoints/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(DETS, spacepush_registry).
@@ -59,6 +59,11 @@ lookup(Token) ->
         [{Token, Environment, Topics, Version}] -> {ok, Environment, Topics, Version};
         [] -> error
     end.
+
+-doc "Every endpoint at least one device subscribed to, read from ETS.".
+-spec subscribed_endpoints() -> [binary()].
+subscribed_endpoints() ->
+    lists:usort([Endpoint || {{Endpoint, _Room}, _Token} <- ets:tab2list(?INDEX)]).
 
 -spec subscribers(spacepush_state:topic()) -> [subscriber()].
 subscribers(Topic) ->

@@ -1,0 +1,89 @@
+{
+    "api_compatibility": [
+        "14",
+        "15"
+    ],
+    "contact": {
+        "email": "vorstand@kreativitaet-trifft-technik.de",
+        "issue_mail": "hc@kreativitaet-trifft-technik.de",
+        "ml": "https://mailman.ktt-ol.de/postorius/lists/diskussion.lists.ktt-ol.de/"
+    },
+    "feeds": {
+        "calendar": {
+            "type": "application/calendar",
+            "url": "https://www.kreativitaet-trifft-technik.de/calendar/ical/markusframer@gmail.com/public/basic.ics"
+        }
+    },
+    "location": {
+        "address": "Bahnhofsplatz 10, 26122 Oldenburg, Germany",
+        "lat": 53.14402,
+        "lon": 8.21988
+    },
+    "logo": "https://status.mainframe.io/assets/images/mainframe.png",
+    "power_consumption": [
+        {
+            "description": "Value changed 2 sec. ago.",
+            "location": "Hackspace, front",
+            "name": "current consumption front",
+            "unit": "W",
+            "value": 528.64
+        },
+        {
+            "description": "Value changed 2 sec. ago.",
+            "location": "Hackspace, back",
+            "name": "current consumption back",
+            "unit": "W",
+            "value": 984.34
+        },
+        {
+            "description": "Value changed 1 sec. ago.",
+            "location": "Hackspace, machining",
+            "name": "current consumption machining",
+            "unit": "W",
+            "value": 47.39
+        }
+    ],
+    "projects": [
+        "https://github.com/ktt-ol/"
+    ],
+    "sensors": {
+        "network_connections": [
+            {
+                "location": "Inside",
+                "name": "deviceCount",
+                "value": 118
+            },
+            {
+                "description": "0: no internet connection, 1: everything is fine",
+                "name": "internetStatus",
+                "value": 1
+            }
+        ],
+        "people_now_present": [
+            {
+                "names": [
+                    "Juniper",
+                    "NiMs",
+                    "Patrick alias MarvinGS",
+                    "Pluto",
+                    "Tamlin",
+                    "ami",
+                    "halb9",
+                    "larsh404"
+                ],
+                "value": 8
+            }
+        ]
+    },
+    "space": "Mainframe",
+    "state": {
+        "icon": {
+            "closed": "https://www.kreativitaet-trifft-technik.de/media/img/mainframe-closed.svg",
+            "open": "https://www.kreativitaet-trifft-technik.de/media/img/mainframe-open.svg"
+        },
+        "lastchange": 1791483594,
+        "message": "Open!",
+        "open": true
+    },
+    "url": "https://mainframe.io/"
+}

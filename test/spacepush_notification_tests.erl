@@ -36,3 +36,17 @@ collapse_id_test() ->
     ?assertEqual(64, byte_size(Id)),
     ?assertEqual(Id, spacepush_notification:collapse_id({?MAINFRAME, <<"space">>})),
     ?assertNotEqual(Id, spacepush_notification:collapse_id({?MAINFRAME, <<"radstelle">>})).
+
+title(Name) ->
+    #{<<"aps">> := #{<<"alert">> := #{<<"title">> := Title}}} =
+        spacepush_notification:payload({<<"https://a.example/">>, <<"space">>}, Name, open),
+    Title.
+
+title_drops_control_characters_test() ->
+    ?assertEqual(<<"EvilSpace">>, title(<<"Evil\nSpace\r\t", 0>>)),
+    ?assertEqual(<<"abc">>, title(<<"a‮b​c"/utf8>>)).
+
+title_is_shortened_test() ->
+    Title = title(binary:copy(<<"x">>, 500)),
+    ?assertEqual(64, string:length(Title)),
+    ?assertMatch(<<_:63/binary, "…"/utf8>>, Title).

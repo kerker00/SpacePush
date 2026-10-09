@@ -9,9 +9,11 @@ Registration body:
  "subscriptions": [{"endpoint": "https://status.mainframe.io/api/spaceInfo", "room": "radstelle"}]}
 ```
 
-`room` is optional and defaults to `"space"`. Answers 204 on success, 413 for
-a body over 16 KB, 408 if the body does not arrive within `http_body_timeout_ms`, 429
-when the client sent too many requests and 503 when the registry is full.
+`room` is optional and defaults to `"space"`. Every endpoint must be listed in
+the SpaceAPI directory. Answers 204 on success, 400 for invalid input or an
+unknown endpoint, 413 for a body over 16 KB, 408 if the body does not arrive
+within `http_body_timeout_ms`, 429 when the client sent too many requests and
+503 when the registry is full or the directory is not loaded yet.
 """.
 -behaviour(cowboy_handler).
 
@@ -23,16 +25,16 @@ when the client sent too many requests and 503 when the registry is full.
 
 init(Req0, Opts) ->
     Req =
-        case spacepush_ratelimit:allow(client(Req0)) of
+        case spacepush_ratelimit:allow(write, spacepush_http:client(Req0)) of
             true -> handle(cowboy_req:method(Req0), cowboy_req:binding(token, Req0), Req0);
-            false -> error_reply(429, <<"rate_limited">>, Req0)
+            false -> spacepush_http:error_reply(429, <<"rate_limited">>, Req0)
         end,
     {ok, Req, Opts}.
 
 handle(Method, Token, Req) ->
     case valid_token(Token) of
         true -> handle_valid(Method, string:lowercase(Token), Req);
-        false -> error_reply(400, <<"invalid_token">>, Req)
+        false -> spacepush_http:error_reply(400, <<"invalid_token">>, Req)
     end.
 
 handle_valid(<<"PUT">>, Token, Req0) ->
@@ -40,23 +42,36 @@ handle_valid(<<"PUT">>, Token, Req0) ->
         {ok, Body, Req} ->
             case parse_registration(Body) of
                 {ok, Environment, Topics} ->
-                    case spacepush_registry:register(Token, Environment, Topics) of
-                        ok -> cowboy_req:reply(204, Req);
-                        {error, full} -> error_reply(503, <<"registry_full">>, Req)
-                    end;
+                    register(Token, Environment, Topics, Req);
                 {error, Reason} ->
-                    error_reply(400, Reason, Req)
+                    spacepush_http:error_reply(400, Reason, Req)
             end;
         {error, too_large, Req} ->
-            error_reply(413, <<"body_too_large">>, Req);
+            spacepush_http:error_reply(413, <<"body_too_large">>, Req);
         {error, timeout, Req} ->
-            error_reply(408, <<"body_timeout">>, Req)
+            spacepush_http:error_reply(408, <<"body_timeout">>, Req)
     end;
 handle_valid(<<"DELETE">>, Token, Req) ->
     ok = spacepush_registry:unregister(Token),
     cowboy_req:reply(204, Req);
 handle_valid(_Method, _Token, Req) ->
     cowboy_req:reply(405, #{<<"allow">> => <<"PUT, DELETE">>}, Req).
+
+%% Only endpoints from the directory: SpacePush fetches what devices subscribe
+%% to, so it must not accept arbitrary, possibly internal, URLs.
+register(Token, Environment, Topics, Req) ->
+    Unknown = [Endpoint || {Endpoint, _Room} <- Topics, not spacepush_directory:known(Endpoint)],
+    case {spacepush_directory:loaded(), Unknown} of
+        {false, _} ->
+            spacepush_http:error_reply(503, <<"directory_unavailable">>, Req);
+        {true, [_ | _]} ->
+            spacepush_http:error_reply(400, <<"unknown_space">>, Req);
+        {true, []} ->
+            case spacepush_registry:register(Token, Environment, Topics) of
+                ok -> cowboy_req:reply(204, Req);
+                {error, full} -> spacepush_http:error_reply(503, <<"registry_full">>, Req)
+            end
+    end.
 
 %% Cowboy's `length` only sets how much to read per call, so the total size and
 %% the overall time are checked here. A declared length over the limit is
@@ -137,22 +152,3 @@ valid_room(Room) when is_binary(Room), byte_size(Room) >= 1, byte_size(Room) =< 
     re:run(Room, "^[a-z0-9_]+$", [{capture, none}]) =:= match;
 valid_room(_) ->
     false.
-
-client(Req) ->
-    Forwarded = cowboy_req:header(<<"x-forwarded-for">>, Req),
-    case application:get_env(spacepush, trust_proxy, false) of
-        true when is_binary(Forwarded) ->
-            [First | _] = binary:split(Forwarded, <<",">>),
-            string:trim(First);
-        _ ->
-            {Ip, _Port} = cowboy_req:peer(Req),
-            Ip
-    end.
-
-error_reply(Status, Reason, Req) ->
-    cowboy_req:reply(
-        Status,
-        #{<<"content-type">> => <<"application/json">>},
-        json:encode(#{<<"error">> => Reason}),
-        Req
-    ).
