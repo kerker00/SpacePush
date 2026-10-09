@@ -82,7 +82,7 @@ subscribers(Topic) ->
 
 -doc """
 Registered devices for the statistics: in total, per APNs environment, per
-platform, and per subscribed space or room with the space's name.
+platform, and per subscribed space or room.
 """.
 -spec summary() -> map().
 summary() ->
@@ -90,12 +90,11 @@ summary() ->
     Count = fun(Key) ->
         lists:foldl(fun(Registration, Acc) -> maps:update_with(Key(Registration), fun(N) -> N + 1 end, 1, Acc) end, #{}, Registrations)
     end,
-    Names = maps:from_list([{Endpoint, Name} || #{endpoint := Endpoint, name := Name} <- spacepush_directory:entries()]),
     Topics = lists:foldl(
         fun({Topic, _Token}, Acc) -> maps:update_with(Topic, fun(N) -> N + 1 end, 1, Acc) end, #{}, ets:tab2list(?INDEX)
     ),
     Subscriptions = [
-        #{<<"endpoint">> => Endpoint, <<"room">> => Room, <<"name">> => maps:get(Endpoint, Names, null), <<"devices">> => N}
+        #{<<"endpoint">> => Endpoint, <<"room">> => Room, <<"devices">> => N}
      || {Endpoint, Room} := N <- Topics
     ],
     #{

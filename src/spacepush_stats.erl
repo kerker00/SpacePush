@@ -227,7 +227,7 @@ build_report(Days, #{days := Counters, installs := Installs, uniques := Uniques,
     #{
         <<"generated_at">> => rfc3339(erlang:system_time(millisecond)),
         <<"service">> => service(),
-        <<"devices">> => spacepush_registry:summary(),
+        <<"devices">> => devices(),
         <<"outbox">> => #{<<"pending">> => spacepush_outbox:pending()},
         <<"installs">> => #{
             <<"today">> => distinct([Today], Installs),
@@ -249,6 +249,12 @@ build_report(Days, #{days := Counters, installs := Installs, uniques := Uniques,
          || Date <- lists:reverse(dates(add_days(Today, 1 - Days), Today))
         ]
     }.
+
+%% The registry's summary, with the spaces' names from the directory.
+devices() ->
+    #{<<"subscriptions">> := Subscriptions} = Summary = spacepush_registry:summary(),
+    Names = maps:from_list([{Endpoint, Name} || #{endpoint := Endpoint, name := Name} <- spacepush_directory:entries()]),
+    Summary#{<<"subscriptions">> := [S#{<<"name">> => maps:get(E, Names, null)} || #{<<"endpoint">> := E} = S <- Subscriptions]}.
 
 %% The newest `Count` closed periods whose label has the given shape:
 %% days `2026-10-09`, weeks `2026-W41`, months `2026-10`.

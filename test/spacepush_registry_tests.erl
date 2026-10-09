@@ -118,13 +118,14 @@ migrates_prototype_records() ->
     ?assertEqual([{token(1), sandbox, Seconds * 1000}], spacepush_registry:subscribers(?A)).
 
 migrates_format_1_records() ->
-    with_raw_records([{token(1), {registration, 1, production, [?A], 42}}]),
-    ?assertEqual([{token(1), production, 42}], spacepush_registry:subscribers(?A)),
+    Version = erlang:system_time(millisecond),
+    with_raw_records([{token(1), {registration, 1, production, [?A], Version}}]),
+    ?assertEqual([{token(1), production, Version}], spacepush_registry:subscribers(?A)),
     ?assertMatch(#{<<"by_platform">> := #{<<"unknown">> := 1}}, spacepush_registry:summary()),
     stop(),
     {ok, File} = application:get_env(spacepush, registry_file),
     {ok, Table} = dets:open_file(raw_registry, [{file, File}, {type, set}]),
-    ?assertEqual([{token(1), {registration, 2, production, [?A], 42, <<"unknown">>}}], dets:lookup(Table, token(1))),
+    ?assertEqual([{token(1), {registration, 2, production, [?A], Version, <<"unknown">>}}], dets:lookup(Table, token(1))),
     ok = dets:close(Table),
     start().
 
