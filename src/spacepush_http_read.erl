@@ -21,10 +21,14 @@ must not render a hostile document as HTML.
 -export([init/2, directory/1]).
 
 init(Req0, Kind) ->
+    spacepush_stats:request(atom_to_binary(Kind), Req0),
     Req =
         case {cowboy_req:method(Req0), spacepush_ratelimit:allow(read, spacepush_http:client(Req0))} of
-            {<<"GET">>, true} -> handle(Kind, Req0);
-            {<<"GET">>, false} -> spacepush_http:error_reply(429, <<"rate_limited">>, Req0);
+            {<<"GET">>, true} ->
+                handle(Kind, Req0);
+            {<<"GET">>, false} ->
+                spacepush_stats:rate_limited(read),
+                spacepush_http:error_reply(429, <<"rate_limited">>, Req0);
             {_Method, _Allowed} -> cowboy_req:reply(405, #{<<"allow">> => <<"GET">>}, Req0)
         end,
     {ok, Req, Kind}.

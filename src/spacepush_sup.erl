@@ -11,6 +11,8 @@ start_link() ->
 %% rest_for_one restarts everything after a crashed process, so the sender
 %% never holds requests for an outbox or registry that was restarted.
 %% Pending work survives in the outbox and the tracker file.
+%% The statistics come last: the others only cast to them, which never fails,
+%% and a crash there restarts nothing else.
 init([]) ->
     Children = [
         worker(spacepush_ratelimit),
@@ -19,7 +21,8 @@ init([]) ->
         worker(spacepush_cache),
         worker(spacepush_outbox),
         worker(spacepush_apns),
-        worker(spacepush_poller)
+        worker(spacepush_poller),
+        worker(spacepush_stats)
     ],
     {ok, {#{strategy => rest_for_one, intensity => 5, period => 60}, Children}}.
 

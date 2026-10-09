@@ -135,11 +135,13 @@ prepare(#{key := {Token, Topic} = Key, id := Id} = Delivery, State) ->
 
 discard(Key, Id, State) ->
     ?LOG_INFO(#{msg => delivery_discarded, reason => no_longer_subscribed}),
+    spacepush_stats:count(<<"push.discarded">>),
     spacepush_outbox:complete(Key, Id),
     State.
 
 send_when_up(#{key := Key, id := Id, token := Token, payload := Payload}, #{key := undefined} = State) ->
     ?LOG_INFO(#{msg => dry_run_delivery, token => Token, payload => Payload}),
+    spacepush_stats:count(<<"push.dry_run">>),
     spacepush_outbox:complete(Key, Id),
     State;
 send_when_up(#{environment := Environment} = Delivery, State0) ->
@@ -184,7 +186,9 @@ update_request(Ref, IsFin, Update, #{in_flight := InFlight} = State) ->
 finish(#{delivery := Delivery, status := Status, body := Body}, State) ->
     #{key := Key, id := Id, token := Token, environment := Environment, version := Version} = Delivery,
     {Reason, InvalidSince} = error_details(Body),
-    case classify(Status, Reason) of
+    Result = classify(Status, Reason),
+    spacepush_stats:count(<<"push.", (atom_to_binary(Result))/binary>>),
+    case Result of
         delivered ->
             spacepush_outbox:complete(Key, Id),
             State;
@@ -216,6 +220,7 @@ expire_requests(#{in_flight := InFlight} = State) ->
 fail_requests(Refs, Reason, #{in_flight := InFlight} = State) ->
     Failed = maps:with(Refs, InFlight),
     Failed =/= #{} andalso ?LOG_WARNING(#{msg => apns_requests_failed, count => map_size(Failed), reason => Reason}),
+    spacepush_stats:count(<<"push.connection_failed">>, map_size(Failed)),
     [schedule_retry(Delivery) || _Ref := #{delivery := Delivery} <- Failed],
     State#{in_flight := maps:without(Refs, InFlight)}.
 

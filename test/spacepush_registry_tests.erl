@@ -24,6 +24,8 @@ registry_test_() ->
             fun capacity/0,
             fun survives_restart/0,
             fun migrates_prototype_records/0,
+            fun migrates_format_1_records/0,
+            fun keeps_platform/0,
             fun drops_unknown_records/0,
             fun lookup_returns_current_registration/0,
             fun subscribed_endpoints_are_unique/0,
@@ -114,6 +116,24 @@ migrates_prototype_records() ->
     stop(),
     start(),
     ?assertEqual([{token(1), sandbox, Seconds * 1000}], spacepush_registry:subscribers(?A)).
+
+migrates_format_1_records() ->
+    Version = erlang:system_time(millisecond),
+    with_raw_records([{token(1), {registration, 1, production, [?A], Version}}]),
+    ?assertEqual([{token(1), production, Version}], spacepush_registry:subscribers(?A)),
+    ?assertMatch(#{<<"by_platform">> := #{<<"unknown">> := 1}}, spacepush_registry:summary()),
+    stop(),
+    {ok, File} = application:get_env(spacepush, registry_file),
+    {ok, Table} = dets:open_file(raw_registry, [{file, File}, {type, set}]),
+    ?assertEqual([{token(1), {registration, 2, production, [?A], Version, <<"unknown">>}}], dets:lookup(Table, token(1))),
+    ok = dets:close(Table),
+    start().
+
+keeps_platform() ->
+    ok = spacepush_registry:register(token(1), production, [?A], <<"macos">>),
+    stop(),
+    start(),
+    ?assertMatch(#{<<"total">> := 1, <<"by_platform">> := #{<<"macos">> := 1}}, spacepush_registry:summary()).
 
 drops_unknown_records() ->
     with_raw_records([{token(1), {registration, 99, sandbox, [?A], 1}}, {token(2), garbage}]),
