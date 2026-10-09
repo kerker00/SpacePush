@@ -10,12 +10,17 @@ start(_StartType, _StartArgs) ->
     Dispatch = cowboy_router:compile([
         {'_', [
             {"/v1/devices/:token", spacepush_http_devices, []},
+            {"/v1/directory", spacepush_http_read, directory},
+            {"/v1/spaces", spacepush_http_read, space},
+            {"/v1/mainframe/rooms", spacepush_http_read, mainframe_rooms},
             {"/health", spacepush_http_health, []}
         ]}
     ]),
     {ok, Ip} = application:get_env(spacepush, http_ip),
     {ok, Port} = application:get_env(spacepush, http_port),
-    {ok, _} = cowboy:start_clear(?LISTENER, [{ip, Ip}, {port, Port}], #{env => #{dispatch => Dispatch}}),
+    {ok, MaxConnections} = application:get_env(spacepush, http_max_connections),
+    TransportOptions = #{socket_opts => [{ip, Ip}, {port, Port}], max_connections => MaxConnections},
+    {ok, _} = cowboy:start_clear(?LISTENER, TransportOptions, #{env => #{dispatch => Dispatch}}),
     {ok, Sup}.
 
 prep_stop(State) ->

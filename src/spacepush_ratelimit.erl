@@ -1,8 +1,12 @@
 -module(spacepush_ratelimit).
--moduledoc "Limits API requests per client within a fixed one-minute window.".
+-moduledoc """
+Limits API requests per client within a fixed one-minute window, separately
+for writes (registrations) and reads. Reads get a higher limit: many members
+of a space often share one public address.
+""".
 -behaviour(gen_server).
 
--export([start_link/0, allow/1]).
+-export([start_link/0, allow/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(TABLE, ?MODULE).
@@ -11,10 +15,16 @@
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
--spec allow(term()) -> boolean().
-allow(Client) ->
-    Limit = application:get_env(spacepush, rate_limit_per_minute, 30),
-    ets:update_counter(?TABLE, Client, 1, {Client, 0}) =< Limit.
+-spec allow(write | read, term()) -> boolean().
+allow(Bucket, Client) ->
+    LimitKey =
+        case Bucket of
+            write -> rate_limit_per_minute;
+            read -> read_rate_limit_per_minute
+        end,
+    {ok, Limit} = application:get_env(spacepush, LimitKey),
+    Key = {Bucket, Client},
+    ets:update_counter(?TABLE, Key, 1, {Key, 0}) =< Limit.
 
 init([]) ->
     ets:new(?TABLE, [named_table, public, set, {write_concurrency, true}]),

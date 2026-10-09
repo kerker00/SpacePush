@@ -26,6 +26,7 @@ registry_test_() ->
             fun migrates_prototype_records/0,
             fun drops_unknown_records/0,
             fun lookup_returns_current_registration/0,
+            fun subscribed_endpoints_are_unique/0,
             fun expires_old_registrations/0
         ]}.
 
@@ -123,3 +124,11 @@ lookup_returns_current_registration() ->
     ?assertEqual(error, spacepush_registry:lookup(token(1))),
     ok = spacepush_registry:register(token(1), production, [?A]),
     ?assertMatch({ok, production, [?A], _}, spacepush_registry:lookup(token(1))).
+
+subscribed_endpoints_are_unique() ->
+    Room = {<<"https://a.example/">>, <<"radstelle">>},
+    ok = spacepush_registry:register(token(1), sandbox, [?A, Room]),
+    ok = spacepush_registry:register(token(2), sandbox, [?A, ?B]),
+    ?assertEqual([<<"https://a.example/">>, <<"https://b.example/">>], spacepush_registry:subscribed_endpoints()),
+    ok = spacepush_registry:unregister(token(2)),
+    ?assertEqual([<<"https://a.example/">>], spacepush_registry:subscribed_endpoints()).

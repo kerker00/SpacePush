@@ -7,40 +7,43 @@
 -define(MAX_AGE, 900).
 -define(DEBOUNCE, 120).
 
-parse(Body) -> spacepush_state:parse_aggregator(Body, ?NOW, ?MAX_AGE).
+directory(Body) -> spacepush_state:parse_directory(Body, ?NOW, ?MAX_AGE).
 
-states(Observations) ->
-    maps:from_list([{Name, State} || {_Topic, Name, State} <- Observations]).
+by_name(Entries) ->
+    maps:from_list([{Name, Entry} || #{name := Name} = Entry <- Entries]).
 
-%% Parsing
+%% Directory
 
-aggregator_test() ->
-    Observations = parse(spacepush_test_util:fixture("aggregator.json")),
-    ?assertEqual(
-        #{
-            <<"Nerd2Nerd">> => open,
-            <<"Hacker Embassy">> => closed,
-            <<"Apollo-NG">> => closed,
-            <<"B4CKSP4CE">> => unknown,
-            <<"LuXeria">> => unknown,
-            <<"Milton Keynes Makerspace">> => unknown
-        },
-        states(Observations)
+directory_keeps_every_listed_endpoint_test() ->
+    Entries = directory(spacepush_test_util:fixture("aggregator.json")),
+    ?assertEqual(8, length(Entries)),
+    Endpoints = [Endpoint || #{endpoint := Endpoint} <- Entries],
+    ?assert(lists:member(?MAINFRAME, Endpoints)),
+    %% Listed without data: allowed, but nothing to show.
+    ?assertMatch(
+        [#{name := null, open := null}],
+        [E || #{endpoint := <<"http://blog.attraktor.org/spaceapi/spaceapi.json">>} = E <- Entries]
+    ).
+
+directory_display_fields_test() ->
+    Entries = by_name(directory(spacepush_test_util:fixture("aggregator.json"))),
+    ?assertMatch(
+        #{open := true, address := <<"Schönleinstraße 5, 97080 Würzburg, Germany"/utf8>>, lat := 49.801756},
+        maps:get(<<"Nerd2Nerd">>, Entries)
     ),
-    ?assert(lists:all(fun({{_Url, Room}, _, _}) -> Room =:= <<"space">> end, Observations)).
+    ?assertMatch(#{open := false}, maps:get(<<"Hacker Embassy">>, Entries)),
+    ?assertMatch(#{open := false}, maps:get(<<"Apollo-NG">>, Entries)),
+    ?assertMatch(#{open := null}, maps:get(<<"B4CKSP4CE">>, Entries)),
+    ?assertMatch(#{open := null}, maps:get(<<"LuXeria">>, Entries)),
+    ?assertMatch(#{open := true}, maps:get(<<"Mainframe">>, Entries)).
 
-aggregator_skips_mainframe_test() ->
-    ?assertNot(lists:keymember(<<"Mainframe">>, 2, parse(spacepush_test_util:fixture("aggregator.json")))).
-
-aggregator_skips_broken_entries_test() ->
-    Body = <<"[42, {\"url\": \"https://a.example/\", \"lastSeen\": 1791485450, \"data\": {\"space\": \"A\"}},"
-             " {\"url\": 1}, {\"data\": null}]">>,
-    ?assertEqual([{{<<"https://a.example/">>, <<"space">>}, <<"A">>, unknown}], parse(Body)).
-
-aggregator_accepts_items_object_test() ->
+directory_accepts_items_object_test() ->
     Body = <<"{\"items\": [{\"url\": \"https://a.example/\", \"lastSeen\": 1791485450,"
              " \"data\": {\"space\": \"A\", \"state\": {\"open\": true}}}]}">>,
-    ?assertEqual([{{<<"https://a.example/">>, <<"space">>}, <<"A">>, open}], parse(Body)).
+    ?assertMatch([#{endpoint := <<"https://a.example/">>, name := <<"A">>, open := true}], directory(Body)).
+
+directory_skips_entries_without_url_test() ->
+    ?assertEqual([], directory(<<"[42, {\"url\": 1}, {\"data\": null}]">>)).
 
 entry(Extra) ->
     Entry = maps:merge(
@@ -51,23 +54,42 @@ entry(Extra) ->
         },
         Extra
     ),
-    [{_Topic, _Name, State}] = parse(iolist_to_binary(json:encode([Entry]))),
-    State.
+    [#{open := Open}] = directory(iolist_to_binary(json:encode([Entry]))),
+    Open.
 
 fresh_data_counts_test() ->
-    ?assertEqual(open, entry(#{})).
+    ?assertEqual(true, entry(#{})).
 
-stale_data_is_unknown_test() ->
-    ?assertEqual(unknown, entry(#{<<"lastSeen">> => 1})).
+stale_data_is_not_shown_test() ->
+    ?assertEqual(null, entry(#{<<"lastSeen">> => 1})).
 
-missing_last_seen_is_unknown_test() ->
-    ?assertEqual(unknown, entry(#{<<"lastSeen">> => null})).
+missing_last_seen_is_not_shown_test() ->
+    ?assertEqual(null, entry(#{<<"lastSeen">> => null})).
 
-unreachable_endpoint_is_unknown_test() ->
-    ?assertEqual(unknown, entry(#{<<"validationResult">> => #{<<"reachable">> => false}})).
+unreachable_endpoint_is_not_shown_test() ->
+    ?assertEqual(null, entry(#{<<"validationResult">> => #{<<"reachable">> => false}})).
 
 invalid_schema_still_counts_test() ->
-    ?assertEqual(open, entry(#{<<"valid">> => false, <<"validationResult">> => #{<<"reachable">> => true}})).
+    ?assertEqual(true, entry(#{<<"valid">> => false, <<"validationResult">> => #{<<"reachable">> => true}})).
+
+%% Single SpaceAPI documents
+
+space_test_() ->
+    Url = <<"https://a.example/">>,
+    [
+        ?_assertEqual({{Url, <<"space">>}, <<"A">>, open}, spacepush_state:parse_space(Url, <<"{\"space\":\"A\",\"state\":{\"open\":true}}">>)),
+        ?_assertEqual({{Url, <<"space">>}, <<"A">>, closed}, spacepush_state:parse_space(Url, <<"{\"space\":\"A\",\"open\":false}">>)),
+        ?_assertEqual({{Url, <<"space">>}, <<"A">>, unknown}, spacepush_state:parse_space(Url, <<"{\"space\":\"A\"}">>)),
+        ?_assertError(not_a_space, spacepush_state:parse_space(Url, <<"[1,2]">>)),
+        ?_assertError(not_a_space, spacepush_state:parse_space(Url, <<"{\"state\":{\"open\":true}}">>)),
+        ?_assertError(_, spacepush_state:parse_space(Url, <<"<html>">>))
+    ].
+
+mainframe_document_test() ->
+    ?assertEqual(
+        {{?MAINFRAME, <<"space">>}, <<"Mainframe">>, open},
+        spacepush_state:parse_space(?MAINFRAME, spacepush_test_util:fixture("mainframe-spaceinfo.json"))
+    ).
 
 mainframe_test() ->
     Observations = spacepush_state:parse_mainframe(spacepush_test_util:fixture("mainframe-openstate.json")),

@@ -8,6 +8,12 @@ flight, its successor waits, so states arrive in order. Every delivery has a
 unique id, so a late result for a replaced delivery cannot complete or delay
 its successor. Deliveries that are still not sent when they expire are dropped.
 
+Notifications for a topic are spaced at least `notification_cooldown_ms`
+apart, so a space that keeps switching cannot flood its subscribers: a change
+within that time is scheduled for the end of it, and a still newer change
+replaces it. The spacing is kept in memory only; after a restart it starts
+fresh.
+
 Every change is synced to disk before the call returns.
 """.
 -behaviour(gen_server).
@@ -68,15 +74,21 @@ init([]) ->
     {ok, ?DETS} = dets:open_file(?DETS, [{file, File}, {type, set}]),
     ets:new(?TABLE, [named_table, protected, set]),
     ?TABLE = dets:to_ets(?DETS, ?TABLE),
-    {ok, #{}}.
+    {ok, #{slots => #{}}}.
 
-handle_call({enqueue, Changes}, _From, State) ->
-    {ok, Ttl} = application:get_env(spacepush, delivery_ttl_ms),
+handle_call({enqueue, Changes}, _From, #{slots := Slots} = State) ->
     Now = erlang:system_time(millisecond),
-    Count = lists:sum([enqueue_change(Change, Now, Now + Ttl) || Change <- Changes]),
+    {Count, Slots1} = lists:foldl(
+        fun(Change, {CountAcc, SlotsAcc}) ->
+            {Added, SlotsAcc1} = enqueue_change(Change, Now, SlotsAcc),
+            {CountAcc + Added, SlotsAcc1}
+        end,
+        {0, Slots},
+        Changes
+    ),
     sync(),
     Count > 0 andalso spacepush_apns:wake(),
-    {reply, ok, State};
+    {reply, ok, State#{slots := Slots1}};
 handle_call({due, Now, InFlight, Limit}, _From, State) ->
     {Expired, Ready} = ets:foldl(
         fun({Key, #{not_before := NotBefore, expires := Expires} = Delivery}, {ExpiredAcc, ReadyAcc}) ->
@@ -125,14 +137,28 @@ handle_cast(_Msg, State) ->
 terminate(_Reason, _State) ->
     dets:close(?DETS).
 
-enqueue_change({Topic, Name, _From, To}, Now, Expires) ->
+enqueue_change({Topic, Name, _From, To}, Now, Slots) ->
+    {ok, Cooldown} = application:get_env(spacepush, notification_cooldown_ms),
+    {ok, Ttl} = application:get_env(spacepush, delivery_ttl_ms),
+    Slot =
+        case Slots of
+            #{Topic := Previous} -> max(Now, Previous + Cooldown);
+            #{} -> Now
+        end,
     Payload = iolist_to_binary(json:encode(spacepush_notification:payload(Topic, Name, To))),
     CollapseId = spacepush_notification:collapse_id(Topic),
     Subscribers = spacepush_registry:subscribers(Topic),
     lists:foreach(
         fun({Token, Environment, Version}) ->
+            Key = {Token, Topic},
+            %% A pending, unsent delivery is replaced in its own slot.
+            NotBefore =
+                case ets:lookup(?TABLE, Key) of
+                    [{Key, #{not_before := Pending}}] -> Pending;
+                    [] -> Slot
+                end,
             save(#{
-                key => {Token, Topic},
+                key => Key,
                 id => {erlang:system_time(microsecond), erlang:unique_integer([positive])},
                 token => Token,
                 environment => Environment,
@@ -140,14 +166,14 @@ enqueue_change({Topic, Name, _From, To}, Now, Expires) ->
                 payload => Payload,
                 collapse_id => CollapseId,
                 attempts => 0,
-                not_before => Now,
-                expires => Expires
+                not_before => NotBefore,
+                expires => NotBefore + Ttl
             })
         end,
         Subscribers
     ),
     ?LOG_INFO(#{msg => state_change_enqueued, topic => Topic, state => To, deliveries => length(Subscribers)}),
-    length(Subscribers).
+    {length(Subscribers), Slots#{Topic => Slot}}.
 
 save(#{key := Key} = Delivery) ->
     ok = dets:insert(?DETS, {Key, Delivery}),
