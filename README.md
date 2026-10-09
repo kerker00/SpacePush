@@ -108,7 +108,7 @@ All settings live in the `spacepush` application environment (see `src/spacepush
 | `http_ip`, `http_port` | Listener; defaults to `127.0.0.1:8080` behind a reverse proxy |
 | `trust_proxy` | Rate-limit by `X-Forwarded-For`; enable only behind a trusted proxy |
 | `poll_interval_ms`, `debounce_s` | Polling interval and how long a new state must hold |
-| `aggregator_url`, `directory_refresh_ms` | Source of the list of spaces and how often it is reloaded |
+| `aggregator_url`, `directory_refresh_ms`, `directory_max_bytes` | Source of the list of spaces, how often it is reloaded and its size limit |
 | `max_data_age_s` | Aggregator states older than this are not shown in the directory |
 | `watch_window_ms` | How long a space stays fetched after an app asked for it |
 | `fetch_concurrency`, `fetch_timeout_ms`, `max_body_bytes` | Limits for fetching spaces |
@@ -122,28 +122,170 @@ All settings live in the `spacepush` application environment (see `src/spacepush
 
 ## Deploy on Uberspace 7
 
-Uberspace 7 runs CentOS 7, whose Erlang and OpenSSL are too old, so both are built once in the home directory. Templates for the configuration and the service are in `deploy/uberspace/`.
+Production runs on an [Uberspace 7](https://manual.uberspace.de/) account and answers at `https://push.grafixmafia.net`. Uberspace 7 is CentOS 7: its Erlang (OTP 21) and OpenSSL (1.0.2) are far too old, so a current OpenSSL and Erlang/OTP 28 are built once in the home directory. Nothing outside the home directory changes. Templates for the configuration and the service are in `deploy/uberspace/`.
 
-1. **OpenSSL 3.5** (static, ~10 min) into `~/opt/openssl-3.5.9`:
+All commands run on the Uberspace host unless they say otherwise. `<user>` and `<host>` stand for the account name and host (`<host>.uberspace.de`). Long builds are best run inside `tmux`, which survives a dropped SSH connection (`tmux attach` to return).
 
-        ./Configure linux-x86_64 --prefix=$HOME/opt/openssl-3.5.9 --libdir=lib no-shared no-tests -fPIC
-        make -j2 && make install_sw
+### Layout on the host
 
-2. **Erlang/OTP 28** (~30 min) into `~/opt/otp-28.5.0.7`, linked against it:
+| Path | Contents |
+| --- | --- |
+| `~/opt/openssl-3.5.9` | OpenSSL, static, only used to build Erlang |
+| `~/opt/otp-28.5.0.7` | Erlang/OTP 28 |
+| `~/bin/rebar3` | Build tool |
+| `~/spacepush/src` | Checkout of this repository |
+| `~/spacepush/release` | The running release, including the Erlang runtime |
+| `~/spacepush/sys.config`, `~/spacepush/vm.args` | Production configuration (mode 600) |
+| `~/spacepush/secrets/` | APNs key (directory 700, key 600) |
+| `~/spacepush/data/` | Directory list, registrations, outbox, tracker |
+| `~/etc/services.d/spacepush.ini` | The supervisord service |
 
-        ./configure --prefix=$HOME/opt/otp-28.5.0.7 --with-ssl=$HOME/opt/openssl-3.5.9 --disable-dynamic-ssl-lib \
-          --without-javac --without-wx --without-odbc --without-observer --without-debugger --without-et
-        make -j2 && make install
+Release, configuration, key and data are separate, so a new release replaces only `~/spacepush/release`.
 
-3. **rebar3** in `~/bin`, with the new Erlang first in `PATH`.
-4. **Release**: `rebar3 as prod release` in a checkout, then copy `_build/prod/rel/spacepush` to `~/spacepush/release`. It contains the Erlang runtime.
-5. **Configuration**: `~/spacepush/sys.config` and `~/spacepush/vm.args` from the templates, the APNs key in `~/spacepush/secrets/` (mode 600), data in `~/spacepush/data/`.
-6. **Service**: `deploy/uberspace/spacepush.ini` to `~/etc/services.d/`, then `supervisorctl reread && supervisorctl update`.
-7. **Web backend**: `uberspace web backend set push.grafixmafia.net --http --port 52184`; the port stays closed to the outside, Uberspace's proxy forwards HTTPS to it.
+### 1. OpenSSL 3.5 (once, ~10 min)
 
-Check with `curl https://push.grafixmafia.net/health`. Logs: `supervisorctl tail -f spacepush`.
+Built as a static library, so Erlang does not depend on the system's OpenSSL.
 
-To update: build a new release, copy it to `~/spacepush/release.new`, then `supervisorctl stop spacepush`, swap the directories and `supervisorctl start spacepush`. Data, configuration and key live outside the release.
+    mkdir -p ~/build ~/opt && cd ~/build
+    curl -LO https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz
+    curl -LO https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz.sha256
+    echo "$(grep -oE '[0-9a-f]{64}' openssl-3.5.9.tar.gz.sha256)  openssl-3.5.9.tar.gz" | sha256sum -c
+
+Continue only if it prints `OK`:
+
+    tar xzf openssl-3.5.9.tar.gz && cd openssl-3.5.9
+    ./Configure linux-x86_64 --prefix=$HOME/opt/openssl-3.5.9 --libdir=lib no-shared no-tests -fPIC
+    make -j2 && make install_sw
+
+### 2. Erlang/OTP 28 (once, ~30 min)
+
+    cd ~/build
+    curl -LO https://github.com/erlang/otp/releases/download/OTP-28.5.0.7/otp_src_28.5.0.7.tar.gz
+    curl -LO https://github.com/erlang/otp/releases/download/OTP-28.5.0.7/SHA256.txt
+    grep ' otp_src_28.5.0.7.tar.gz$' SHA256.txt | sha256sum -c
+
+Continue only if it prints `OK`:
+
+    tar xzf otp_src_28.5.0.7.tar.gz && cd otp_src_28.5.0.7
+    ./configure --prefix=$HOME/opt/otp-28.5.0.7 \
+      --with-ssl=$HOME/opt/openssl-3.5.9 --disable-dynamic-ssl-lib \
+      --without-javac --without-wx --without-odbc --without-observer --without-debugger --without-et
+    make -j2 && make install
+    ~/opt/otp-28.5.0.7/bin/erl -noshell -eval 'io:format("~s~n~p~n", [erlang:system_info(otp_release), crypto:info_lib()]), halt().'
+
+Expect `28` and `OpenSSL 3.5.9`.
+
+### 3. PATH and rebar3 (once)
+
+    echo 'export PATH=$HOME/opt/otp-28.5.0.7/bin:$HOME/bin:$PATH' >> ~/.bash_profile
+    source ~/.bash_profile
+    mkdir -p ~/bin && cd ~/bin
+    curl -LO https://github.com/erlang/rebar3/releases/download/3.27.1/rebar3
+    echo "708407032479514dd68b581a0b09a68b5a781fb6f53dcf4ad81ce4ef6b92940f  rebar3" | sha256sum -c
+    chmod +x rebar3 && rebar3 version
+
+### 4. First release (once)
+
+    mkdir -p ~/spacepush && cd ~/spacepush
+    git clone --branch dev https://github.com/kerker00/SpacePush.git src
+    cd src && rebar3 as prod release
+    cp -a _build/prod/rel/spacepush ~/spacepush/release
+
+The release contains the Erlang runtime (`erts-…`), so it runs on its own.
+
+### 5. Configuration and APNs key (once)
+
+    mkdir -p ~/spacepush/data ~/spacepush/secrets && chmod 700 ~/spacepush/secrets
+    cp ~/spacepush/src/deploy/uberspace/sys.config.example ~/spacepush/sys.config
+    cp ~/spacepush/src/deploy/uberspace/vm.args.example ~/spacepush/vm.args
+    sed -i "s#/home/USER/#$HOME/#g; s#AuthKey_KEYID#AuthKey_<key id>#; s#<<\"KEYID\">>#<<\"<key id>\">>#" ~/spacepush/sys.config
+    sed -i "s#^-setcookie COOKIE#-setcookie $(openssl rand -hex 32)#" ~/spacepush/vm.args
+    chmod 600 ~/spacepush/sys.config ~/spacepush/vm.args
+
+Upload the key **from the Mac**, naming the target file in full (newer `scp` fails with `dest open …: Failure` on a directory target):
+
+    scp AuthKey_<key id>.p8 <user>@<host>.uberspace.de:spacepush/secrets/AuthKey_<key id>.p8
+
+Then on the host:
+
+    chmod 600 ~/spacepush/secrets/AuthKey_*.p8
+    erl -noshell -pa ~/spacepush/release/lib/*/ebin -eval '
+      {ok, [Config]} = file:consult(os:getenv("HOME") ++ "/spacepush/sys.config"),
+      Env = proplists:get_value(spacepush, Config),
+      spacepush_jwt:read_key(proplists:get_value(apns_key_file, Env)),
+      io:format("config ok, key ok~n"), halt().'
+
+Never commit the filled-in `sys.config`, `vm.args` or the key. The cookie in `vm.args` is a secret too.
+
+### 6. Service (once)
+
+    cp ~/spacepush/src/deploy/uberspace/spacepush.ini ~/etc/services.d/
+    supervisorctl reread && supervisorctl update
+    supervisorctl status spacepush
+    curl -s http://127.0.0.1:52184/health; echo
+
+supervisord restarts SpacePush after crashes and reboots.
+
+### 7. Domain and web backend (once)
+
+    uberspace web domain add push.grafixmafia.net
+
+It prints the IPv4 and IPv6 address. At the DNS provider (Namecheap: Domain List → Manage → Advanced DNS) add an `A` and an `AAAA` record for host `push` with these addresses. Once `dig +short push.grafixmafia.net` shows them:
+
+    uberspace web backend set push.grafixmafia.net --http --port 52184
+    uberspace web backend list
+    curl -s https://push.grafixmafia.net/health; echo
+
+Port 52184 stays closed to the outside; Uberspace's proxy forwards HTTPS on 443 to it. Do not open it with `uberspace port add`. The certificate is issued automatically.
+
+### Updating to a new release
+
+Build next to the running release, then swap; the interruption is a few seconds:
+
+    cd ~/spacepush/src && git pull
+    rebar3 as prod release
+    rm -rf ~/spacepush/release.new && cp -a _build/prod/rel/spacepush ~/spacepush/release.new
+    supervisorctl stop spacepush
+    rm -rf ~/spacepush/release.old
+    mv ~/spacepush/release ~/spacepush/release.old && mv ~/spacepush/release.new ~/spacepush/release
+    supervisorctl start spacepush
+    sleep 20 && supervisorctl status spacepush
+    curl -s https://push.grafixmafia.net/health; echo
+    curl -s https://push.grafixmafia.net/v1/directory | head -c 200; echo
+
+Data, configuration and key are untouched. If the new configuration template gained keys you need (see `src/spacepush.app.src` and the release notes), add them to `~/spacepush/sys.config` before starting; keys missing there fall back to the defaults.
+
+To roll back, swap back to the previous release:
+
+    supervisorctl stop spacepush
+    mv ~/spacepush/release ~/spacepush/release.broken && mv ~/spacepush/release.old ~/spacepush/release
+    supervisorctl start spacepush
+
+### Updating Erlang or OpenSSL
+
+Build the new version into its own directory under `~/opt` as in steps 1 and 2, point `PATH` in `~/.bash_profile` at it, and build and swap a release as above. The release brings its own runtime, so the old one in `~/opt` can be deleted once the new release runs.
+
+### Operating
+
+    supervisorctl status spacepush        # running?
+    supervisorctl tail -f spacepush       # log; the level is notice, so only noteworthy events appear
+    supervisorctl restart spacepush
+
+Remote shell into the running node, for inspection (`Ctrl-G q` leaves without stopping it):
+
+    ~/spacepush/release/bin/spacepush remote_console
+
+The release script reads `vm.args` and `sys.config` from `VMARGS_PATH` and `RELX_CONFIG_PATH`, which the service sets; export both before calling it by hand.
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+| --- | --- |
+| `/v1/directory` answers `directory_unavailable` | The list could not be loaded. Check the log for `directory_fetch_failed`; `too_large` means `directory_max_bytes` is too small. |
+| `config ok` check fails with `enoent` | The key file is not where `apns_key_file` says; compare `ls ~/spacepush/secrets` with the path in `sys.config`. |
+| `uberspace web backend list` says the backend is not OK | SpacePush is not running or listens on the wrong interface or port; it must listen on `0.0.0.0:52184`. |
+| Warning about a post-quantum key exchange when connecting | Informational, from a newer SSH client; Uberspace 7's server does not offer it. |
+| Notifications never arrive | Log entries `apns_rejected_*` point to the key, key ID or topic (`apns_topic` must be the apps' bundle ID). |
 
 ## Tests
 
