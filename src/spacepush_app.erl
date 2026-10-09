@@ -13,7 +13,8 @@ start(_StartType, _StartArgs) ->
             {"/v1/directory", spacepush_http_read, directory},
             {"/v1/spaces", spacepush_http_read, space},
             {"/v1/mainframe/rooms", spacepush_http_read, mainframe_rooms},
-            {"/health", spacepush_http_health, []}
+            {"/health", spacepush_http_health, []},
+            {"/v1/stats", spacepush_http_stats, []}
         ]}
     ]),
     {ok, Ip} = application:get_env(spacepush, http_ip),

@@ -20,7 +20,7 @@ Every change is synced to disk before the call returns.
 
 -include_lib("kernel/include/logger.hrl").
 
--export([start_link/0, enqueue/1, due/3, complete/2, retry/3]).
+-export([start_link/0, enqueue/1, due/3, complete/2, retry/3, pending/0]).
 -export([init/1, handle_call/3, handle_cast/2, terminate/2]).
 
 -define(DETS, spacepush_outbox).
@@ -56,6 +56,11 @@ enqueue(Changes) ->
 -spec due(integer(), [key()], non_neg_integer()) -> [delivery()].
 due(Now, InFlight, Limit) ->
     gen_server:call(?MODULE, {due, Now, InFlight, Limit}).
+
+-doc "How many deliveries wait to be sent, read from ETS.".
+-spec pending() -> non_neg_integer().
+pending() ->
+    ets:info(?TABLE, size).
 
 -doc "Removes a delivery that was sent or permanently rejected.".
 -spec complete(key(), id()) -> ok.

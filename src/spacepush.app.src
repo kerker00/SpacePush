@@ -3,7 +3,7 @@
     {vsn, "2.0.0"},
     {registered, [
         spacepush_sup, spacepush_ratelimit, spacepush_registry, spacepush_directory,
-        spacepush_cache, spacepush_outbox, spacepush_apns, spacepush_poller
+        spacepush_cache, spacepush_outbox, spacepush_apns, spacepush_poller, spacepush_stats
     ]},
     {mod, {spacepush_app, []}},
     {applications, [kernel, stdlib, crypto, public_key, ssl, inets, gun, cowboy]},
@@ -51,7 +51,9 @@
         {apns_key_file, undefined},
         {apns_key_id, undefined},
         {apns_team_id, <<"7E3BJ546SA">>},
-        {apns_topic, <<"net.grafixmafia.spacepush">>}
+        {apns_topic, <<"net.grafixmafia.spacepush">>},
+        %% Usage statistics, served on GET /v1/stats to local requests only.
+        {stats_file, "data/stats.bin"}
     ]},
     {licenses, ["MIT"]},
     {links, [{"GitHub", "https://github.com/kerker00/SpacePush"}]}

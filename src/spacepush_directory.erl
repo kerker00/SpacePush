@@ -58,7 +58,9 @@ handle_info(refresh, #{file := File} = State) ->
                     ?LOG_WARNING(#{msg => directory_empty, url => Url});
                 Entries ->
                     replace(Entries),
-                    spacepush_store:save(File, {directory, 1, Entries})
+                    spacepush_store:save(File, {directory, 1, Entries}),
+                    spacepush_stats:count(<<"directory.refresh_ok">>),
+                    spacepush_stats:success(<<"directory">>)
             catch
                 Class:Reason ->
                     ?LOG_WARNING(#{msg => directory_unreadable, url => Url, class => Class, reason => Reason})
@@ -66,6 +68,8 @@ handle_info(refresh, #{file := File} = State) ->
         {error, Reason} ->
             ?LOG_WARNING(#{msg => directory_fetch_failed, url => Url, reason => Reason})
     end,
+    %% Refreshes without a matching `refresh_ok` failed.
+    spacepush_stats:count(<<"directory.refreshes">>),
     erlang:send_after(env(directory_refresh_ms), self(), refresh),
     {noreply, State};
 handle_info(_Info, State) ->

@@ -23,6 +23,7 @@ setup_env(Name) ->
     application:set_env(spacepush, outbox_file, filename:join(Dir, "outbox.dets")),
     application:set_env(spacepush, tracker_file, filename:join(Dir, "tracker.bin")),
     application:set_env(spacepush, directory_file, filename:join(Dir, "directory.bin")),
+    application:set_env(spacepush, stats_file, filename:join(Dir, "stats.bin")),
     application:set_env(spacepush, http_get, {?MODULE, fake_get}),
     fake_responses(#{}),
     Dir.
