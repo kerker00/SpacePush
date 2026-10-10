@@ -21,6 +21,7 @@ app_test_() ->
             ?_assertEqual(405, status(request(get, Port, "/v1/devices/" ?TOKEN))),
             ?_assertEqual(400, status(request(put, Port, "/v1/devices/" ?TOKEN, registration(<<"https://evil.example/">>)))),
             ?_test(directory(Port)),
+            ?_test(summary(Port)),
             ?_assertEqual({200, ?SPACE}, request(get, Port, "/v1/spaces?endpoint=" ?NERD2NERD_QS)),
             ?_assertEqual(404, status(request(get, Port, "/v1/spaces?endpoint=http%3A%2F%2F127.0.0.1%3A8080%2F"))),
             ?_assertEqual(400, status(request(get, Port, "/v1/spaces"))),
@@ -124,6 +125,15 @@ directory(Port) ->
     ?assertEqual(7, length(Entries)),
     [Nerd2Nerd] = [E || #{<<"url">> := ?NERD2NERD} = E <- Entries],
     ?assertMatch(#{<<"data">> := #{<<"space">> := <<"Nerd2Nerd">>, <<"location">> := #{<<"address">> := _}}}, Nerd2Nerd).
+
+%% The summary counts the same states the directory lists, and any page may read it.
+summary(Port) ->
+    {200, Directory} = request(get, Port, "/v1/directory"),
+    Entries = json:decode(Directory),
+    Open = length([E || #{<<"data">> := #{<<"state">> := #{<<"open">> := true}}} = E <- Entries]),
+    {200, Body} = request(get, Port, "/v1/summary"),
+    ?assertMatch(#{<<"open">> := Open, <<"total">> := 7, <<"as_of">> := <<_/binary>>}, json:decode(Body)),
+    ?assertEqual("*", proplists:get_value("access-control-allow-origin", headers(Port, "/v1/summary"))).
 
 passes_documents_through_safely(Port) ->
     Headers = headers(Port, "/v1/spaces?endpoint=" ?NERD2NERD_QS),

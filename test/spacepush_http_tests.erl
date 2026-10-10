@@ -23,3 +23,14 @@ client_test_() ->
             ?assertEqual({10, 0, 0, 1}, spacepush_http:client(req(undefined)))
         end
     ]}.
+
+summary_test_() ->
+    Entry = fun(Open, Seen) -> #{<<"url">> => <<"https://a.example/">>, <<"lastSeen">> => Seen, <<"data">> => #{<<"state">> => #{<<"open">> => Open}}} end,
+    Unknown = #{<<"url">> => <<"https://b.example/">>, <<"data">> => #{<<"space">> => <<"B">>}},
+    [
+        ?_assertEqual(
+            #{<<"open">> => 2, <<"total">> => 4, <<"as_of">> => <<"2026-10-10T10:00:00Z">>},
+            spacepush_http_read:summary([Entry(true, 1791626400), Entry(false, 1791626000), Entry(true, 1791620000), Unknown])
+        ),
+        ?_assertEqual(#{<<"open">> => 0, <<"total">> => 0, <<"as_of">> => null}, spacepush_http_read:summary([]))
+    ].
