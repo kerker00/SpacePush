@@ -63,6 +63,9 @@ Read the current state, in the shapes the apps already decode:
     GET /v1/directory                    the listed spaces, in the aggregator's format
     GET /v1/spaces?endpoint=<url>        a space's SpaceAPI document, at most a minute old
     GET /v1/mainframe/rooms              Mainframe's openState response
+    GET /v1/summary                      {"open", "total", "as_of"}: how many listed spaces are open
+
+`/v1/summary` counts the same states as `/v1/directory`: spaces somebody subscribed to or asked for in the last minutes are at most a minute old, the others come from the hourly directory; `as_of` is the newest of them. It carries `Access-Control-Allow-Origin: *`, so web pages such as the project site can show the number live.
 
 Unknown endpoints answer `404`; a space that cannot be fetched and has nothing cached answers `502`, and too many spaces fetched at once `503`.
 
