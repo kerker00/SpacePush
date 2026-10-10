@@ -11,6 +11,7 @@ start(_StartType, _StartArgs) ->
         {'_', [
             {"/v1/devices/:token", spacepush_http_devices, []},
             {"/v1/directory", spacepush_http_read, directory},
+            {"/v1/summary", spacepush_http_read, summary},
             {"/v1/spaces", spacepush_http_read, space},
             {"/v1/mainframe/rooms", spacepush_http_read, mainframe_rooms},
             {"/health", spacepush_http_health, []},

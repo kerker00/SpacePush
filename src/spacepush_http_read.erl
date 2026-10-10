@@ -9,6 +9,9 @@ Read API for the apps, in the shapes they already decode:
 - `GET /v1/spaces?endpoint=<url>` – the space's SpaceAPI document as fetched,
   at most `cache_max_age_ms` old; 404 for endpoints not in the directory.
 - `GET /v1/mainframe/rooms` – Mainframe's openState response as fetched.
+- `GET /v1/summary` – how many of the listed spaces are open, from the same
+  states as the directory: `{"open", "total", "as_of"}`, where `as_of` is the
+  newest state. Public data, so any web page may read it (CORS `*`).
 
 Answers 502 when a space cannot be fetched and nothing is cached, 503 when too
 many spaces are being fetched at once, and 429 when a client exceeds
@@ -18,7 +21,7 @@ must not render a hostile document as HTML.
 """.
 -behaviour(cowboy_handler).
 
--export([init/2, directory/1]).
+-export([init/2, directory/1, summary/1]).
 
 init(Req0, Kind) ->
     spacepush_stats:request(atom_to_binary(Kind), Req0),
@@ -38,6 +41,14 @@ handle(directory, Req) ->
         true ->
             Body = json:encode(directory(erlang:system_time(millisecond))),
             spacepush_http:json_reply(200, #{<<"cache-control">> => <<"max-age=300">>}, Body, Req);
+        false ->
+            spacepush_http:error_reply(503, <<"directory_unavailable">>, Req)
+    end;
+handle(summary, Req) ->
+    case spacepush_directory:loaded() of
+        true ->
+            Headers = #{<<"cache-control">> => <<"max-age=60">>, <<"access-control-allow-origin">> => <<"*">>},
+            spacepush_http:json_reply(200, Headers, json:encode(summary(directory(erlang:system_time(millisecond)))), Req);
         false ->
             spacepush_http:error_reply(503, <<"directory_unavailable">>, Req)
     end;
@@ -95,6 +106,18 @@ entry(#{endpoint := Url, name := Name, address := Address, lat := Lat, lon := Lo
         <<"state">> => maps:filter(fun(_Key, Value) -> Value =/= null end, #{<<"open">> => Open})
     }),
     maps:filter(fun(_Key, Value) -> Value =/= null end, #{<<"url">> => Url, <<"lastSeen">> => LastSeen, <<"data">> => Data}).
+
+-doc "Counts the open spaces among directory entries as `directory/1` returns them.".
+-spec summary([map()]) -> map().
+summary(Entries) ->
+    Open = length([E || #{<<"data">> := #{<<"state">> := #{<<"open">> := true}}} = E <- Entries]),
+    Seen = [S || #{<<"lastSeen">> := S} <- Entries, is_integer(S)],
+    AsOf =
+        case Seen of
+            [] -> null;
+            _ -> list_to_binary(calendar:system_time_to_rfc3339(lists:max(Seen), [{unit, second}, {offset, "Z"}]))
+        end,
+    #{<<"open">> => Open, <<"total">> => length(Entries), <<"as_of">> => AsOf}.
 
 without_empty(Map) ->
     maps:filter(fun(_Key, Value) -> Value =/= #{} end, Map).
