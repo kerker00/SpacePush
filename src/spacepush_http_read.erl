@@ -5,13 +5,17 @@ Read API for the apps, in the shapes they already decode:
 - `GET /v1/directory` – the listed spaces in the aggregator's format
   (`url`, `lastSeen`, `data.space`, `data.location`, `data.state.open`). The
   state comes from SpacePush's own recent fetch when there is one, otherwise
-  from the hourly directory.
+  from the hourly directory while its original observation is still recent.
+  Expired observations keep their display fields and endpoint but omit the
+  open flag. Directory and summary require HTTP cache revalidation.
 - `GET /v1/spaces?endpoint=<url>` – the space's SpaceAPI document as fetched,
-  at most `cache_max_age_ms` old; 404 for endpoints not in the directory.
+  with its fetch-time header, including an older fallback on refresh failure;
+  404 for endpoints not in the directory.
 - `GET /v1/mainframe/rooms` – Mainframe's openState response as fetched.
 - `GET /v1/summary` – how many of the listed spaces are open, from the same
   states as the directory: `{"open", "total", "as_of"}`, where `as_of` is the
-  newest state. Public data, so any web page may read it (CORS `*`).
+  newest known current state, or null if none is known. This is not an age
+  guarantee for all listed spaces. Public data, so any web page may read it (CORS `*`).
 
 Answers 502 when a space cannot be fetched and nothing is cached, 503 when too
 many spaces are being fetched at once, and 429 when a client exceeds
@@ -24,10 +28,10 @@ must not render a hostile document as HTML.
 -export([init/2, directory/1, summary/1]).
 
 init(Req0, Kind) ->
-    spacepush_stats:request(atom_to_binary(Kind), Req0),
     Req =
         case {cowboy_req:method(Req0), spacepush_ratelimit:allow(read, spacepush_http:client(Req0))} of
             {<<"GET">>, true} ->
+                spacepush_stats:request(atom_to_binary(Kind), Req0),
                 handle(Kind, Req0);
             {<<"GET">>, false} ->
                 spacepush_stats:rate_limited(read),
@@ -40,14 +44,14 @@ handle(directory, Req) ->
     case spacepush_directory:loaded() of
         true ->
             Body = json:encode(directory(erlang:system_time(millisecond))),
-            spacepush_http:json_reply(200, #{<<"cache-control">> => <<"max-age=300">>}, Body, Req);
+            spacepush_http:json_reply(200, #{<<"cache-control">> => <<"no-cache">>}, Body, Req);
         false ->
             spacepush_http:error_reply(503, <<"directory_unavailable">>, Req)
     end;
 handle(summary, Req) ->
     case spacepush_directory:loaded() of
         true ->
-            Headers = #{<<"cache-control">> => <<"max-age=60">>, <<"access-control-allow-origin">> => <<"*">>},
+            Headers = #{<<"cache-control">> => <<"no-cache">>, <<"access-control-allow-origin">> => <<"*">>},
             spacepush_http:json_reply(200, Headers, json:encode(summary(directory(erlang:system_time(millisecond)))), Req);
         false ->
             spacepush_http:error_reply(503, <<"directory_unavailable">>, Req)
@@ -86,15 +90,21 @@ serve(Url, Req) ->
 -spec directory(integer()) -> [map()].
 directory(Now) ->
     {ok, Window} = application:get_env(spacepush, watch_window_ms),
-    [entry(Entry, Now, Window) || #{name := Name} = Entry <- spacepush_directory:entries(), Name =/= null].
+    {ok, MaxAge} = application:get_env(spacepush, max_data_age_s),
+    [entry(Entry, Now, min(Window, MaxAge * 1000), MaxAge * 1000) || #{name := Name} = Entry <- spacepush_directory:entries(), Name =/= null].
 
-entry(#{endpoint := Url, name := Name, address := Address, lat := Lat, lon := Lon} = Entry, Now, Window) ->
+entry(#{endpoint := Url, name := Name, address := Address, lat := Lat, lon := Lon} = Entry, Now, Window, MaxAge) ->
     {Open, LastSeen} =
         case spacepush_cache:lookup(Url) of
-            #{fetched_at := FetchedAt, observations := [{_Topic, _Name, State} | _]} when Now - FetchedAt < Window ->
+            #{fetched_at := FetchedAt, observations := [{_Topic, _Name, State} | _]} when FetchedAt =< Now, Now - FetchedAt < Window ->
                 {open_flag(State), FetchedAt div 1000};
             _ ->
-                {maps:get(open, Entry), maps:get(last_seen, Entry)}
+                LastSeen0 = maps:get(last_seen, Entry, null),
+                Open0 = case LastSeen0 of
+                    Seen when is_number(Seen), Seen * 1000 =< Now, Now - Seen * 1000 =< MaxAge -> maps:get(open, Entry, null);
+                    _ -> null
+                end,
+                {Open0, LastSeen0}
         end,
     Location = maps:filter(
         fun(_Key, Value) -> Value =/= null end,
@@ -111,7 +121,7 @@ entry(#{endpoint := Url, name := Name, address := Address, lat := Lat, lon := Lo
 -spec summary([map()]) -> map().
 summary(Entries) ->
     Open = length([E || #{<<"data">> := #{<<"state">> := #{<<"open">> := true}}} = E <- Entries]),
-    Seen = [S || #{<<"lastSeen">> := S} <- Entries, is_integer(S)],
+    Seen = [trunc(S) || #{<<"lastSeen">> := S, <<"data">> := #{<<"state">> := #{<<"open">> := O}}} <- Entries, is_number(S), is_boolean(O)],
     AsOf =
         case Seen of
             [] -> null;

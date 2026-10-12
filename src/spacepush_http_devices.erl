@@ -26,10 +26,10 @@ within `http_body_timeout_ms`, 429 when the client sent too many requests and
 -define(MAX_ENDPOINT, 512).
 
 init(Req0, Opts) ->
-    spacepush_stats:request(kind(cowboy_req:method(Req0)), Req0),
     Req =
         case spacepush_ratelimit:allow(write, spacepush_http:client(Req0)) of
             true ->
+                spacepush_stats:request(kind(cowboy_req:method(Req0)), Req0),
                 handle(cowboy_req:method(Req0), cowboy_req:binding(token, Req0), Req0);
             false ->
                 spacepush_stats:rate_limited(write),
@@ -67,6 +67,10 @@ handle_valid(<<"DELETE">>, Token, Req) ->
 handle_valid(_Method, _Token, Req) ->
     cowboy_req:reply(405, #{<<"allow">> => <<"PUT, DELETE">>}, Req).
 
+%% Unsubscribing does not need a directory or a free registration slot.
+register(Token, Environment, [], Platform, Req) ->
+    ok = spacepush_registry:register(Token, Environment, [], Platform),
+    cowboy_req:reply(204, Req);
 %% Only endpoints from the directory: SpacePush fetches what devices subscribe
 %% to, so it must not accept arbitrary, possibly internal, URLs.
 register(Token, Environment, Topics, Platform, Req) ->
@@ -79,7 +83,8 @@ register(Token, Environment, Topics, Platform, Req) ->
         {true, []} ->
             case spacepush_registry:register(Token, Environment, Topics, Platform) of
                 ok -> cowboy_req:reply(204, Req);
-                {error, full} -> spacepush_http:error_reply(503, <<"registry_full">>, Req)
+                {error, full} -> spacepush_http:error_reply(503, <<"registry_full">>, Req);
+                {error, invalid_registration} -> spacepush_http:error_reply(400, <<"invalid_registration">>, Req)
             end
     end.
 
@@ -107,10 +112,8 @@ read_body(Req0, Acc, Size, Deadline) ->
 
 -doc "APNs device tokens are hex strings, currently 64 characters long.".
 -spec valid_token(term()) -> boolean().
-valid_token(Token) when is_binary(Token), byte_size(Token) >= 64, byte_size(Token) =< 200 ->
-    re:run(Token, "^[0-9a-fA-F]+$", [{capture, none}]) =:= match;
-valid_token(_) ->
-    false.
+valid_token(Token) ->
+    spacepush_device:valid_token(Token).
 
 -spec parse_registration(binary()) ->
     {ok, spacepush_registry:environment(), [spacepush_state:topic()]} | {error, binary()}.
@@ -173,7 +176,5 @@ valid_endpoint(Endpoint) ->
             false
     end.
 
-valid_room(Room) when is_binary(Room), byte_size(Room) >= 1, byte_size(Room) =< 32 ->
-    re:run(Room, "^[a-z0-9_]+$", [{capture, none}]) =:= match;
-valid_room(_) ->
-    false.
+valid_room(Room) ->
+    spacepush_device:valid_room(Room).

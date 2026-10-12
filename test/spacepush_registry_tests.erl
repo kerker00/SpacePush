@@ -27,9 +27,15 @@ registry_test_() ->
             fun migrates_format_1_records/0,
             fun keeps_platform/0,
             fun drops_unknown_records/0,
+            fun rejects_invalid_registration/0,
+            fun drops_invalid_persisted_tokens_and_rooms/0,
             fun lookup_returns_current_registration/0,
             fun subscribed_endpoints_are_unique/0,
-            fun expires_old_registrations/0
+            fun expires_old_registrations/0,
+            fun empty_topics_never_consume_capacity/0,
+            fun empty_topics_remove_existing_registration/0,
+            fun empty_topics_work_at_full_capacity/0,
+            fun drops_persisted_empty_registrations/0
         ]}.
 
 start() ->
@@ -140,6 +146,37 @@ drops_unknown_records() ->
     ?assertEqual([], spacepush_registry:subscribers(?A)),
     ?assertEqual(error, spacepush_registry:lookup(token(1))).
 
+rejects_invalid_registration() ->
+    ?assertEqual({error, invalid_registration}, spacepush_registry:register(<<(token(1))/binary, 10>>, sandbox, [?A])),
+    ?assertEqual(
+        {error, invalid_registration},
+        spacepush_registry:register(token(1), sandbox, [{element(1, ?A), <<"space\n">>}])
+    ),
+    ?assertMatch(#{<<"total">> := 0}, spacepush_registry:summary()).
+
+drops_invalid_persisted_tokens_and_rooms() ->
+    Version = erlang:system_time(millisecond),
+    BadToken = <<(token(2))/binary, 10>>,
+    OldBadToken = <<(token(3))/binary, 0>>,
+    BadRoom = {element(1, ?A), <<"space\n">>},
+    with_raw_records([
+        {token(1), {registration, 2, sandbox, [?A], Version, <<"ios">>}},
+        {BadToken, {registration, 2, production, [?A], Version, <<"ios">>}},
+        {token(4), {registration, 1, sandbox, [BadRoom], Version}},
+        {OldBadToken, production, [?A], Version div 1000}
+    ]),
+    ?assertEqual([{token(1), sandbox, Version}], spacepush_registry:subscribers(?A)),
+    ?assertEqual(error, spacepush_registry:lookup(BadToken)),
+    ?assertEqual(error, spacepush_registry:lookup(OldBadToken)),
+    ?assertEqual(error, spacepush_registry:lookup(token(4))),
+    stop(),
+    {ok, File} = application:get_env(spacepush, registry_file),
+    {ok, Table} = dets:open_file(raw_registry, [{file, File}, {type, set}]),
+    ?assertEqual(1, dets:info(Table, size)),
+    ok = dets:close(Table),
+    start(),
+    ?assertEqual([{token(1), sandbox, Version}], spacepush_registry:subscribers(?A)).
+
 lookup_returns_current_registration() ->
     ?assertEqual(error, spacepush_registry:lookup(token(1))),
     ok = spacepush_registry:register(token(1), production, [?A]),
@@ -152,3 +189,51 @@ subscribed_endpoints_are_unique() ->
     ?assertEqual([<<"https://a.example/">>, <<"https://b.example/">>], spacepush_registry:subscribed_endpoints()),
     ok = spacepush_registry:unregister(token(2)),
     ?assertEqual([<<"https://a.example/">>], spacepush_registry:subscribed_endpoints()).
+
+empty_topics_never_consume_capacity() ->
+    [ok = spacepush_registry:register(token(N), sandbox, []) || N <- [1, 2, 3, 4]],
+    ?assertMatch(#{<<"total">> := 0}, spacepush_registry:summary()),
+    ?assertEqual(error, spacepush_registry:lookup(token(1))),
+    ?assertEqual(ok, spacepush_registry:register(token(1), sandbox, [?A])),
+    stop(),
+    start(),
+    ?assertMatch(#{<<"total">> := 1}, spacepush_registry:summary()).
+
+empty_topics_remove_existing_registration() ->
+    ok = spacepush_registry:register(token(1), sandbox, [?A, ?B]),
+    ok = spacepush_registry:register(token(1), production, [], <<"ios">>),
+    ?assertEqual(error, spacepush_registry:lookup(token(1))),
+    ?assertEqual([], spacepush_registry:subscribers(?A)),
+    ?assertEqual([], spacepush_registry:subscribers(?B)),
+    ?assertEqual([], spacepush_registry:subscribed_endpoints()),
+    stop(),
+    start(),
+    ?assertEqual(error, spacepush_registry:lookup(token(1))),
+    ?assertMatch(#{<<"total">> := 0}, spacepush_registry:summary()).
+
+empty_topics_work_at_full_capacity() ->
+    [ok = spacepush_registry:register(token(N), sandbox, [?A]) || N <- [1, 2, 3]],
+    ?assertEqual({error, full}, spacepush_registry:register(token(4), sandbox, [?A])),
+    ?assertEqual(ok, spacepush_registry:register(token(4), sandbox, [])),
+    ?assertMatch(#{<<"total">> := 3}, spacepush_registry:summary()),
+    ?assertEqual(ok, spacepush_registry:register(token(1), sandbox, [])),
+    ?assertEqual(ok, spacepush_registry:register(token(4), sandbox, [?A])),
+    ?assertMatch(#{<<"total">> := 3}, spacepush_registry:summary()).
+
+drops_persisted_empty_registrations() ->
+    Version = erlang:system_time(millisecond),
+    with_raw_records([
+        {token(1), {registration, 2, sandbox, [?A], Version, <<"ios">>}},
+        {token(2), {registration, 2, sandbox, [], Version, <<"ios">>}},
+        {token(3), {registration, 1, production, [], Version}},
+        {token(4), production, [], Version div 1000}
+    ]),
+    ?assertEqual([{token(1), sandbox, Version}], spacepush_registry:subscribers(?A)),
+    ?assertMatch(#{<<"total">> := 1}, spacepush_registry:summary()),
+    stop(),
+    {ok, File} = application:get_env(spacepush, registry_file),
+    {ok, Table} = dets:open_file(raw_registry, [{file, File}, {type, set}]),
+    ?assertEqual(1, dets:info(Table, size)),
+    ok = dets:close(Table),
+    start(),
+    ?assertMatch(#{<<"total">> := 1}, spacepush_registry:summary()).

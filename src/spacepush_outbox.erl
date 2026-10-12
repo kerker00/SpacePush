@@ -20,7 +20,7 @@ Every change is synced to disk before the call returns.
 
 -include_lib("kernel/include/logger.hrl").
 
--export([start_link/0, enqueue/1, due/3, complete/2, retry/3, pending/0]).
+-export([start_link/0, enqueue/1, due/3, due/4, complete/2, retry/3, pending/0]).
 -export([init/1, handle_call/3, handle_cast/2, terminate/2]).
 
 -define(DETS, spacepush_outbox).
@@ -55,7 +55,12 @@ enqueue(Changes) ->
 -doc "Returns up to `Limit` deliveries due at `Now` (ms) whose keys are not in `InFlight`.".
 -spec due(integer(), [key()], non_neg_integer()) -> [delivery()].
 due(Now, InFlight, Limit) ->
-    gen_server:call(?MODULE, {due, Now, InFlight, Limit}).
+    due(Now, InFlight, Limit, fun(_Delivery) -> true end).
+
+-doc "Selects eligible deliveries before limiting, preserving order within the selection.".
+-spec due(integer(), [key()], non_neg_integer(), fun((delivery()) -> boolean())) -> [delivery()].
+due(Now, InFlight, Limit, Eligible) ->
+    gen_server:call(?MODULE, {due, Now, InFlight, Limit, Eligible}).
 
 -doc "How many deliveries wait to be sent, read from ETS.".
 -spec pending() -> non_neg_integer().
@@ -94,16 +99,16 @@ handle_call({enqueue, Changes}, _From, #{slots := Slots} = State) ->
     sync(),
     Count > 0 andalso spacepush_apns:wake(),
     {reply, ok, State#{slots := Slots1}};
-handle_call({due, Now, InFlight, Limit}, _From, State) ->
+handle_call({due, Now, InFlight, Limit, Eligible}, _From, State) ->
     {Expired, Ready} = ets:foldl(
         fun({Key, #{not_before := NotBefore, expires := Expires} = Delivery}, {ExpiredAcc, ReadyAcc}) ->
             if
                 Expires =< Now -> {[Key | ExpiredAcc], ReadyAcc};
                 NotBefore > Now -> {ExpiredAcc, ReadyAcc};
                 true ->
-                    case lists:member(Key, InFlight) of
-                        true -> {ExpiredAcc, ReadyAcc};
-                        false -> {ExpiredAcc, [Delivery | ReadyAcc]}
+                    case not lists:member(Key, InFlight) andalso Eligible(Delivery) of
+                        false -> {ExpiredAcc, ReadyAcc};
+                        true -> {ExpiredAcc, [Delivery | ReadyAcc]}
                     end
             end
         end,

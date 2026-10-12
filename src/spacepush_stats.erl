@@ -12,8 +12,15 @@ of each period, and SpacePush adds one per named period. The app versions,
 platforms and OS versions are tallied per ISO week from those week reports.
 No ID and no client address is recorded.
 
-Recording is a cast, so a caller never waits for or fails because of this
-process. Everything is saved to `stats_file` every minute and on shutdown.
+Recording uses a bounded ETS buffer, so callers never wait for this process
+and cannot fill its mailbox. At most `stats_max_pending` events wait; overflow
+is counted as `stats.dropped` instead. The buffer is drained every 100 ms,
+before a report and on shutdown. Events are best effort under overload.
+
+Each week's versions and OS versions retain at most `stats_max_versions`
+and `stats_max_os_versions` distinct values, plus an `other` bucket. Existing
+oversized files are folded into the same limits on startup, keeping totals.
+Everything is saved to `stats_file` every minute and on shutdown.
 
 On disk: `{stats, 2, Days, Weeks, LastSuccess}`. Format 1 files, which held
 hashed install IDs, are migrated on start and keep only their counters.
@@ -25,6 +32,8 @@ hashed install IDs, are migrated on start and keep only their counters.
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(TICK_MS, 60000).
+-define(FLUSH_MS, 100).
+-define(INGRESS, spacepush_stats_ingress).
 %% Long enough for the 13 months before the current one.
 -define(COUNTER_DAYS, 430).
 -define(MAX_REPORT_DAYS, 400).
@@ -44,7 +53,7 @@ the apps may open a day, week or month; widgets and other clients are only count
 request(Kind, Req) ->
     Client = user_agent(cowboy_req:header(<<"user-agent">>, Req)),
     First = first_periods(cowboy_req:header(<<"x-spacestate-first">>, Req)),
-    gen_server:cast(?MODULE, {request, today(), Kind, Client, First}).
+    record({request, today(), Kind, Client, First}).
 
 -spec rate_limited(read | write) -> ok.
 rate_limited(Bucket) ->
@@ -58,17 +67,36 @@ count(Key) ->
 count(_Key, 0) ->
     ok;
 count(Key, N) ->
-    gen_server:cast(?MODULE, {count, today(), Key, N}).
+    record({count, today(), Key, N}).
 
 -doc "Adds a duration in milliseconds to `Key.ms_sum` and raises `Key.ms_max`.".
 -spec duration(binary(), non_neg_integer()) -> ok.
 duration(Key, Ms) ->
-    gen_server:cast(?MODULE, {duration, today(), Key, Ms}).
+    record({duration, today(), Key, Ms}).
 
 -doc "Notes that `Source` (such as `<<\"directory\">>`) was fetched successfully just now.".
 -spec success(binary()) -> ok.
 success(Source) ->
-    gen_server:cast(?MODULE, {success, Source, erlang:system_time(millisecond)}).
+    record({success, Source, erlang:system_time(millisecond)}).
+
+%% Each slot holds at most one bounded event. No per-event messages are sent,
+%% even when the statistics process is suspended or overloaded.
+record(Event) ->
+    try
+        Table = ets:whereis(?INGRESS),
+        case ets:lookup(Table, limit) of
+            [{limit, Limit}] ->
+                Cursor = ets:update_counter(Table, cursor, 1),
+                case ets:insert_new(Table, {{event, Cursor rem Limit}, Event}) of
+                    true -> ok;
+                    false -> ets:update_counter(Table, dropped, 1), ok
+                end;
+            [] -> ok
+        end
+    catch
+        %% Statistics are optional during startup, shutdown or a restart.
+        error:badarg -> ok
+    end.
 
 -doc "The statistics as a JSON-ready map, with daily counters for the last `Days` days.".
 -spec report(pos_integer()) -> map().
@@ -117,13 +145,28 @@ init([]) ->
             _ ->
                 #{days => #{}, weeks => #{}, last_success => #{}}
         end,
+    Limits = #{
+        <<"versions">> => limit(stats_max_versions),
+        <<"platforms">> => 3,
+        <<"os_versions">> => limit(stats_max_os_versions)
+    },
+    Table = ets:new(?INGRESS, [named_table, public, set, {write_concurrency, true}]),
+    true = ets:insert(Table, [{limit, limit(stats_max_pending)}, {cursor, 0}, {dropped, 0}]),
+    State1 = prune(State0#{file => File, dirty => true, limits => Limits, ingress => Table}, Today),
+    #{weeks := RecentWeeks} = State1,
+    State2 = State1#{weeks := maps:map(fun(_Label, Week) -> compact_week(Week, Limits) end, RecentWeeks)},
+    erlang:send_after(?FLUSH_MS, self(), flush),
     erlang:send_after(?TICK_MS, self(), tick),
-    {ok, prune(State0#{file => File, dirty => true}, Today)}.
+    {ok, save(State2)}.
 
 handle_call({report, Days}, _From, State) ->
-    {reply, build_report(Days, State), State}.
+    State1 = drain(State),
+    {reply, build_report(Days, State1), State1}.
 
-handle_cast({request, Date, Kind, Client, First}, State) ->
+handle_cast(_Message, State) ->
+    {noreply, State}.
+
+apply_event({request, Date, Kind, Client, First}, State) ->
     State1 = add(Date, <<"requests.", Kind/binary>>, 1, State),
     State2 =
         case Client of
@@ -131,23 +174,45 @@ handle_cast({request, Date, Kind, Client, First}, State) ->
             other -> add(Date, <<"requests.other">>, 1, State1);
             {app, _} -> State1
         end,
-    {noreply, record_first(Date, Client, First, State2)};
-handle_cast({count, Date, Key, N}, State) ->
-    {noreply, add(Date, Key, N, State)};
-handle_cast({duration, Date, Key, Ms}, State) ->
+    record_first(Date, Client, First, State2);
+apply_event({count, Date, Key, N}, State) ->
+    add(Date, Key, N, State);
+apply_event({duration, Date, Key, Ms}, State) ->
     State1 = add(Date, <<Key/binary, ".ms_sum">>, Ms, State),
-    {noreply, update(Date, <<Key/binary, ".ms_max">>, fun(Max) -> max(Max, Ms) end, State1)};
-handle_cast({success, Source, At}, #{last_success := LastSuccess} = State) ->
-    {noreply, State#{last_success := LastSuccess#{Source => At}, dirty := true}}.
+    update(Date, <<Key/binary, ".ms_max">>, fun(Max) -> max(Max, Ms) end, State1);
+apply_event({success, Source, At}, #{last_success := LastSuccess} = State) ->
+    State#{last_success := LastSuccess#{Source => max(At, maps:get(Source, LastSuccess, At))}, dirty := true}.
 
+drain(#{ingress := Table} = State) ->
+    State1 = lists:foldl(
+        fun({Key, _Event}, Acc) ->
+            case ets:take(Table, Key) of
+                [{Key, Event}] -> apply_event(Event, Acc);
+                [] -> Acc
+            end
+        end,
+        State,
+        ets:match_object(Table, {{event, '_'}, '_'})
+    ),
+    Dropped = ets:update_counter(Table, dropped, {2, 0}),
+    _ = ets:update_counter(Table, dropped, {2, -Dropped}),
+    case Dropped of
+        0 -> State1;
+        _ -> add(today(), <<"stats.dropped">>, Dropped, State1)
+    end.
+
+handle_info(flush, State) ->
+    State1 = drain(State),
+    erlang:send_after(?FLUSH_MS, self(), flush),
+    {noreply, State1};
 handle_info(tick, State) ->
     erlang:send_after(?TICK_MS, self(), tick),
-    {noreply, save(prune(State, today()))};
+    {noreply, save(prune(drain(State), today()))};
 handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, State) ->
-    save(State).
+    save(drain(State)).
 
 %% Only the apps report the periods they open; a week report also tallies their version.
 record_first(Date, {app, Info}, First, State0) ->
@@ -165,17 +230,66 @@ record_first(Date, {app, Info}, First, State0) ->
 record_first(_Date, _Client, _First, State) ->
     State.
 
-tally_week(Label, {Version, Os, OsVersion}, #{weeks := Weeks} = State) ->
+tally_week(Label, {Version, Os, OsVersion}, #{weeks := Weeks, limits := Limits} = State) ->
     Week0 = maps:get(Label, Weeks, #{}),
     Week = lists:foldl(
         fun({Group, Key}, Acc) ->
             Counts = maps:get(Group, Acc, #{}),
-            Acc#{Group => Counts#{Key => maps:get(Key, Counts, 0) + 1}}
+            Acc#{Group => tally(Key, 1, Counts, maps:get(Group, Limits))}
         end,
         Week0,
         [{<<"versions">>, Version}, {<<"platforms">>, Os}, {<<"os_versions">>, <<Os/binary, " ", OsVersion/binary>>}]
     ),
     State#{weeks := Weeks#{Label => Week}, dirty := true}.
+
+tally(Key, N, Counts, Limit) ->
+    Distinct = map_size(Counts) - case maps:is_key(<<"other">>, Counts) of true -> 1; false -> 0 end,
+    Bucket =
+        case maps:is_key(Key, Counts) orelse Key =:= <<"other">> orelse Distinct < Limit of
+            true -> Key;
+            false -> <<"other">>
+        end,
+    Counts#{Bucket => maps:get(Bucket, Counts, 0) + N}.
+
+%% Compact only the known groups, without carrying arbitrary persisted keys.
+compact_week(Week, Limits) when is_map(Week) ->
+    maps:map(
+        fun(Group, Limit) ->
+            Counts = maps:get(Group, Week, #{}),
+            compact_counts(Group, Counts, Limit)
+        end,
+        Limits
+    );
+compact_week(_Week, Limits) ->
+    maps:map(fun(_Group, _Limit) -> #{} end, Limits).
+
+compact_counts(Group, Counts, Limit) when is_map(Counts) ->
+    maps:fold(
+        fun
+            (Key, N, Acc) when is_integer(N), N >= 0 ->
+                Bucket = case valid_bucket(Group, Key) of true -> Key; false -> <<"other">> end,
+                tally(Bucket, N, Acc, Limit);
+            (_Key, _N, Acc) -> Acc
+        end,
+        #{},
+        Counts
+    );
+compact_counts(_Group, _Counts, _Limit) ->
+    #{}.
+
+valid_bucket(<<"platforms">>, Key) ->
+    lists:member(Key, [<<"iOS">>, <<"iPadOS">>, <<"macOS">>, <<"other">>]);
+valid_bucket(<<"versions">>, Key) ->
+    is_binary(Key) andalso byte_size(Key) > 0 andalso byte_size(Key) =< 16;
+valid_bucket(<<"os_versions">>, Key) ->
+    is_binary(Key) andalso byte_size(Key) > 0 andalso byte_size(Key) =< 32.
+
+limit(Key) ->
+    {ok, Value} = application:get_env(spacepush, Key),
+    case is_integer(Value) andalso Value > 0 of
+        true -> Value;
+        false -> error({invalid_statistics_limit, Key})
+    end.
 
 add(Date, Key, N, State) ->
     update(Date, Key, fun(Value) -> Value + N end, State).

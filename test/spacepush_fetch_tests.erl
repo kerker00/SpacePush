@@ -68,3 +68,53 @@ size_limit_applies_test() ->
     spacepush_test_util:fake_responses(#{url(1) => {ok, Big}}),
     ?assertEqual({error, too_large}, spacepush_fetch:get(url(1))),
     ?assertEqual({ok, Big}, spacepush_fetch:get(url(1), 4194304)).
+
+informational_responses_test_() ->
+    [?_test(begin
+        Conn = spawn(fun() -> receive stop -> ok end end),
+        Ref = make_ref(),
+        try
+            self() ! {gun_inform, Conn, Ref, Status, []},
+            self() ! {gun_response, Conn, Ref, nofin, 200, []},
+            self() ! {gun_data, Conn, Ref, fin, <<"ok">>},
+            Deadline = erlang:monotonic_time(millisecond) + 1000,
+            ?assertEqual({ok, <<"ok">>}, spacepush_fetch:response(Conn, Ref, Deadline, 100))
+        after Conn ! stop end
+    end) || Status <- [100, 103]].
+
+informational_response_does_not_reset_deadline_test() ->
+    Conn = spawn(fun() -> receive stop -> ok end end),
+    Ref = make_ref(),
+    try
+        self() ! {gun_inform, Conn, Ref, 103, []},
+        Started = erlang:monotonic_time(millisecond),
+        ?assertEqual({error, timeout}, spacepush_fetch:response(Conn, Ref, Started + 50, 100)),
+        ?assert(erlang:monotonic_time(millisecond) - Started < 500)
+    after Conn ! stop end.
+
+expired_deadline_rejects_queued_informational_response_test() ->
+    Conn = self(),
+    Ref = make_ref(),
+    self() ! {gun_inform, Conn, Ref, 103, []},
+    Deadline = erlang:monotonic_time(millisecond) - 1,
+    ?assertEqual({error, timeout}, spacepush_fetch:response(Conn, Ref, Deadline, 100)),
+    receive {gun_inform, Conn, Ref, _, _} -> ok end.
+
+total_fetch_deadline_test() ->
+    spacepush_test_util:setup_env("fetch_deadline"),
+    {ok, Previous} = application:get_env(spacepush, fetch_timeout_ms),
+    application:set_env(spacepush, fetch_timeout_ms, 50),
+    spacepush_test_util:fake_responses(#{url(1) => {notify, self(), {wait, {ok, <<"late">>}}}}),
+    try
+        Started = erlang:monotonic_time(millisecond),
+        ?assertEqual({error, timeout}, spacepush_fetch:get(url(1))),
+        ?assert(erlang:monotonic_time(millisecond) - Started < 500),
+        Worker = receive {fetch_worker, Pid} -> Pid after 1000 -> error(no_worker) end,
+        Ref = monitor(process, Worker),
+        receive {'DOWN', Ref, process, Worker, _} -> ok after 1000 -> error(worker_survived_deadline) end
+    after application:set_env(spacepush, fetch_timeout_ms, Previous) end.
+
+transport_exception_is_a_result_test() ->
+    spacepush_test_util:setup_env("fetch_exception"),
+    spacepush_test_util:fake_responses(#{url(1) => {crash, test_transport_failure}}),
+    ?assertMatch({error, {crashed, _}}, spacepush_fetch:get(url(1))).

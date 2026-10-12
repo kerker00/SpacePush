@@ -7,14 +7,20 @@ directory_test_() ->
     {foreach,
         fun() ->
             spacepush_test_util:setup_env("directory"),
-            application:set_env(spacepush, max_data_age_s, 1000000000)
+            application:set_env(spacepush, max_data_age_s, 1000000000),
+            {ok, Pid} = spacepush_cache:start_link(),
+            unlink(Pid)
         end,
-        fun(_) -> catch gen_server:stop(spacepush_directory) end,
+        fun(_) ->
+            try gen_server:stop(spacepush_directory) catch _:_ -> ok end,
+            gen_server:stop(spacepush_cache)
+        end,
         [
             fun loads_the_aggregator_list/0,
             fun keeps_the_saved_list_when_the_aggregator_fails/0,
             fun starts_empty_without_list/0,
-            fun loads_a_list_larger_than_a_space_document/0
+            fun loads_a_list_larger_than_a_space_document/0,
+            fun restored_old_list_keeps_endpoints_without_open_flags/0
         ]}.
 
 aggregator() ->
@@ -60,3 +66,19 @@ loads_a_list_larger_than_a_space_document() ->
     spacepush_test_util:fake_responses(#{aggregator() => {ok, Body}}),
     start(),
     ?assertEqual(600, length(spacepush_directory:entries())).
+
+restored_old_list_keeps_endpoints_without_open_flags() ->
+    application:set_env(spacepush, max_data_age_s, 900),
+    Seen = erlang:system_time(second) - 901,
+    Raw = #{<<"url">> => <<"https://a.example/">>, <<"lastSeen">> => Seen,
+        <<"data">> => #{<<"space">> => <<"A">>, <<"state">> => #{<<"open">> => true}}},
+    Entries = spacepush_state:parse_directory(iolist_to_binary(json:encode([Raw])), Seen, 900),
+    ?assertMatch([#{open := true}], Entries),
+    {ok, File} = application:get_env(spacepush, directory_file),
+    ok = spacepush_store:save(File, {directory, 1, Entries}),
+    spacepush_test_util:fake_responses(#{aggregator() => {error, timeout}}),
+    start(),
+    ?assert(spacepush_directory:known(<<"https://a.example/">>)),
+    Directory = spacepush_http_read:directory(erlang:system_time(millisecond)),
+    ?assertMatch([#{<<"data">> := #{<<"space">> := <<"A">>}}], Directory),
+    ?assertEqual(#{<<"open">> => 0, <<"total">> => 1, <<"as_of">> => null}, spacepush_http_read:summary(Directory)).

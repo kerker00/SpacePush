@@ -147,16 +147,101 @@ handle_info(_Info, State) ->
 dispatch(#{in_flight := InFlight, max_in_flight := Max} = State) ->
     case Max - map_size(InFlight) of
         Free when Free > 0 ->
-            Keys = [Key || _Ref := #{delivery := #{key := Key}} <- InFlight],
-            Due = spacepush_outbox:due(erlang:system_time(millisecond), Keys, Free),
-            lists:foldl(fun prepare/2, State, Due);
+            Now = erlang:system_time(millisecond),
+            InFlightKeys = [Key || _Ref := #{delivery := #{key := Key}} <- InFlight],
+            %% Clean invalid/unsubscribed rows independently of connection readiness.
+            Invalid = spacepush_outbox:due(Now, InFlightKeys, Free, fun(D) -> delivery_environment(D) =:= discard end),
+            State1 = lists:foldl(fun prepare/2, State, Invalid),
+            State2 = connect_queued_environments(Now, State1),
+            Order = case maps:get(next_environment, State2, sandbox) of
+                sandbox -> [sandbox, production];
+                production -> [production, sandbox]
+            end,
+            Due = maps:from_list([{Environment, eligible_due(Environment, Now, InFlightKeys, Free, State2)} || Environment <- Order]),
+            Active = [Environment || Environment <- Order, maps:get(Environment, Due) =/= []],
+            Counts = lists:foldl(fun(#{delivery := #{environment := Environment}}, Acc) ->
+                maps:update_with(Environment, fun(N) -> N + 1 end, 1, Acc)
+            end, #{}, maps:values(InFlight)),
+            dispatch_fair(Active, Due, Counts, Free, Max, State2);
         _ ->
             State
     end.
 
+connect_queued_environments(Now, #{keys := Keys, paused := Paused} = State) ->
+    case spacepush_outbox:pending() of
+        0 -> State;
+        _ -> maps:fold(fun(Environment, _Key, Acc) ->
+            case maps:get(Environment, Paused, 0) > Now of
+                true -> Acc;
+                false ->
+                    case connection(Environment, Acc) of
+                        {up, _Pid, Updated} -> Updated;
+                        {down, Updated} -> Updated
+                    end
+            end
+        end, State, Keys)
+    end.
+
+eligible_due(Environment, Now, InFlightKeys, Free, #{keys := Keys, paused := Paused, connections := Connections}) ->
+    Ready = case Keys of
+        #{Environment := _} -> maps:get(Environment, Paused, 0) =< Now andalso
+            case Connections of #{Environment := #{up := true}} -> true; _ -> false end;
+        _ -> true
+    end,
+    case Ready of
+        true -> spacepush_outbox:due(Now, InFlightKeys, Free, fun(D) -> delivery_environment(D) =:= Environment end);
+        false -> []
+    end.
+
+dispatch_fair([], _Due, _Counts, _Free, _Max, State) -> State;
+dispatch_fair([Environment], Due, _Counts, Free, _Max, State) ->
+    dispatch_environment(Environment, lists:sublist(maps:get(Environment, Due), Free), State);
+dispatch_fair([First, Second], Due, Counts, Free, Max, State) ->
+    FirstBudget = max(0, (Max + 1) div 2 - maps:get(First, Counts, 0)),
+    SecondBudget = max(0, Max div 2 - maps:get(Second, Counts, 0)),
+    FirstDue = lists:sublist(maps:get(First, Due), min(Free, FirstBudget)),
+    State1 = dispatch_environment(First, FirstDue, State),
+    Remaining = maps:get(max_in_flight, State1) - map_size(maps:get(in_flight, State1)),
+    dispatch_environment(Second, lists:sublist(maps:get(Second, Due), min(Remaining, SecondBudget)), State1).
+
+dispatch_environment(_Environment, [], State) -> State;
+dispatch_environment(Environment, Due, State) ->
+    Next = case Environment of sandbox -> production; production -> sandbox end,
+    (lists:foldl(fun prepare/2, State, Due))#{next_environment => Next}.
+
+delivery_environment(#{key := {Token, Topic}} = Delivery) ->
+    case valid_identity(Token, Topic, maps:get(token, Delivery, undefined)) of
+        false -> discard;
+        true ->
+            case spacepush_registry:lookup(Token) of
+                {ok, Environment, Topics, _Version} ->
+                    case lists:member(Topic, Topics) of true -> Environment; false -> discard end;
+                error -> discard
+            end
+    end;
+delivery_environment(_) -> discard.
+
+valid_identity(Token, Topic, StoredToken) ->
+    ValidRoom = case Topic of {_Endpoint, Room} -> spacepush_device:valid_room(Room); _ -> false end,
+    spacepush_device:valid_token(Token) andalso StoredToken =:= Token andalso ValidRoom.
+
 %% Checks a due delivery against the current registration and sends it once
 %% the connection for its environment is up.
 prepare(#{key := {Token, Topic} = Key, id := Id} = Delivery, State) ->
+    case valid_identity(Token, Topic, maps:get(token, Delivery, undefined)) of
+        true -> prepare_registered(Delivery, State);
+        false ->
+            ?LOG_WARNING(#{msg => delivery_discarded, reason => invalid_device_or_room}),
+            spacepush_stats:count(<<"push.invalid_delivery">>),
+            case spacepush_device:valid_token(Token) of
+                false -> spacepush_registry:unregister(Token);
+                true -> ok
+            end,
+            spacepush_outbox:complete(Key, Id),
+            State
+    end.
+
+prepare_registered(#{key := {Token, Topic} = Key, id := Id} = Delivery, State) ->
     case spacepush_registry:lookup(Token) of
         {ok, Environment, Topics, Version} ->
             case lists:member(Topic, Topics) of
@@ -187,8 +272,8 @@ send_when_up(#{key := Key, id := Id, environment := Environment} = Delivery, #{k
                 {down, State1} -> State1
             end;
         _ ->
-            #{token := Token, payload := Payload} = Delivery,
-            ?LOG_INFO(#{msg => dry_run_delivery, environment => Environment, token => Token, payload => Payload}),
+            #{payload := Payload} = Delivery,
+            ?LOG_INFO(#{msg => dry_run_delivery, environment => Environment, payload => Payload}),
             spacepush_stats:count(<<"push.dry_run">>),
             spacepush_outbox:complete(Key, Id),
             State0
@@ -206,15 +291,26 @@ send(Delivery, Connection, State0) ->
         {<<"apns-expiration">>, integer_to_binary(Expires div 1000)},
         {<<"apns-collapse-id">>, CollapseId}
     ],
-    Ref = gun:post(Connection, <<"/3/device/", Token/binary>>, Headers, Payload),
-    Request = #{
-        delivery => Delivery,
-        connection => Connection,
-        deadline => erlang:system_time(millisecond) + Timeout,
-        status => undefined,
-        body => <<>>
-    },
-    State2#{in_flight := InFlight#{Ref => Request}}.
+    try gun:post(Connection, <<"/3/device/", Token/binary>>, Headers, Payload) of
+        Ref ->
+            Request = #{
+                delivery => Delivery,
+                connection => Connection,
+                deadline => erlang:system_time(millisecond) + Timeout,
+                status => undefined,
+                body => <<>>
+            },
+            State2#{in_flight := InFlight#{Ref => Request}}
+    catch
+        Class:_Reason ->
+            %% Gun can reject a request synchronously. Keep the provider-token
+            %% cache, back off this delivery and continue dispatching the rest.
+            %% The exception can contain credentials, so log only its class.
+            ?LOG_WARNING(#{msg => apns_send_failed, environment => Environment, class => Class}),
+            spacepush_stats:count(<<"push.send_failed">>),
+            schedule_retry(Delivery),
+            State2
+    end.
 
 update_request(Ref, IsFin, Update, #{in_flight := InFlight} = State) ->
     case InFlight of

@@ -63,6 +63,9 @@ fresh_data_counts_test() ->
 stale_data_is_not_shown_test() ->
     ?assertEqual(null, entry(#{<<"lastSeen">> => 1})).
 
+future_data_is_not_shown_test() ->
+    ?assertEqual(null, entry(#{<<"lastSeen">> => ?NOW + 1})).
+
 missing_last_seen_is_not_shown_test() ->
     ?assertEqual(null, entry(#{<<"lastSeen">> => null})).
 
@@ -102,6 +105,20 @@ mainframe_test() ->
         ]),
         lists:sort(Observations)
     ).
+
+mainframe_rejects_unusable_documents_test_() ->
+    [?_assertError(not_mainframe, spacepush_state:parse_mainframe(Body)) || Body <- [
+        <<"{}">>, <<"{\"error\":\"maintenance\"}">>, <<"[]">>, <<"null">>,
+        <<"{\"space\":{\"state\":42}}">>, <<"{\"space\\n\":{\"state\":\"open\"}}">>
+    ]].
+
+mainframe_keeps_usable_rooms_and_unknown_future_states_test() ->
+    Body = <<"{\"space\":{\"state\":\"open\"},\"lab3d\":{\"state\":\"future_state\"},"
+             "\"radstelle\":{\"state\":42},\"error\":\"maintenance\"}">>,
+    ?assertEqual(lists:sort([
+        {{?MAINFRAME, <<"space">>}, <<"Mainframe">>, open},
+        {{?MAINFRAME, <<"lab3d">>}, <<"Mainframe">>, unknown}
+    ]), lists:sort(spacepush_state:parse_mainframe(Body))).
 
 mainframe_state_test_() ->
     [

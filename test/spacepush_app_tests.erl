@@ -14,6 +14,8 @@ app_test_() ->
             ?_test(all_children_running()),
             ?_assertEqual({200, <<"ok">>}, request(get, Port, "/health")),
             ?_test(register_and_unregister(Port)),
+            ?_test(empty_subscriptions_unregister_without_directory(Port)),
+            ?_test(rejects_percent_decoded_token_bytes(Port)),
             ?_assertEqual(400, status(request(put, Port, "/v1/devices/xyz", <<"{}">>))),
             ?_assertEqual(413, status(request(put, Port, "/v1/devices/" ?TOKEN, binary:copy(<<" ">>, 20000)))),
             ?_assertEqual(413, raw(Port, chunked_oversized())),
@@ -27,7 +29,8 @@ app_test_() ->
             ?_assertEqual(400, status(request(get, Port, "/v1/spaces"))),
             ?_assertEqual({200, spacepush_test_util:fixture("mainframe-openstate.json")}, request(get, Port, "/v1/mainframe/rooms")),
             ?_assertEqual(405, status(request(post, Port, "/v1/directory", <<"{}">>))),
-            ?_test(passes_documents_through_safely(Port))
+            ?_test(passes_documents_through_safely(Port)),
+            ?_test(rate_limited_requests_do_not_tally_versions(Port))
         ]
     end}.
 
@@ -79,6 +82,37 @@ register_and_unregister(Port) ->
     ?assertEqual(204, status(request(delete, Port, "/v1/devices/" ?TOKEN))),
     ?assertEqual([], spacepush_registry:subscribers(?TOPIC)).
 
+empty_subscriptions_unregister_without_directory(Port) ->
+    Path = "/v1/devices/" ?TOKEN,
+    Empty = iolist_to_binary(json:encode(#{<<"environment">> => <<"sandbox">>, <<"subscriptions">> => []})),
+    ?assertEqual(204, status(request(put, Port, Path, registration(?NERD2NERD)))),
+    Entries = ets:tab2list(spacepush_directory),
+    sys:replace_state(spacepush_directory, fun(State) -> ets:delete_all_objects(spacepush_directory), State end),
+    try
+        ?assertEqual(503, status(request(put, Port, Path, registration(?NERD2NERD)))),
+        ?assertEqual(204, status(request(put, Port, Path, Empty))),
+        ?assertEqual(error, spacepush_registry:lookup(list_to_binary(?TOKEN))),
+        ?assertEqual([], spacepush_registry:subscribers(?TOPIC)),
+        ?assertEqual(204, status(request(put, Port, Path, Empty))),
+        ?assertEqual(error, spacepush_registry:lookup(list_to_binary(?TOKEN)))
+    after
+        sys:replace_state(spacepush_directory, fun(State) -> ets:insert(spacepush_directory, Entries), State end)
+    end.
+
+rejects_percent_decoded_token_bytes(Port) ->
+    Path = "/v1/devices/" ?TOKEN,
+    ?assertEqual(204, status(request(put, Port, Path, registration(?NERD2NERD)))),
+    [
+        begin
+            ?assertEqual(400, status(request(put, Port, Path ++ Suffix, registration(?NERD2NERD)))),
+            ?assertEqual(400, status(request(delete, Port, Path ++ Suffix)))
+        end
+     || Suffix <- ["%0A", "%0D", "%00", "%20", "%09"]
+    ],
+    %% An invalid DELETE must not remove the legitimate token sharing its prefix.
+    ?assertMatch({ok, sandbox, [?TOPIC], _}, spacepush_registry:lookup(list_to_binary(?TOKEN))),
+    ?assertEqual(204, status(request(delete, Port, Path))).
+
 url(Port, Path) ->
     "http://127.0.0.1:" ++ integer_to_list(Port) ++ Path.
 
@@ -120,6 +154,7 @@ raw(Port, Request) ->
 
 directory(Port) ->
     {200, Body} = request(get, Port, "/v1/directory"),
+    ?assertEqual("no-cache", proplists:get_value("cache-control", headers(Port, "/v1/directory"))),
     Entries = json:decode(Body),
     %% Entries without a name are allowlisted but not listed.
     ?assertEqual(7, length(Entries)),
@@ -133,9 +168,43 @@ summary(Port) ->
     Open = length([E || #{<<"data">> := #{<<"state">> := #{<<"open">> := true}}} = E <- Entries]),
     {200, Body} = request(get, Port, "/v1/summary"),
     ?assertMatch(#{<<"open">> := Open, <<"total">> := 7, <<"as_of">> := <<_/binary>>}, json:decode(Body)),
-    ?assertEqual("*", proplists:get_value("access-control-allow-origin", headers(Port, "/v1/summary"))).
+    Headers = headers(Port, "/v1/summary"),
+    ?assertEqual("*", proplists:get_value("access-control-allow-origin", Headers)),
+    ?assertEqual("no-cache", proplists:get_value("cache-control", Headers)).
 
 passes_documents_through_safely(Port) ->
     Headers = headers(Port, "/v1/spaces?endpoint=" ?NERD2NERD_QS),
     ?assertEqual("nosniff", proplists:get_value("x-content-type-options", Headers)),
     ?assertEqual("application/json", proplists:get_value("content-type", Headers)).
+
+rate_limited_requests_do_not_tally_versions(Port) ->
+    application:set_env(spacepush, read_rate_limit_per_minute, 1),
+    application:set_env(spacepush, rate_limit_per_minute, 1),
+    ets:delete_all_objects(spacepush_ratelimit),
+    try
+        Read = [reported_request(get, Port, "/v1/summary", N) || N <- [9001, 9002, 9003]],
+        Write = [reported_request(put, Port, "/v1/devices/" ?TOKEN, N) || N <- [9011, 9012, 9013]],
+        ?assertEqual([200, 429, 429], Read),
+        ?assertEqual([204, 429, 429], Write),
+        Report = spacepush_stats:report(1),
+        Installs = maps:get(<<"installs">>, Report),
+        ?assertEqual(2, maps:get(<<"this_week">>, Installs)),
+        Versions = maps:get(<<"versions">>, maps:get(<<"this_week_by">>, Installs)),
+        ?assertEqual(#{<<"9001">> => 1, <<"9011">> => 1}, Versions),
+        [Today | _] = maps:get(<<"days">>, Report),
+        ?assertMatch(#{<<"rate_limited.read">> := 2, <<"rate_limited.write">> := 2}, Today)
+    after
+        application:set_env(spacepush, read_rate_limit_per_minute, 300),
+        application:set_env(spacepush, rate_limit_per_minute, 30)
+    end.
+
+reported_request(Method, Port, Path, Version) ->
+    Headers = [
+        {"user-agent", "SpaceState/" ++ integer_to_list(Version) ++ " (iOS 26.0)"},
+        {"x-spacestate-first", "week"}
+    ],
+    Result = case Method of
+        get -> httpc:request(get, {url(Port, Path), Headers}, [], [{body_format, binary}]);
+        put -> httpc:request(put, {url(Port, Path), Headers, "application/json", registration(?NERD2NERD)}, [], [{body_format, binary}])
+    end,
+    status(reply(Result)).

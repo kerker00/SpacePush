@@ -21,9 +21,13 @@
         {watch_window_ms, 600000},
         {fetch_concurrency, 10},
         {fetch_timeout_ms, 10000},
+        %% Shared per-endpoint admission for polling and read requests.
+        {fetch_min_interval_ms, 60000},
+        {fetch_backoff_max_ms, 1800000},
         {max_body_bytes, 262144},
         {cache_max_age_ms, 60000},
         {on_demand_fetch_limit, 20},
+        {on_demand_waiter_limit, 1000},
         %% A new state must be seen this long before anyone is notified.
         {debounce_s, 120},
         {tracker_file, "data/tracker.bin"},
@@ -56,7 +60,12 @@
         {apns_team_id, <<"7E3BJ546SA">>},
         {apns_topic, <<"net.grafixmafia.spacepush">>},
         %% Usage statistics, served on GET /v1/stats to local requests only.
-        {stats_file, "data/stats.bin"}
+        {stats_file, "data/stats.bin"},
+        %% Per ISO week, with one additional "other" bucket for overflow.
+        {stats_max_versions, 64},
+        {stats_max_os_versions, 64},
+        %% Recording is best effort; queued events never grow the stats mailbox.
+        {stats_max_pending, 1000}
     ]},
     {licenses, ["MIT"]},
     {links, [{"GitHub", "https://github.com/kerker00/SpacePush"}]}
