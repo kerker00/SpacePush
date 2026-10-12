@@ -97,7 +97,7 @@ parse_space(Endpoint, Body) ->
     end.
 
 fresh(#{<<"validationResult">> := #{<<"reachable">> := false}}, _Now, _MaxAge) -> false;
-fresh(#{<<"lastSeen">> := LastSeen}, Now, MaxAge) when is_number(LastSeen) -> Now - LastSeen =< MaxAge;
+fresh(#{<<"lastSeen">> := LastSeen}, Now, MaxAge) when is_number(LastSeen) -> LastSeen =< Now andalso Now - LastSeen =< MaxAge;
 fresh(_, _Now, _MaxAge) -> false.
 
 %% Since v0.13 the flag lives in `state`; v0.12 and older kept it at the top level.
@@ -109,13 +109,22 @@ open_flag(_) -> unknown.
 bool_state(true) -> open;
 bool_state(false) -> closed.
 
--doc "Reads the rooms from Mainframe's openState response.".
+-doc "Reads usable rooms from Mainframe's openState response; rejects documents without any.".
 -spec parse_mainframe(binary()) -> [observation()].
 parse_mainframe(Body) ->
-    [
-        {{?MAINFRAME_ENDPOINT, Room}, <<"Mainframe">>, mainframe_state(Raw)}
-     || Room := #{<<"state">> := Raw} <- json:decode(Body), is_binary(Room), is_binary(Raw)
-    ].
+    case json:decode(Body) of
+        Rooms when is_map(Rooms) ->
+            Observations = [
+                {{?MAINFRAME_ENDPOINT, Room}, <<"Mainframe">>, mainframe_state(Raw)}
+             || Room := #{<<"state">> := Raw} <- Rooms,
+                is_binary(Raw), spacepush_device:valid_room(Room)
+            ],
+            case Observations of
+                [] -> error(not_mainframe);
+                _ -> Observations
+            end;
+        _ -> error(not_mainframe)
+    end.
 
 -doc "Maps a state of ktt-ol/spacestatus2, including its legacy values.".
 -spec mainframe_state(binary()) -> state().

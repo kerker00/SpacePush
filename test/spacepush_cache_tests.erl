@@ -42,7 +42,8 @@ cache_test_() ->
             fun failure_without_cache_does_not_retry_immediately/0,
             fun successful_attempts_keep_minimum_interval/0,
             fun failure_backoff_grows_caps_and_resets/0,
-            fun shared_failure_only_falls_back_for_readers/0
+            fun shared_failure_only_falls_back_for_readers/0,
+            fun unusable_mainframe_keeps_last_good_result/0
         ]}.
 
 fetches_once_then_serves_cached() ->
@@ -283,3 +284,16 @@ shared_failure_only_falls_back_for_readers() ->
     ?assertEqual({error, timeout}, receive {refresh_result, Result} -> Result after 1000 -> timeout end),
     ?assertEqual(1, spacepush_test_util:fake_calls(x)),
     ?assertEqual(Stale, spacepush_cache:lookup(?URL)).
+
+unusable_mainframe_keeps_last_good_result() ->
+    {ok, Configured} = application:get_env(spacepush, mainframe_url),
+    Url = list_to_binary(Configured),
+    Body = spacepush_test_util:fixture("mainframe-openstate.json"),
+    spacepush_test_util:fake_responses(#{Url => {ok, Body}}),
+    {ok, Good} = spacepush_cache:refresh(Url),
+    application:set_env(spacepush, cache_max_age_ms, 0),
+    spacepush_test_util:fake_responses(#{Url => {ok, <<"{\"error\":\"maintenance\"}">>}}),
+    ?assertEqual({error, invalid_response}, spacepush_cache:refresh(Url)),
+    ?assertEqual(Good, spacepush_cache:lookup(Url)),
+    ?assertEqual({ok, Good}, spacepush_cache:get(Url)),
+    ?assertEqual(Good, spacepush_cache:lookup(Url)).
