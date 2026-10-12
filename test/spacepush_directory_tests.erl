@@ -9,7 +9,7 @@ directory_test_() ->
             spacepush_test_util:setup_env("directory"),
             application:set_env(spacepush, max_data_age_s, 1000000000)
         end,
-        fun(_) -> catch gen_server:stop(spacepush_directory) end,
+        fun(_) -> try gen_server:stop(spacepush_directory) catch _:_ -> ok end end,
         [
             fun loads_the_aggregator_list/0,
             fun keeps_the_saved_list_when_the_aggregator_fails/0,

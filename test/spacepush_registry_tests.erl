@@ -27,6 +27,8 @@ registry_test_() ->
             fun migrates_format_1_records/0,
             fun keeps_platform/0,
             fun drops_unknown_records/0,
+            fun rejects_invalid_registration/0,
+            fun drops_invalid_persisted_tokens_and_rooms/0,
             fun lookup_returns_current_registration/0,
             fun subscribed_endpoints_are_unique/0,
             fun expires_old_registrations/0
@@ -139,6 +141,37 @@ drops_unknown_records() ->
     with_raw_records([{token(1), {registration, 99, sandbox, [?A], 1}}, {token(2), garbage}]),
     ?assertEqual([], spacepush_registry:subscribers(?A)),
     ?assertEqual(error, spacepush_registry:lookup(token(1))).
+
+rejects_invalid_registration() ->
+    ?assertEqual({error, invalid_registration}, spacepush_registry:register(<<(token(1))/binary, 10>>, sandbox, [?A])),
+    ?assertEqual(
+        {error, invalid_registration},
+        spacepush_registry:register(token(1), sandbox, [{element(1, ?A), <<"space\n">>}])
+    ),
+    ?assertMatch(#{<<"total">> := 0}, spacepush_registry:summary()).
+
+drops_invalid_persisted_tokens_and_rooms() ->
+    Version = erlang:system_time(millisecond),
+    BadToken = <<(token(2))/binary, 10>>,
+    OldBadToken = <<(token(3))/binary, 0>>,
+    BadRoom = {element(1, ?A), <<"space\n">>},
+    with_raw_records([
+        {token(1), {registration, 2, sandbox, [?A], Version, <<"ios">>}},
+        {BadToken, {registration, 2, production, [?A], Version, <<"ios">>}},
+        {token(4), {registration, 1, sandbox, [BadRoom], Version}},
+        {OldBadToken, production, [?A], Version div 1000}
+    ]),
+    ?assertEqual([{token(1), sandbox, Version}], spacepush_registry:subscribers(?A)),
+    ?assertEqual(error, spacepush_registry:lookup(BadToken)),
+    ?assertEqual(error, spacepush_registry:lookup(OldBadToken)),
+    ?assertEqual(error, spacepush_registry:lookup(token(4))),
+    stop(),
+    {ok, File} = application:get_env(spacepush, registry_file),
+    {ok, Table} = dets:open_file(raw_registry, [{file, File}, {type, set}]),
+    ?assertEqual(1, dets:info(Table, size)),
+    ok = dets:close(Table),
+    start(),
+    ?assertEqual([{token(1), sandbox, Version}], spacepush_registry:subscribers(?A)).
 
 lookup_returns_current_registration() ->
     ?assertEqual(error, spacepush_registry:lookup(token(1))),

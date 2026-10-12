@@ -14,6 +14,7 @@ app_test_() ->
             ?_test(all_children_running()),
             ?_assertEqual({200, <<"ok">>}, request(get, Port, "/health")),
             ?_test(register_and_unregister(Port)),
+            ?_test(rejects_percent_decoded_token_bytes(Port)),
             ?_assertEqual(400, status(request(put, Port, "/v1/devices/xyz", <<"{}">>))),
             ?_assertEqual(413, status(request(put, Port, "/v1/devices/" ?TOKEN, binary:copy(<<" ">>, 20000)))),
             ?_assertEqual(413, raw(Port, chunked_oversized())),
@@ -78,6 +79,20 @@ register_and_unregister(Port) ->
     ?assertMatch([{_, sandbox, _}], spacepush_registry:subscribers(?TOPIC)),
     ?assertEqual(204, status(request(delete, Port, "/v1/devices/" ?TOKEN))),
     ?assertEqual([], spacepush_registry:subscribers(?TOPIC)).
+
+rejects_percent_decoded_token_bytes(Port) ->
+    Path = "/v1/devices/" ?TOKEN,
+    ?assertEqual(204, status(request(put, Port, Path, registration(?NERD2NERD)))),
+    [
+        begin
+            ?assertEqual(400, status(request(put, Port, Path ++ Suffix, registration(?NERD2NERD)))),
+            ?assertEqual(400, status(request(delete, Port, Path ++ Suffix)))
+        end
+     || Suffix <- ["%0A", "%0D", "%00", "%20", "%09"]
+    ],
+    %% An invalid DELETE must not remove the legitimate token sharing its prefix.
+    ?assertMatch({ok, sandbox, [?TOPIC], _}, spacepush_registry:lookup(list_to_binary(?TOKEN))),
+    ?assertEqual(204, status(request(delete, Port, Path))).
 
 url(Port, Path) ->
     "http://127.0.0.1:" ++ integer_to_list(Port) ++ Path.
