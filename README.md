@@ -100,6 +100,8 @@ Spaces run their own endpoints, and clients are anonymous, so SpacePush treats b
 
 Not covered: a botnet registering many devices can fill the registry (Apple's App Attest would tie registrations to genuine app installs), and spaces that only offer plain HTTP can be altered in transit.
 
+The [security, Erlang/OTP and QA audit of 10 October 2026](docs/AUDIT_2026-10-10.md) preserves the defects, local reproductions and deployment checks at its audited revision. Its 12 October update records the merged token/room and statistics hardening; the original reproduction script demonstrates the old defects, while inverse EUnit regressions cover the fixes. Other findings and deployment checks remain open.
+
 ## Notifications
 
 The alert title is the space name (and the room for Mainframe rooms). The body is a localization key the apps resolve:
