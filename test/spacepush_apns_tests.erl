@@ -51,7 +51,12 @@ backoff_grows_and_is_capped_test() ->
 dispatch_test_() ->
     {foreach, fun setup_dispatch/0, fun(_) -> stop_dispatch() end, [
         fun rejects_invalid_persisted_delivery/0,
-        fun synchronous_send_failure_is_isolated/0
+        fun synchronous_send_failure_is_isolated/0,
+        fun down_environment_does_not_starve_ready_environment/0,
+        fun paused_environment_does_not_starve_ready_environment/0,
+        fun both_environments_receive_capacity/0,
+        fun one_slot_alternates_between_ready_environments/0,
+        fun selects_the_current_registration_environment/0
     ]}.
 
 setup_dispatch() ->
@@ -118,10 +123,90 @@ synchronous_send_failure_is_isolated() ->
     replace_delivery(Key, Delivery#{collapse_id := <<"invalid\n">>}),
     %% Production has no key and completes via dry-run without any network.
     State = sender_state(self()),
-    ?assertEqual({noreply, State}, spacepush_apns:handle_cast(wake, State)),
+    {noreply, Updated} = spacepush_apns:handle_cast(wake, State),
+    ?assertEqual(#{}, maps:get(in_flight, Updated)),
     ?assertEqual(1, spacepush_outbox:pending()),
     ?assertEqual([], spacepush_outbox:due(erlang:system_time(millisecond), [], 10)),
     ?assertMatch(
         [#{token := _, attempts := 1}],
         spacepush_outbox:due(erlang:system_time(millisecond) + 5000, [], 10)
     ).
+
+fair_sender(Max) ->
+    Now = erlang:system_time(second),
+    (sender_state(self()))#{
+        keys := #{sandbox => unused, production => unused},
+        connections := #{sandbox => #{pid => self(), up => true}, production => #{pid => self(), up => true}},
+        tokens := #{sandbox => {<<"synthetic-provider-token">>, Now}, production => {<<"synthetic-provider-token">>, Now}},
+        max_in_flight := Max
+    }.
+
+enqueue_pair(FirstEnvironment, SecondEnvironment) ->
+    ok = spacepush_registry:register(token(1), FirstEnvironment, [topic()]),
+    ok = spacepush_registry:register(token(2), SecondEnvironment, [topic()]),
+    ok = spacepush_outbox:enqueue([{topic(), <<"Test">>, closed, open}]),
+    [Older] = [D || #{token := T} = D <- spacepush_outbox:due(erlang:system_time(millisecond), [], 10), T =:= token(1)],
+    replace_delivery(maps:get(key, Older), Older#{not_before := erlang:system_time(millisecond) - 1000}).
+
+finish_only_request(State) ->
+    [Ref] = maps:keys(maps:get(in_flight, State)),
+    {noreply, Updated} = spacepush_apns:handle_info({gun_response, self(), Ref, fin, 200, []}, State),
+    Updated.
+
+down_environment_does_not_starve_ready_environment() ->
+    lists:foreach(fun({Down, Ready}) ->
+        enqueue_pair(Down, Ready),
+        State = fair_sender(1),
+        Connections = maps:get(connections, State),
+        DownConnection = (maps:get(Down, Connections))#{up := false},
+        {noreply, Sent} = spacepush_apns:handle_cast(wake, State#{connections := Connections#{Down := DownConnection}}),
+        [#{delivery := #{environment := Ready}}] = maps:values(maps:get(in_flight, Sent)),
+        Completed = finish_only_request(Sent),
+        ?assertEqual(1, spacepush_outbox:pending()),
+        {noreply, Again} = spacepush_apns:handle_cast(wake, Completed),
+        ?assertEqual(#{}, maps:get(in_flight, Again)),
+        ?assertEqual(1, spacepush_outbox:pending())
+    end, [{sandbox, production}, {production, sandbox}]).
+
+paused_environment_does_not_starve_ready_environment() ->
+    enqueue_pair(sandbox, production),
+    State = (fair_sender(1))#{paused := #{sandbox => erlang:system_time(millisecond) + 60000}},
+    {noreply, Sent} = spacepush_apns:handle_cast(wake, State),
+    [#{delivery := #{environment := production}}] = maps:values(maps:get(in_flight, Sent)),
+    Completed = finish_only_request(Sent),
+    ?assertEqual(1, spacepush_outbox:pending()),
+    {noreply, Resumed} = spacepush_apns:handle_cast(wake, Completed#{paused := #{}}),
+    [#{delivery := #{environment := sandbox}}] = maps:values(maps:get(in_flight, Resumed)),
+    finish_only_request(Resumed),
+    ?assertEqual(0, spacepush_outbox:pending()).
+
+both_environments_receive_capacity() ->
+    application:set_env(spacepush, max_registrations, 30),
+    [ok = spacepush_registry:register(token(N), sandbox, [topic()]) || N <- lists:seq(1, 20)],
+    ok = spacepush_registry:register(token(21), production, [topic()]),
+    ok = spacepush_outbox:enqueue([{topic(), <<"Test">>, closed, open}]),
+    {noreply, Sent} = spacepush_apns:handle_cast(wake, fair_sender(20)),
+    Environments = [E || #{delivery := #{environment := E}} <- maps:values(maps:get(in_flight, Sent))],
+    ?assertEqual(10, length([E || E <- Environments, E =:= sandbox])),
+    ?assertEqual(1, length([E || E <- Environments, E =:= production])).
+
+one_slot_alternates_between_ready_environments() ->
+    enqueue_pair(sandbox, production),
+    {noreply, First} = spacepush_apns:handle_cast(wake, fair_sender(1)),
+    [#{delivery := #{environment := sandbox}}] = maps:values(maps:get(in_flight, First)),
+    Completed = finish_only_request(First),
+    %% Sandbox gets new work too; production still receives the next slot.
+    ok = spacepush_outbox:enqueue([{topic(), <<"Test">>, open, closed}]),
+    {noreply, Second} = spacepush_apns:handle_cast(wake, Completed),
+    [#{delivery := #{environment := production}}] = maps:values(maps:get(in_flight, Second)).
+
+selects_the_current_registration_environment() ->
+    ok = spacepush_registry:register(token(1), sandbox, [topic()]),
+    ok = spacepush_outbox:enqueue([{topic(), <<"Test">>, closed, open}]),
+    ok = spacepush_registry:register(token(1), production, [topic()]),
+    State = fair_sender(1),
+    Connections = maps:get(connections, State),
+    {noreply, Sent} = spacepush_apns:handle_cast(wake, State#{connections := Connections#{sandbox := #{pid => self(), up => false}}}),
+    [#{delivery := #{environment := production}}] = maps:values(maps:get(in_flight, Sent)),
+    finish_only_request(Sent),
+    ?assertEqual(0, spacepush_outbox:pending()).
