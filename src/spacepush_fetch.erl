@@ -18,7 +18,7 @@ The function doing the request is configurable (`http_get`), so tests can
 replace the network.
 """.
 
--export([get/1, get/2, many/2, http_get/2, public_address/1]).
+-export([get/1, get/2, many/2, many/3, http_get/2, public_address/1]).
 
 -ifdef(TEST).
 -export([response/4]).
@@ -73,14 +73,19 @@ bounded(Fun, Timeout) ->
 -doc "Fetches all URLs, at most `Concurrency` at a time, and returns each result.".
 -spec many([binary()], pos_integer()) -> #{binary() => result()}.
 many(Urls, Concurrency) ->
-    many(Urls, Concurrency, #{}, #{}).
+    many(Urls, Concurrency, fun get/1).
 
-many([], _Concurrency, Running, Results) when map_size(Running) =:= 0 ->
+-doc "Runs a fetch function per URL with the same bounded parallelism.".
+-spec many([binary()], pos_integer(), fun((binary()) -> Result)) -> #{binary() => Result | {error, term()}}.
+many(Urls, Concurrency, Fetch) ->
+    many(Urls, Concurrency, Fetch, #{}, #{}).
+
+many([], _Concurrency, _Fetch, Running, Results) when map_size(Running) =:= 0 ->
     Results;
-many([Url | Rest], Concurrency, Running, Results) when map_size(Running) < Concurrency ->
-    {_Pid, Ref} = spawn_monitor(fun() -> exit({fetched, get(Url)}) end),
-    many(Rest, Concurrency, Running#{Ref => Url}, Results);
-many(Urls, Concurrency, Running, Results) ->
+many([Url | Rest], Concurrency, Fetch, Running, Results) when map_size(Running) < Concurrency ->
+    {_Pid, Ref} = spawn_monitor(fun() -> exit({fetched, Fetch(Url)}) end),
+    many(Rest, Concurrency, Fetch, Running#{Ref => Url}, Results);
+many(Urls, Concurrency, Fetch, Running, Results) ->
     receive
         {'DOWN', Ref, process, _Pid, Reason} when is_map_key(Ref, Running) ->
             Result =
@@ -88,7 +93,7 @@ many(Urls, Concurrency, Running, Results) ->
                     {fetched, Fetched} -> Fetched;
                     Other -> {error, {crashed, Other}}
                 end,
-            many(Urls, Concurrency, maps:remove(Ref, Running), Results#{maps:get(Ref, Running) => Result})
+            many(Urls, Concurrency, Fetch, maps:remove(Ref, Running), Results#{maps:get(Ref, Running) => Result})
     end.
 
 -doc "The default `http_get`: a real request with gun.".

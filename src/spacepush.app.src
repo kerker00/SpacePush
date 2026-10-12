@@ -21,6 +21,9 @@
         {watch_window_ms, 600000},
         {fetch_concurrency, 10},
         {fetch_timeout_ms, 10000},
+        %% Shared per-endpoint admission for polling and read requests.
+        {fetch_min_interval_ms, 60000},
+        {fetch_backoff_max_ms, 1800000},
         {max_body_bytes, 262144},
         {cache_max_age_ms, 60000},
         {on_demand_fetch_limit, 20},
