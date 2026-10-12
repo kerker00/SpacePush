@@ -30,7 +30,9 @@ setup_env(Name) ->
 
 -doc """
 Sets what `fake_get/1` answers per URL: `{ok, Body}`, `{error, Reason}`, or
-`{delay, Ms, Result}` to answer after a pause. Unknown URLs give `{error, not_found}`.
+`{delay, Ms, Result}` to answer after a pause. `{notify, Pid, Result}` reports the
+worker PID, `{wait, Result}` waits for `continue`, and `{crash, Reason}` raises.
+Unknown URLs give `{error, not_found}`.
 """.
 fake_responses(Responses) ->
     persistent_term:put({?MODULE, responses}, Responses),
@@ -39,18 +41,24 @@ fake_responses(Responses) ->
 %% Applies the size limit like the real fetch, so tests catch a limit that is too small.
 fake_get(Url, MaxBytes) ->
     counters:add(persistent_term:get({?MODULE, calls}), 1, 1),
-    Result =
-        case maps:get(list_to_binary(Url), persistent_term:get({?MODULE, responses}), {error, not_found}) of
-            {delay, Ms, Delayed} ->
-                timer:sleep(Ms),
-                Delayed;
-            Immediate ->
-                Immediate
-        end,
+    Result = fake_result(maps:get(list_to_binary(Url), persistent_term:get({?MODULE, responses}), {error, not_found})),
     case Result of
         {ok, Body} when byte_size(Body) > MaxBytes -> {error, too_large};
         _ -> Result
     end.
+
+fake_result({delay, Ms, Result}) ->
+    timer:sleep(Ms),
+    fake_result(Result);
+fake_result({notify, Pid, Result}) ->
+    Pid ! {fetch_worker, self()},
+    fake_result(Result);
+fake_result({wait, Result}) ->
+    receive continue -> fake_result(Result) end;
+fake_result({crash, Reason}) ->
+    error(Reason);
+fake_result(Result) ->
+    Result.
 
 -doc "How many requests `fake_get/1` answered since the last `fake_responses/1`.".
 fake_calls(_) ->

@@ -132,7 +132,7 @@ All settings live in the `spacepush` application environment (see `src/spacepush
 | `max_data_age_s` | Aggregator states older than this are not shown in the directory |
 | `watch_window_ms` | How long a space stays fetched after an app asked for it |
 | `fetch_concurrency`, `fetch_timeout_ms`, `max_body_bytes` | Limits for fetching spaces |
-| `cache_max_age_ms`, `on_demand_fetch_limit` | Freshness of read API answers and parallel on-demand fetches |
+| `cache_max_age_ms`, `on_demand_fetch_limit`, `on_demand_waiter_limit` | Freshness of read API answers, parallel on-demand fetches and total waiting callers |
 | `notification_cooldown_ms` | Minimum time between notifications for one space or room |
 | `rate_limit_per_minute`, `read_rate_limit_per_minute`, `http_max_connections` | Limits for clients |
 | `max_registrations`, `registration_ttl_days` | Cap and expiry for device registrations |

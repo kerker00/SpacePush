@@ -20,6 +20,10 @@ replace the network.
 
 -export([get/1, get/2, many/2, http_get/2, public_address/1]).
 
+-ifdef(TEST).
+-export([response/4]).
+-endif.
+
 %% get/1 is this module's fetch, not the process dictionary.
 -compile({no_auto_import, [get/1]}).
 
@@ -37,7 +41,34 @@ get(Url) ->
 -spec get(binary() | string(), pos_integer()) -> result().
 get(Url, MaxBytes) ->
     {Module, Function} = application:get_env(spacepush, http_get, {?MODULE, http_get}),
-    Module:Function(unicode:characters_to_list(Url), MaxBytes).
+    {ok, Timeout} = application:get_env(spacepush, fetch_timeout_ms),
+    bounded(fun() -> Module:Function(unicode:characters_to_list(Url), MaxBytes) end, Timeout).
+
+%% The guard owns the total deadline, including DNS and configurable transports.
+%% Its linked worker also stops if the guard or the calling process disappears.
+bounded(Fun, Timeout) ->
+    Caller = self(),
+    {_Guard, GuardRef} = spawn_monitor(fun() ->
+        process_flag(trap_exit, true),
+        CallerRef = monitor(process, Caller),
+        {Worker, WorkerRef} = spawn_opt(fun() -> exit({fetched, Fun()}) end, [link, monitor]),
+        receive
+            {'DOWN', WorkerRef, process, Worker, {fetched, Result}} ->
+                exit({fetched, Result});
+            {'DOWN', WorkerRef, process, Worker, Reason} ->
+                exit({fetched, {error, {crashed, Reason}}});
+            {'DOWN', CallerRef, process, Caller, _Reason} ->
+                exit(Worker, kill)
+        after Timeout ->
+            exit(Worker, kill),
+            receive {'DOWN', WorkerRef, process, Worker, _Reason} -> ok end,
+            exit({fetched, {error, timeout}})
+        end
+    end),
+    receive
+        {'DOWN', GuardRef, process, _Pid, {fetched, Result}} -> Result;
+        {'DOWN', GuardRef, process, _Pid, Reason} -> {error, {crashed, Reason}}
+    end.
 
 -doc "Fetches all URLs, at most `Concurrency` at a time, and returns each result.".
 -spec many([binary()], pos_integer()) -> #{binary() => result()}.
@@ -67,7 +98,7 @@ http_get(Url, MaxBytes) ->
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
     case uri_string:parse(Url) of
         #{scheme := Scheme, host := Host} = Parsed when Scheme =:= "https"; Scheme =:= "http" ->
-            case resolve(Host) of
+            case resolve(Host, Deadline) of
                 {ok, Address} -> request(Scheme, Host, Address, Parsed, Deadline, MaxBytes);
                 {error, Reason} -> {error, Reason}
             end;
@@ -102,7 +133,14 @@ request(Scheme, Host, Address, Parsed, Deadline, MaxBytes) ->
     end.
 
 response(Conn, Ref, Deadline, MaxBytes) ->
-    case gun:await(Conn, Ref, remaining(Deadline)) of
+    case remaining(Deadline) of
+        0 -> {error, timeout};
+        Budget -> response(Conn, Ref, Deadline, MaxBytes, Budget)
+    end.
+
+response(Conn, Ref, Deadline, MaxBytes, Budget) ->
+    case gun:await(Conn, Ref, Budget) of
+        {inform, _Status, _Headers} -> response(Conn, Ref, Deadline, MaxBytes);
         {response, nofin, 200, _Headers} -> body(Conn, Ref, Deadline, MaxBytes, []);
         {response, fin, 200, _Headers} -> {ok, <<>>};
         {response, _IsFin, Status, _Headers} -> {error, {http_status, Status}};
@@ -110,7 +148,13 @@ response(Conn, Ref, Deadline, MaxBytes) ->
     end.
 
 body(Conn, Ref, Deadline, MaxBytes, Acc) ->
-    case gun:await(Conn, Ref, remaining(Deadline)) of
+    case remaining(Deadline) of
+        0 -> {error, timeout};
+        Budget -> body(Conn, Ref, Deadline, MaxBytes, Acc, Budget)
+    end.
+
+body(Conn, Ref, Deadline, MaxBytes, Acc, Budget) ->
+    case gun:await(Conn, Ref, Budget) of
         {data, IsFin, Data} ->
             Acc1 = [Acc, Data],
             case {iolist_size(Acc1) > MaxBytes, IsFin} of
@@ -125,21 +169,34 @@ body(Conn, Ref, Deadline, MaxBytes, Acc) ->
     end.
 
 %% The address to connect to; an error unless every address of the host is public.
-resolve(Host) ->
+resolve(Host, Deadline) ->
     case inet:parse_address(Host) of
         {ok, Address} ->
             check_public([Address]);
         {error, einval} ->
-            case addresses(Host, inet) ++ addresses(Host, inet6) of
-                [] -> {error, nxdomain};
-                Addresses -> check_public(Addresses)
+            case addresses(Host, inet, Deadline) of
+                {error, timeout} -> {error, timeout};
+                IPv4 ->
+                    case addresses(Host, inet6, Deadline) of
+                        {error, timeout} -> {error, timeout};
+                        IPv6 ->
+                            case IPv4 ++ IPv6 of
+                                [] -> {error, nxdomain};
+                                Addresses -> check_public(Addresses)
+                            end
+                    end
             end
     end.
 
-addresses(Host, Family) ->
-    case inet:getaddrs(Host, Family) of
-        {ok, Addresses} -> Addresses;
-        {error, _} -> []
+addresses(Host, Family, Deadline) ->
+    case remaining(Deadline) of
+        0 -> {error, timeout};
+        Budget ->
+            case inet:getaddrs(Host, Family, Budget) of
+                {ok, Addresses} -> Addresses;
+                {error, timeout} -> {error, timeout};
+                {error, _} -> []
+            end
     end.
 
 %% A host that resolves to any non-public address is refused, even if it also

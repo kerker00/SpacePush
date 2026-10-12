@@ -24,6 +24,7 @@
         {max_body_bytes, 262144},
         {cache_max_age_ms, 60000},
         {on_demand_fetch_limit, 20},
+        {on_demand_waiter_limit, 1000},
         %% A new state must be seen this long before anyone is notified.
         {debounce_s, 120},
         {tracker_file, "data/tracker.bin"},
