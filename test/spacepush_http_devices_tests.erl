@@ -51,5 +51,34 @@ valid_token_test_() ->
         ?_assert(spacepush_http_devices:valid_token(string:uppercase(Hex64))),
         ?_assertNot(spacepush_http_devices:valid_token(binary:copy(<<"ab">>, 31))),
         ?_assertNot(spacepush_http_devices:valid_token(<<Hex64/binary, "zz">>)),
-        ?_assertNot(spacepush_http_devices:valid_token(undefined))
+        ?_assertNot(spacepush_http_devices:valid_token(undefined)),
+        ?_assert(spacepush_http_devices:valid_token(binary:copy(<<"a">>, 200))),
+        ?_assertNot(spacepush_http_devices:valid_token(binary:copy(<<"a">>, 201)))
     ].
+
+token_control_bytes_test_() ->
+    Hex = binary:copy(<<"ab">>, 32),
+    [
+        ?_assertNot(spacepush_http_devices:valid_token(<<Hex/binary, Suffix/binary>>))
+     || Suffix <- [<<10>>, <<13>>, <<0>>, <<" ">>, <<9>>, <<"/">>, <<"%0A">>, <<255>>]
+    ].
+
+invalid_rooms_test_() ->
+    [
+        ?_assertEqual(
+            {error, <<"invalid_subscription">>},
+            spacepush_http_devices:parse_registration(
+                registration(<<"sandbox">>, [#{<<"endpoint">> => ?ENDPOINT, <<"room">> => Room}])
+            )
+        )
+     || Room <- [<<"space\n">>, <<"space\r">>, <<"space", 0>>, <<"space ">>, <<"Space">>, <<>>, binary:copy(<<"a">>, 33)]
+    ].
+
+room_length_boundary_test() ->
+    Room = binary:copy(<<"a">>, 32),
+    ?assertEqual(
+        {ok, sandbox, [{?ENDPOINT, Room}]},
+        spacepush_http_devices:parse_registration(
+            registration(<<"sandbox">>, [#{<<"endpoint">> => ?ENDPOINT, <<"room">> => Room}])
+        )
+    ).

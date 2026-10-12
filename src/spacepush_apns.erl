@@ -157,6 +157,21 @@ dispatch(#{in_flight := InFlight, max_in_flight := Max} = State) ->
 %% Checks a due delivery against the current registration and sends it once
 %% the connection for its environment is up.
 prepare(#{key := {Token, Topic} = Key, id := Id} = Delivery, State) ->
+    ValidRoom = case Topic of {_Endpoint, Room} -> spacepush_device:valid_room(Room); _ -> false end,
+    case spacepush_device:valid_token(Token) andalso maps:get(token, Delivery, undefined) =:= Token andalso ValidRoom of
+        true -> prepare_registered(Delivery, State);
+        false ->
+            ?LOG_WARNING(#{msg => delivery_discarded, reason => invalid_device_or_room}),
+            spacepush_stats:count(<<"push.invalid_delivery">>),
+            case spacepush_device:valid_token(Token) of
+                false -> spacepush_registry:unregister(Token);
+                true -> ok
+            end,
+            spacepush_outbox:complete(Key, Id),
+            State
+    end.
+
+prepare_registered(#{key := {Token, Topic} = Key, id := Id} = Delivery, State) ->
     case spacepush_registry:lookup(Token) of
         {ok, Environment, Topics, Version} ->
             case lists:member(Topic, Topics) of
@@ -206,15 +221,26 @@ send(Delivery, Connection, State0) ->
         {<<"apns-expiration">>, integer_to_binary(Expires div 1000)},
         {<<"apns-collapse-id">>, CollapseId}
     ],
-    Ref = gun:post(Connection, <<"/3/device/", Token/binary>>, Headers, Payload),
-    Request = #{
-        delivery => Delivery,
-        connection => Connection,
-        deadline => erlang:system_time(millisecond) + Timeout,
-        status => undefined,
-        body => <<>>
-    },
-    State2#{in_flight := InFlight#{Ref => Request}}.
+    try gun:post(Connection, <<"/3/device/", Token/binary>>, Headers, Payload) of
+        Ref ->
+            Request = #{
+                delivery => Delivery,
+                connection => Connection,
+                deadline => erlang:system_time(millisecond) + Timeout,
+                status => undefined,
+                body => <<>>
+            },
+            State2#{in_flight := InFlight#{Ref => Request}}
+    catch
+        Class:_Reason ->
+            %% Gun can reject a request synchronously. Keep the provider-token
+            %% cache, back off this delivery and continue dispatching the rest.
+            %% The exception can contain credentials, so log only its class.
+            ?LOG_WARNING(#{msg => apns_send_failed, environment => Environment, class => Class}),
+            spacepush_stats:count(<<"push.send_failed">>),
+            schedule_retry(Delivery),
+            State2
+    end.
 
 update_request(Ref, IsFin, Update, #{in_flight := InFlight} = State) ->
     case InFlight of

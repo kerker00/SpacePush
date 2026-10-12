@@ -36,14 +36,17 @@ prototype format, which stored seconds, are migrated on start.
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
--spec register(binary(), environment(), [spacepush_state:topic()]) -> ok | {error, full}.
+-spec register(binary(), environment(), [spacepush_state:topic()]) -> ok | {error, full | invalid_registration}.
 register(Token, Environment, Topics) ->
     register(Token, Environment, Topics, <<"unknown">>).
 
 -doc "Adds or replaces a registration. Fails for a new token once the cap is reached.".
--spec register(binary(), environment(), [spacepush_state:topic()], platform()) -> ok | {error, full}.
+-spec register(binary(), environment(), [spacepush_state:topic()], platform()) -> ok | {error, full | invalid_registration}.
 register(Token, Environment, Topics, Platform) ->
-    gen_server:call(?MODULE, {register, Token, Environment, Topics, Platform}).
+    case valid_registration({Token, Environment, Topics, 0, Platform}) of
+        true -> gen_server:call(?MODULE, {register, Token, Environment, Topics, Platform});
+        false -> {error, invalid_registration}
+    end.
 
 -spec unregister(binary()) -> ok.
 unregister(Token) ->
@@ -163,21 +166,44 @@ terminate(_Reason, _State) ->
 %% Fills ETS from DETS, migrating or dropping records in other formats.
 load() ->
     Records = dets:foldl(fun(Record, Acc) -> [Record | Acc] end, [], ?DETS),
-    lists:foreach(
-        fun
-            ({Token, {registration, 2, Environment, Topics, Version, Platform}}) ->
-                insert_ets({Token, Environment, Topics, Version, Platform});
-            ({Token, {registration, 1, Environment, Topics, Version}}) ->
-                migrate({Token, Environment, Topics, Version, <<"unknown">>});
-            ({Token, Environment, Topics, UpdatedAt}) when is_binary(Token), is_integer(UpdatedAt) ->
-                migrate({Token, Environment, Topics, UpdatedAt * 1000, <<"unknown">>});
-            (Record) ->
-                ?LOG_WARNING(#{msg => registration_dropped, record => Record}),
-                ok = dets:delete(?DETS, element(1, Record))
-        end,
-        Records
-    ),
+    lists:foreach(fun load_record/1, Records),
     ok = dets:sync(?DETS).
+
+load_record({Token, {registration, 2, Environment, Topics, Version, Platform}}) ->
+    load_registration({Token, Environment, Topics, Version, Platform}, false);
+load_record({Token, {registration, 1, Environment, Topics, Version}}) ->
+    load_registration({Token, Environment, Topics, Version, <<"unknown">>}, true);
+load_record({Token, Environment, Topics, UpdatedAt}) when is_integer(UpdatedAt) ->
+    load_registration({Token, Environment, Topics, UpdatedAt * 1000, <<"unknown">>}, true);
+load_record(Record) ->
+    drop_record(element(1, Record)).
+
+load_registration({Token, _Environment, _Topics, _Version, _Platform} = Registration, Migrate) ->
+    case valid_registration(Registration) of
+        true when Migrate -> migrate(Registration);
+        true -> insert_ets(Registration);
+        false -> drop_record(Token)
+    end.
+
+drop_record(Token) ->
+    %% Never put tokens or complete persisted records in logs.
+    ?LOG_WARNING(#{msg => registration_dropped, reason => invalid_registration}),
+    ok = dets:delete(?DETS, Token).
+
+valid_registration({Token, Environment, Topics, Version, Platform}) when
+    (Environment =:= sandbox orelse Environment =:= production),
+    is_list(Topics), length(Topics) =< 50,
+    is_integer(Version), Version >= 0, is_binary(Platform)
+->
+    spacepush_device:valid_token(Token) andalso lists:all(
+        fun
+            ({Endpoint, Room}) when is_binary(Endpoint) -> spacepush_device:valid_room(Room);
+            (_) -> false
+        end,
+        Topics
+    );
+valid_registration(_) ->
+    false.
 
 migrate(Registration) ->
     ?LOG_INFO(#{msg => registration_migrated}),

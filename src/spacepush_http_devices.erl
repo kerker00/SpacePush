@@ -79,7 +79,8 @@ register(Token, Environment, Topics, Platform, Req) ->
         {true, []} ->
             case spacepush_registry:register(Token, Environment, Topics, Platform) of
                 ok -> cowboy_req:reply(204, Req);
-                {error, full} -> spacepush_http:error_reply(503, <<"registry_full">>, Req)
+                {error, full} -> spacepush_http:error_reply(503, <<"registry_full">>, Req);
+                {error, invalid_registration} -> spacepush_http:error_reply(400, <<"invalid_registration">>, Req)
             end
     end.
 
@@ -107,10 +108,8 @@ read_body(Req0, Acc, Size, Deadline) ->
 
 -doc "APNs device tokens are hex strings, currently 64 characters long.".
 -spec valid_token(term()) -> boolean().
-valid_token(Token) when is_binary(Token), byte_size(Token) >= 64, byte_size(Token) =< 200 ->
-    re:run(Token, "^[0-9a-fA-F]+$", [{capture, none}]) =:= match;
-valid_token(_) ->
-    false.
+valid_token(Token) ->
+    spacepush_device:valid_token(Token).
 
 -spec parse_registration(binary()) ->
     {ok, spacepush_registry:environment(), [spacepush_state:topic()]} | {error, binary()}.
@@ -173,7 +172,5 @@ valid_endpoint(Endpoint) ->
             false
     end.
 
-valid_room(Room) when is_binary(Room), byte_size(Room) >= 1, byte_size(Room) =< 32 ->
-    re:run(Room, "^[a-z0-9_]+$", [{capture, none}]) =:= match;
-valid_room(_) ->
-    false.
+valid_room(Room) ->
+    spacepush_device:valid_room(Room).
