@@ -156,11 +156,11 @@ enqueue_change({Topic, Name, _From, To}, Now, Slots) ->
     lists:foreach(
         fun({Token, Environment, Version}) ->
             Key = {Token, Topic},
-            %% A pending, unsent delivery is replaced in its own slot.
+            %% Keep a live delivery's slot, but do not inherit an expired row.
             NotBefore =
                 case ets:lookup(?TABLE, Key) of
-                    [{Key, #{not_before := Pending}}] -> Pending;
-                    [] -> Slot
+                    [{Key, #{not_before := Pending, expires := Expires}}] when Expires > Now -> Pending;
+                    _ -> Slot
                 end,
             save(#{
                 key => Key,
@@ -172,7 +172,7 @@ enqueue_change({Topic, Name, _From, To}, Now, Slots) ->
                 collapse_id => CollapseId,
                 attempts => 0,
                 not_before => NotBefore,
-                expires => NotBefore + Ttl
+                expires => max(Now, NotBefore) + Ttl
             })
         end,
         Subscribers

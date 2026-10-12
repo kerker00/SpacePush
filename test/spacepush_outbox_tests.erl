@@ -24,6 +24,9 @@ outbox_test_() ->
         [
             fun one_delivery_per_subscriber/0,
             fun newer_state_replaces_pending/0,
+            fun replacement_of_expired_row_survives_restart/0,
+            fun replacement_refreshes_live_delivery_lifetime/0,
+            fun replacement_keeps_future_retry_slot/0,
             fun late_result_cannot_complete_successor/0,
             fun retry_postpones/0,
             fun in_flight_key_holds_back_successor/0,
@@ -64,6 +67,52 @@ late_result_cannot_complete_successor() ->
     ok = spacepush_outbox:complete(Key, OldId),
     ok = spacepush_outbox:retry(Key, OldId, now_ms() + 60000),
     ?assertMatch([#{attempts := 0}], spacepush_outbox:due(now_ms(), [], 10)).
+
+replace_persisted(Delivery) ->
+    gen_server:stop(spacepush_outbox),
+    {ok, File} = application:get_env(spacepush, outbox_file),
+    {ok, replacement_fixture} = dets:open_file(replacement_fixture, [{file, File}, {type, set}]),
+    ok = dets:insert(replacement_fixture, {maps:get(key, Delivery), Delivery}),
+    ok = dets:close(replacement_fixture),
+    start(spacepush_outbox).
+
+replacement_of_expired_row_survives_restart() ->
+    application:set_env(spacepush, notification_cooldown_ms, 0),
+    application:set_env(spacepush, delivery_ttl_ms, 1000),
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [Old] = spacepush_outbox:due(now_ms(), [], 10),
+    replace_persisted(Old#{not_before := now_ms() - 2000, expires := now_ms() - 1000}),
+    Before = now_ms(),
+    ok = spacepush_outbox:enqueue([change(closed)]),
+    gen_server:stop(spacepush_outbox),
+    start(spacepush_outbox),
+    [New] = spacepush_outbox:due(Before + 500, [], 10),
+    ?assertEqual(<<"closed">>, state(New)),
+    ?assertNotEqual(maps:get(id, Old), maps:get(id, New)).
+
+replacement_refreshes_live_delivery_lifetime() ->
+    application:set_env(spacepush, delivery_ttl_ms, 1000),
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [Old] = spacepush_outbox:due(now_ms(), [], 10),
+    Slot = now_ms() - 900,
+    replace_persisted(Old#{not_before := Slot, expires := now_ms() + 100}),
+    Before = now_ms(),
+    ok = spacepush_outbox:enqueue([change(member)]),
+    [New] = spacepush_outbox:due(Before + 500, [], 10),
+    ?assertEqual(<<"member">>, state(New)),
+    ?assertEqual(Slot, maps:get(not_before, New)).
+
+replacement_keeps_future_retry_slot() ->
+    application:set_env(spacepush, delivery_ttl_ms, 1000),
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [#{key := Key, id := Id}] = spacepush_outbox:due(now_ms(), [], 10),
+    Later = now_ms() + 10000,
+    ok = spacepush_outbox:retry(Key, Id, Later),
+    ok = spacepush_outbox:enqueue([change(closed)]),
+    ?assertEqual([], spacepush_outbox:due(Later - 1, [], 10)),
+    [New] = spacepush_outbox:due(Later + 500, [], 10),
+    ?assertEqual(<<"closed">>, state(New)),
+    ?assertEqual([], spacepush_outbox:due(Later + 1000, [], 10)).
 
 retry_postpones() ->
     ok = spacepush_outbox:enqueue([change(open)]),
