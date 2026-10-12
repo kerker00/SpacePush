@@ -67,6 +67,10 @@ handle_valid(<<"DELETE">>, Token, Req) ->
 handle_valid(_Method, _Token, Req) ->
     cowboy_req:reply(405, #{<<"allow">> => <<"PUT, DELETE">>}, Req).
 
+%% Unsubscribing does not need a directory or a free registration slot.
+register(Token, Environment, [], Platform, Req) ->
+    ok = spacepush_registry:register(Token, Environment, [], Platform),
+    cowboy_req:reply(204, Req);
 %% Only endpoints from the directory: SpacePush fetches what devices subscribe
 %% to, so it must not accept arbitrary, possibly internal, URLs.
 register(Token, Environment, Topics, Platform, Req) ->

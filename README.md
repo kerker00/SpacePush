@@ -58,6 +58,11 @@ Remove a device:
 
     DELETE /v1/devices/<hex device token>
 
+A valid `PUT` with `"subscriptions": []` also removes the device and answers
+`204`, including when the directory is unavailable or registration capacity is
+full. It does not create a registration. Older persisted registrations without
+subscriptions are removed on startup.
+
 Read the current state, in the shapes the apps already decode:
 
     GET /v1/directory                    the listed spaces, in the aggregator's format
