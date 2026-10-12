@@ -6,3 +6,6 @@ erl_crash.dump
 *.pem
 *.p8
 .DS_Store
+# Audit reports and reproduction artifacts are kept only in the local workspace.
+/docs/AUDIT_*.md
+/docs/audit/
