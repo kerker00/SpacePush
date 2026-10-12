@@ -1,6 +1,6 @@
 # SpacePush
 
-Sends push notifications to the [SpaceState](https://github.com/kerker00/SpaceState) apps when a hackerspace opens or closes, and serves the apps the spaces' current state, so each space is asked once a minute however many people use the apps.
+Sends push notifications to the [SpaceState](https://github.com/kerker00/SpaceState) apps when a hackerspace opens or closes, and serves the apps the spaces' current state, so by default each space is asked at most once a minute however many people use the apps.
 
 An Erlang/OTP application that:
 
@@ -17,7 +17,7 @@ An Erlang/OTP application that:
 | --- | --- |
 | `spacepush_directory` | The list of spaces and allowlist, refreshed hourly and saved to `data/directory.bin` |
 | `spacepush_cache` | Latest response per space; fetches on demand for the read API, once per space however many requests wait |
-| `spacepush_poller` | Fetches the needed spaces every minute, at most 10 at a time, skipping failing ones with backoff, and confirms changes (`spacepush_state:track/4`); the tracker is saved to `data/tracker.bin` |
+| `spacepush_poller` | Requests needed spaces through the shared cache workers every minute, at most 10 at a time, and confirms changes (`spacepush_state:track/4`); the tracker is saved to `data/tracker.bin` |
 | `spacepush_outbox` | Pending deliveries in `data/outbox.dets` |
 | `spacepush_apns` | Sends due deliveries, at most 20 at a time, each with a 15 s deadline |
 | `spacepush_registry` | Device registrations in `data/registry.dets`, with an ETS topic index |
@@ -98,7 +98,7 @@ Spaces run their own endpoints, and clients are anonymous, so SpacePush treats b
 - Only endpoints listed in the SpaceAPI directory are fetched or accepted in subscriptions.
 - Each request resolves the host itself and connects only to a public address, pinned for the request; loopback, private, link-local and similar addresses are refused, also when DNS points there. TLS is verified against the host name. Redirects are not followed.
 - Responses are read in chunks and aborted beyond 256 KB or after 10 seconds, and are cached only if they parse as a space.
-- Each space is fetched at most once a minute; at most 20 on-demand fetches run at a time.
+- Polling and read requests share each space's fetch: attempts start at least a minute apart by default, and failures back off up to 30 minutes. At most 20 combined fetches run at a time. Reads can keep serving the last good response with its original fetch timestamp while refresh is deferred. The poller observes each successful response once, including results obtained by readers; repeated cached responses, responses beyond `max_data_age_s` and failed refreshes do not confirm state changes.
 - Notification titles are stripped of control and direction characters and shortened to 64 characters. Notifications for one space or room are at least five minutes apart; changes in between are merged into the latest.
 - Passed-through documents are served with `X-Content-Type-Options: nosniff`.
 - Behind the proxy, the rate limit uses the last `X-Forwarded-For` entry, the one the proxy added. The listener accepts at most 1024 connections.
@@ -137,7 +137,8 @@ All settings live in the `spacepush` application environment (see `src/spacepush
 | `max_data_age_s` | Aggregator states older than this are not shown in the directory |
 | `watch_window_ms` | How long a space stays fetched after an app asked for it |
 | `fetch_concurrency`, `fetch_timeout_ms`, `max_body_bytes` | Limits for fetching spaces |
-| `cache_max_age_ms`, `on_demand_fetch_limit`, `on_demand_waiter_limit` | Freshness of read API answers, parallel on-demand fetches and total waiting callers |
+| `fetch_min_interval_ms`, `fetch_backoff_max_ms` | Shared minimum time between attempts per endpoint, and maximum failure backoff |
+| `cache_max_age_ms`, `on_demand_fetch_limit`, `on_demand_waiter_limit` | Freshness of read API answers, combined parallel refreshes and total waiting callers |
 | `notification_cooldown_ms` | Minimum time between notifications for one space or room |
 | `rate_limit_per_minute`, `read_rate_limit_per_minute`, `http_max_connections` | Limits for clients |
 | `max_registrations`, `registration_ttl_days` | Cap and expiry for device registrations |
