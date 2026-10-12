@@ -66,11 +66,15 @@ subscriptions are removed on startup.
 Read the current state, in the shapes the apps already decode:
 
     GET /v1/directory                    the listed spaces, in the aggregator's format
-    GET /v1/spaces?endpoint=<url>        a space's SpaceAPI document, at most a minute old
+    GET /v1/spaces?endpoint=<url>        a space's last successful SpaceAPI document
     GET /v1/mainframe/rooms              Mainframe's openState response
     GET /v1/summary                      {"open", "total", "as_of"}: how many listed spaces are open
 
-`/v1/summary` counts the same states as `/v1/directory`: spaces somebody subscribed to or asked for in the last minutes are at most a minute old, the others come from the hourly directory; `as_of` is the newest of them. It carries `Access-Control-Allow-Origin: *`, so web pages such as the project site can show the number live.
+`/v1/directory` prefers a recent direct fetch and otherwise uses the hourly aggregator data. Every response checks the original observation time against `max_data_age_s`; expired states omit the open flag while the space's name, location and allowlisted endpoint remain available. Future timestamps do not provide a current state. Directory and summary responses use `Cache-Control: no-cache` so clients revalidate them.
+
+`/v1/summary` counts the same current opening flags as `/v1/directory`; `as_of` is the newest timestamp among known current states, or `null` when none is known. It does not describe the age of every listed space. It carries `Access-Control-Allow-Origin: *`, so web pages such as the project site can show the number live.
+
+Document responses carry `X-SpacePush-Fetched-At`. A failed refresh can serve an older last good document with its original timestamp. Mainframe responses without any usable room are treated as failed refreshes.
 
 Unknown endpoints answer `404`; a space that cannot be fetched and has nothing cached answers `502`, and too many spaces fetched at once `503`.
 

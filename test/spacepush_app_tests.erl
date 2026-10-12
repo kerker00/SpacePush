@@ -154,6 +154,7 @@ raw(Port, Request) ->
 
 directory(Port) ->
     {200, Body} = request(get, Port, "/v1/directory"),
+    ?assertEqual("no-cache", proplists:get_value("cache-control", headers(Port, "/v1/directory"))),
     Entries = json:decode(Body),
     %% Entries without a name are allowlisted but not listed.
     ?assertEqual(7, length(Entries)),
@@ -167,7 +168,9 @@ summary(Port) ->
     Open = length([E || #{<<"data">> := #{<<"state">> := #{<<"open">> := true}}} = E <- Entries]),
     {200, Body} = request(get, Port, "/v1/summary"),
     ?assertMatch(#{<<"open">> := Open, <<"total">> := 7, <<"as_of">> := <<_/binary>>}, json:decode(Body)),
-    ?assertEqual("*", proplists:get_value("access-control-allow-origin", headers(Port, "/v1/summary"))).
+    Headers = headers(Port, "/v1/summary"),
+    ?assertEqual("*", proplists:get_value("access-control-allow-origin", Headers)),
+    ?assertEqual("no-cache", proplists:get_value("cache-control", Headers)).
 
 passes_documents_through_safely(Port) ->
     Headers = headers(Port, "/v1/spaces?endpoint=" ?NERD2NERD_QS),
