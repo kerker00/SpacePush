@@ -19,7 +19,7 @@ An Erlang/OTP application that:
 | `spacepush_cache` | Latest response per space; fetches on demand for the read API, once per space however many requests wait |
 | `spacepush_poller` | Requests needed spaces through the shared cache workers every minute, at most 10 at a time, and confirms changes (`spacepush_state:track/4`); the tracker is saved to `data/tracker.bin` |
 | `spacepush_outbox` | Pending deliveries in `data/outbox.dets` |
-| `spacepush_apns` | Sends due deliveries, at most 20 at a time, each with a 15 s deadline |
+| `spacepush_apns` | Sends due deliveries, at most 20 at a time, each with a 15 s deadline; selects ready environments before limiting and shares capacity fairly when both have work |
 | `spacepush_registry` | Device registrations in `data/registry.dets`, with an ETS topic index |
 | `spacepush_ratelimit` | Requests per client and minute for the HTTP API |
 
