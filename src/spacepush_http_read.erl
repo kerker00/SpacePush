@@ -24,10 +24,10 @@ must not render a hostile document as HTML.
 -export([init/2, directory/1, summary/1]).
 
 init(Req0, Kind) ->
-    spacepush_stats:request(atom_to_binary(Kind), Req0),
     Req =
         case {cowboy_req:method(Req0), spacepush_ratelimit:allow(read, spacepush_http:client(Req0))} of
             {<<"GET">>, true} ->
+                spacepush_stats:request(atom_to_binary(Kind), Req0),
                 handle(Kind, Req0);
             {<<"GET">>, false} ->
                 spacepush_stats:rate_limited(read),

@@ -56,7 +56,12 @@
         {apns_team_id, <<"7E3BJ546SA">>},
         {apns_topic, <<"net.grafixmafia.spacepush">>},
         %% Usage statistics, served on GET /v1/stats to local requests only.
-        {stats_file, "data/stats.bin"}
+        {stats_file, "data/stats.bin"},
+        %% Per ISO week, with one additional "other" bucket for overflow.
+        {stats_max_versions, 64},
+        {stats_max_os_versions, 64},
+        %% Recording is best effort; queued events never grow the stats mailbox.
+        {stats_max_pending, 1000}
     ]},
     {licenses, ["MIT"]},
     {links, [{"GitHub", "https://github.com/kerker00/SpacePush"}]}
