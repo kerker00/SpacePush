@@ -9,6 +9,7 @@ answers `subscribers/1` without going through this process.
 
 The number of registrations is capped, and registrations that were not
 renewed within `registration_ttl_days` expire. The apps renew on every launch.
+An empty topic list unregisters a device; it never occupies capacity.
 
 On disk a registration is `{Token, {registration, 2, Environment, Topics, Version, Platform}}`.
 Format 1 records, without a platform, and records of the unversioned
@@ -120,6 +121,8 @@ init([]) ->
     erlang:send_after(?EXPIRY_CHECK_MS, self(), remove_expired),
     {ok, #{}}.
 
+handle_call({register, Token, _Environment, [], _Platform}, From, State) ->
+    handle_call({unregister, Token}, From, State);
 handle_call({register, Token, Environment, Topics, Platform}, _From, State) ->
     Reply =
         case ets:lookup(?REGISTRATIONS, Token) of
@@ -178,11 +181,14 @@ load_record({Token, Environment, Topics, UpdatedAt}) when is_integer(UpdatedAt) 
 load_record(Record) ->
     drop_record(element(1, Record)).
 
-load_registration({Token, _Environment, _Topics, _Version, _Platform} = Registration, Migrate) ->
-    case valid_registration(Registration) of
-        true when Migrate -> migrate(Registration);
-        true -> insert_ets(Registration);
-        false -> drop_record(Token)
+load_registration({Token, _Environment, Topics, _Version, _Platform} = Registration, Migrate) ->
+    case {valid_registration(Registration), Topics} of
+        {true, []} ->
+            ?LOG_INFO(#{msg => registration_dropped, reason => empty_subscriptions}),
+            ok = dets:delete(?DETS, Token);
+        {true, _} when Migrate -> migrate(Registration);
+        {true, _} -> insert_ets(Registration);
+        {false, _} -> drop_record(Token)
     end.
 
 drop_record(Token) ->

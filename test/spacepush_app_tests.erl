@@ -14,6 +14,7 @@ app_test_() ->
             ?_test(all_children_running()),
             ?_assertEqual({200, <<"ok">>}, request(get, Port, "/health")),
             ?_test(register_and_unregister(Port)),
+            ?_test(empty_subscriptions_unregister_without_directory(Port)),
             ?_test(rejects_percent_decoded_token_bytes(Port)),
             ?_assertEqual(400, status(request(put, Port, "/v1/devices/xyz", <<"{}">>))),
             ?_assertEqual(413, status(request(put, Port, "/v1/devices/" ?TOKEN, binary:copy(<<" ">>, 20000)))),
@@ -80,6 +81,23 @@ register_and_unregister(Port) ->
     ?assertMatch([{_, sandbox, _}], spacepush_registry:subscribers(?TOPIC)),
     ?assertEqual(204, status(request(delete, Port, "/v1/devices/" ?TOKEN))),
     ?assertEqual([], spacepush_registry:subscribers(?TOPIC)).
+
+empty_subscriptions_unregister_without_directory(Port) ->
+    Path = "/v1/devices/" ?TOKEN,
+    Empty = iolist_to_binary(json:encode(#{<<"environment">> => <<"sandbox">>, <<"subscriptions">> => []})),
+    ?assertEqual(204, status(request(put, Port, Path, registration(?NERD2NERD)))),
+    Entries = ets:tab2list(spacepush_directory),
+    sys:replace_state(spacepush_directory, fun(State) -> ets:delete_all_objects(spacepush_directory), State end),
+    try
+        ?assertEqual(503, status(request(put, Port, Path, registration(?NERD2NERD)))),
+        ?assertEqual(204, status(request(put, Port, Path, Empty))),
+        ?assertEqual(error, spacepush_registry:lookup(list_to_binary(?TOKEN))),
+        ?assertEqual([], spacepush_registry:subscribers(?TOPIC)),
+        ?assertEqual(204, status(request(put, Port, Path, Empty))),
+        ?assertEqual(error, spacepush_registry:lookup(list_to_binary(?TOKEN)))
+    after
+        sys:replace_state(spacepush_directory, fun(State) -> ets:insert(spacepush_directory, Entries), State end)
+    end.
 
 rejects_percent_decoded_token_bytes(Port) ->
     Path = "/v1/devices/" ?TOKEN,
