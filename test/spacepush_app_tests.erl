@@ -28,7 +28,8 @@ app_test_() ->
             ?_assertEqual(400, status(request(get, Port, "/v1/spaces"))),
             ?_assertEqual({200, spacepush_test_util:fixture("mainframe-openstate.json")}, request(get, Port, "/v1/mainframe/rooms")),
             ?_assertEqual(405, status(request(post, Port, "/v1/directory", <<"{}">>))),
-            ?_test(passes_documents_through_safely(Port))
+            ?_test(passes_documents_through_safely(Port)),
+            ?_test(rate_limited_requests_do_not_tally_versions(Port))
         ]
     end}.
 
@@ -154,3 +155,35 @@ passes_documents_through_safely(Port) ->
     Headers = headers(Port, "/v1/spaces?endpoint=" ?NERD2NERD_QS),
     ?assertEqual("nosniff", proplists:get_value("x-content-type-options", Headers)),
     ?assertEqual("application/json", proplists:get_value("content-type", Headers)).
+
+rate_limited_requests_do_not_tally_versions(Port) ->
+    application:set_env(spacepush, read_rate_limit_per_minute, 1),
+    application:set_env(spacepush, rate_limit_per_minute, 1),
+    ets:delete_all_objects(spacepush_ratelimit),
+    try
+        Read = [reported_request(get, Port, "/v1/summary", N) || N <- [9001, 9002, 9003]],
+        Write = [reported_request(put, Port, "/v1/devices/" ?TOKEN, N) || N <- [9011, 9012, 9013]],
+        ?assertEqual([200, 429, 429], Read),
+        ?assertEqual([204, 429, 429], Write),
+        Report = spacepush_stats:report(1),
+        Installs = maps:get(<<"installs">>, Report),
+        ?assertEqual(2, maps:get(<<"this_week">>, Installs)),
+        Versions = maps:get(<<"versions">>, maps:get(<<"this_week_by">>, Installs)),
+        ?assertEqual(#{<<"9001">> => 1, <<"9011">> => 1}, Versions),
+        [Today | _] = maps:get(<<"days">>, Report),
+        ?assertMatch(#{<<"rate_limited.read">> := 2, <<"rate_limited.write">> := 2}, Today)
+    after
+        application:set_env(spacepush, read_rate_limit_per_minute, 300),
+        application:set_env(spacepush, rate_limit_per_minute, 30)
+    end.
+
+reported_request(Method, Port, Path, Version) ->
+    Headers = [
+        {"user-agent", "SpaceState/" ++ integer_to_list(Version) ++ " (iOS 26.0)"},
+        {"x-spacestate-first", "week"}
+    ],
+    Result = case Method of
+        get -> httpc:request(get, {url(Port, Path), Headers}, [], [{body_format, binary}]);
+        put -> httpc:request(put, {url(Port, Path), Headers, "application/json", registration(?NERD2NERD)}, [], [{body_format, binary}])
+    end,
+    status(reply(Result)).

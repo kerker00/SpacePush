@@ -18,11 +18,17 @@ server_test_() ->
         fun survives_restart/0,
         fun reports_past_periods/0,
         fun migrates_format_1/0,
-        fun reports_devices/0
+        fun reports_devices/0,
+        fun bounds_weekly_dimensions/0,
+        fun bounds_ingress_while_suspended/0,
+        fun compacts_oversized_persisted_dimensions/0
     ]}.
 
 setup() ->
     spacepush_test_util:setup_env("stats"),
+    application:set_env(spacepush, stats_max_versions, 64),
+    application:set_env(spacepush, stats_max_os_versions, 64),
+    application:set_env(spacepush, stats_max_pending, 1000),
     lists:foreach(fun start/1, [spacepush_registry, spacepush_directory, spacepush_stats]).
 
 start(Module) ->
@@ -143,6 +149,90 @@ reports_devices() ->
         Devices
     ),
     ?assertMatch(#{<<"registrations.new">> := 2}, today(spacepush_stats:report(1))).
+
+limited_stats() ->
+    gen_server:stop(spacepush_stats),
+    application:set_env(spacepush, stats_max_versions, 2),
+    application:set_env(spacepush, stats_max_os_versions, 2),
+    application:set_env(spacepush, stats_max_pending, 4),
+    start(spacepush_stats).
+
+version_request(N) ->
+    Value = integer_to_binary(N),
+    req(#{
+        <<"user-agent">> => <<"SpaceState/", Value/binary, " (iOS ", Value/binary, ".0)">>,
+        <<"x-spacestate-first">> => <<"week">>
+    }).
+
+weekly_counts(Report) ->
+    maps:get(<<"this_week_by">>, maps:get(<<"installs">>, Report)).
+
+bounds_weekly_dimensions() ->
+    limited_stats(),
+    [
+        begin
+            spacepush_stats:request(<<"summary">>, version_request(N)),
+            %% Drain between requests: dimension limits are independent of overload.
+            spacepush_stats:report(1)
+        end
+     || N <- lists:seq(1, 10)
+    ],
+    Report = spacepush_stats:report(1),
+    Counts = weekly_counts(Report),
+    [begin
+        GroupCounts = maps:get(Group, Counts),
+        ?assertEqual(3, map_size(GroupCounts)),
+        ?assertEqual(8, maps:get(<<"other">>, GroupCounts)),
+        ?assertEqual(10, lists:sum(maps:values(GroupCounts)))
+    end || Group <- [<<"versions">>, <<"os_versions">>]],
+    gen_server:stop(spacepush_stats),
+    start(spacepush_stats),
+    ?assertEqual(Counts, weekly_counts(spacepush_stats:report(1))).
+
+bounds_ingress_while_suspended() ->
+    limited_stats(),
+    Pid = whereis(spacepush_stats),
+    ok = sys:suspend(Pid),
+    try
+        {message_queue_len, Before} = process_info(Pid, message_queue_len),
+        [spacepush_stats:request(<<"summary">>, version_request(N)) || N <- lists:seq(1, 10000)],
+        ?assertEqual(4, length(ets:match_object(spacepush_stats_ingress, {{event, '_'}, '_'}))),
+        {message_queue_len, After} = process_info(Pid, message_queue_len),
+        %% Only the two periodic timers may arrive while suspended.
+        ?assert(After =< Before + 2)
+    after
+        sys:resume(Pid)
+    end,
+    Report = spacepush_stats:report(1),
+    ?assertMatch(#{<<"requests.summary">> := 4, <<"stats.dropped">> := 9996}, today(Report)),
+    ?assertEqual(4, maps:get(<<"this_week">>, maps:get(<<"installs">>, Report))),
+    ?assertEqual(3, map_size(maps:get(<<"versions">>, weekly_counts(Report)))).
+
+compacts_oversized_persisted_dimensions() ->
+    limited_stats(),
+    gen_server:stop(spacepush_stats),
+    {ok, File} = application:get_env(spacepush, stats_file),
+    Label = spacepush_stats:week_label(date()),
+    Large = maps:from_list([{integer_to_binary(N), 1} || N <- lists:seq(1, 1000)]),
+    Week = #{<<"versions">> => Large, <<"os_versions">> => Large, <<"platforms">> => Large},
+    ok = spacepush_store:save(File, {stats, 2, #{}, #{Label => Week}, #{}}),
+    start(spacepush_stats),
+    Counts = weekly_counts(spacepush_stats:report(1)),
+    [
+        begin
+            GroupCounts = maps:get(Group, Counts),
+            ?assert(map_size(GroupCounts) =< 3),
+            ?assertEqual(1000, lists:sum(maps:values(GroupCounts)))
+        end
+     || Group <- [<<"versions">>, <<"os_versions">>]
+    ],
+    ?assertEqual(#{<<"other">> => 1000}, maps:get(<<"platforms">>, Counts)),
+    %% Startup writes back the bounded representation, before a later restart.
+    {stats, 2, _, #{Label := Stored}, _} = spacepush_store:load(File, none),
+    ?assertEqual(Counts, Stored),
+    gen_server:stop(spacepush_stats),
+    start(spacepush_stats),
+    ?assertEqual(Counts, weekly_counts(spacepush_stats:report(1))).
 
 local_test_() ->
     Req = fun(Ip, Headers) -> #{headers => Headers, peer => {Ip, 4711}} end,

@@ -11,7 +11,7 @@ start_link() ->
 %% rest_for_one restarts everything after a crashed process, so the sender
 %% never holds requests for an outbox or registry that was restarted.
 %% Pending work survives in the outbox and the tracker file.
-%% The statistics come last: the others only cast to them, which never fails,
+%% The statistics come last: recording uses their optional bounded ETS buffer,
 %% and a crash there restarts nothing else.
 init([]) ->
     Children = [

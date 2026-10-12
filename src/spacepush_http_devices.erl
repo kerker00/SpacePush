@@ -26,10 +26,10 @@ within `http_body_timeout_ms`, 429 when the client sent too many requests and
 -define(MAX_ENDPOINT, 512).
 
 init(Req0, Opts) ->
-    spacepush_stats:request(kind(cowboy_req:method(Req0)), Req0),
     Req =
         case spacepush_ratelimit:allow(write, spacepush_http:client(Req0)) of
             true ->
+                spacepush_stats:request(kind(cowboy_req:method(Req0)), Req0),
                 handle(cowboy_req:method(Req0), cowboy_req:binding(token, Req0), Req0);
             false ->
                 spacepush_stats:rate_limited(write),
