@@ -1,0 +1,43 @@
+name: CI
+
+"on":
+  pull_request:
+    branches: [dev, master]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [dev, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: OTP ${{ matrix.otp }} build and EUnit
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: ['28.5.0.7', '29.1.1']
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Erlang and rebar3
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          otp-version: ${{ matrix.otp }}
+          rebar3-version: '3.27.3'
+      - name: Compile production code
+        run: env -u DEBUG rebar3 compile
+      - name: Compile test profile
+        run: env -u DEBUG rebar3 as test compile
+      - name: Run EUnit regressions
+        run: env -u DEBUG rebar3 eunit
