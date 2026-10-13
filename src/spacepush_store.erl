@@ -1,5 +1,5 @@
 -module(spacepush_store).
--moduledoc "Saves a term to a file atomically and durably, and reads it back.".
+-moduledoc "Saves a term by syncing a temporary file and atomically renaming it, and reads it back.".
 
 -include_lib("kernel/include/logger.hrl").
 
@@ -29,6 +29,7 @@ load(File, Default) ->
 -doc """
 Writes and syncs a temporary file, then renames it over the target, so the
 file is either the old or the new version, also after a crash.
+Parent directories are not synced; this does not establish host power-loss durability.
 """.
 -spec save(file:filename(), term()) -> ok.
 save(File, Term) ->

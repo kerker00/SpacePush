@@ -18,17 +18,16 @@ An Erlang/OTP application that:
 | `spacepush_directory` | The list of spaces and allowlist, refreshed hourly and saved to `data/directory.bin` |
 | `spacepush_cache` | Latest response per space; fetches on demand for the read API, once per space however many requests wait |
 | `spacepush_poller` | Requests needed spaces through the shared cache workers every minute, at most 10 at a time, and confirms changes (`spacepush_state:track/4`); the tracker is saved to `data/tracker.bin` |
-<<<<<<< HEAD
 | `spacepush_outbox` | Pending deliveries in `data/outbox.dets`; replacement states receive a fresh lifetime while keeping a live delivery's scheduled slot |
-| `spacepush_apns` | Sends due deliveries, at most 20 at a time, each with a 15 s deadline |
-=======
-| `spacepush_outbox` | Pending deliveries in `data/outbox.dets` |
 | `spacepush_apns` | Sends due deliveries, at most 20 at a time, each with a 15 s deadline; selects ready environments before limiting and shares capacity fairly when both have work |
->>>>>>> refs/remotes/origin/dev
 | `spacepush_registry` | Device registrations in `data/registry.dets`, with an ETS topic index; renewals atomically replace the visible registration without a lookup gap |
 | `spacepush_ratelimit` | Requests per client and minute for the HTTP API |
 
-Pending changes and deliveries are synced to disk before they count as accepted, so a restart of a process or of the whole service, even an abrupt one, loses no work. Persistent formats carry a version; older records are migrated on start.
+Confirmed changes first write a versioned intent beside the tracker (`tracker.bin.intent`). The outbox syncs all delivery rows before writing and syncing its commit marker; the tracker snapshot is then saved before the intent is removed. Startup completes pending outbox work before starting APNs and restores the intended tracker before polling. Replaying an applied commit does not requeue deliveries already completed by the sender. Backups must keep the tracker, any intent and the outbox together. Persistent formats carry a version; older registration records are migrated on start.
+
+The local regression suite covers process crashes and abrupt VM termination at the hand-off boundaries. It does not establish durability under host power loss: parent directories are not synced. An APNs request accepted remotely before its local result is recorded can still be retried after a crash; end-to-end exactly-once delivery is not promised.
+
+Older releases do not understand the new outbox commit marker. Downgrading requires restoring a consistent pre-upgrade backup of the tracker and outbox.
 
 ## Requirements
 

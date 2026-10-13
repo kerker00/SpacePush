@@ -20,11 +20,12 @@ Every change is synced to disk before the call returns.
 
 -include_lib("kernel/include/logger.hrl").
 
--export([start_link/0, enqueue/1, due/3, due/4, complete/2, retry/3, pending/0]).
+-export([start_link/0, enqueue/1, apply_commit/2, due/3, due/4, complete/2, retry/3, pending/0]).
 -export([init/1, handle_call/3, handle_cast/2, terminate/2]).
 
 -define(DETS, spacepush_outbox).
 -define(TABLE, spacepush_outbox_entries).
+-define(COMMIT, '$spacepush_commit').
 
 -type key() :: {Token :: binary(), spacepush_state:topic()}.
 -type id() :: {integer(), pos_integer()}.
@@ -51,6 +52,11 @@ enqueue([]) ->
     ok;
 enqueue(Changes) ->
     gen_server:call(?MODULE, {enqueue, Changes}).
+
+-doc "Idempotently replays the outstanding tracker commit, even after its deliveries were completed.".
+-spec apply_commit(binary(), [spacepush_state:change()]) -> ok.
+apply_commit(Id, Changes) ->
+    gen_server:call(?MODULE, {apply_commit, Id, Changes}, infinity).
 
 -doc "Returns up to `Limit` deliveries due at `Now` (ms) whose keys are not in `InFlight`.".
 -spec due(integer(), [key()], non_neg_integer()) -> [delivery()].
@@ -83,22 +89,31 @@ init([]) ->
     ok = filelib:ensure_dir(File),
     {ok, ?DETS} = dets:open_file(?DETS, [{file, File}, {type, set}]),
     ets:new(?TABLE, [named_table, protected, set]),
-    ?TABLE = dets:to_ets(?DETS, ?TABLE),
-    {ok, #{slots => #{}}}.
+    Applied = case dets:lookup(?DETS, ?COMMIT) of
+        [] -> none;
+        [{?COMMIT, {outbox_commit, 1, Id}}] when is_binary(Id), byte_size(Id) =:= 16 -> Id;
+        _ -> error(invalid_outbox_commit)
+    end,
+    ok = dets:foldl(fun
+        ({?COMMIT, _}, ok) -> ok;
+        (Record, ok) -> true = ets:insert(?TABLE, Record), ok
+    end, ok, ?DETS),
+    State = #{slots => #{}, applied_commit => Applied},
+    {ok, TrackerFile} = application:get_env(spacepush, tracker_file),
+    %% Complete a possibly partial batch before the supervisor starts APNs.
+    Recovered = case spacepush_commit:pending(TrackerFile) of
+        none -> State;
+        {CommitId, _Snapshot, Changes} -> commit_changes(CommitId, Changes, State)
+    end,
+    {ok, Recovered}.
 
-handle_call({enqueue, Changes}, _From, #{slots := Slots} = State) ->
-    Now = erlang:system_time(millisecond),
-    {Count, Slots1} = lists:foldl(
-        fun(Change, {CountAcc, SlotsAcc}) ->
-            {Added, SlotsAcc1} = enqueue_change(Change, Now, SlotsAcc),
-            {CountAcc + Added, SlotsAcc1}
-        end,
-        {0, Slots},
-        Changes
-    ),
+handle_call({enqueue, Changes}, _From, State) ->
+    {Count, State1} = enqueue_changes(Changes, plain, State),
     sync(),
     Count > 0 andalso spacepush_apns:wake(),
-    {reply, ok, State#{slots := Slots1}};
+    {reply, ok, State1};
+handle_call({apply_commit, Id, Changes}, _From, State) ->
+    {reply, ok, commit_changes(Id, Changes, State)};
 handle_call({due, Now, InFlight, Limit, Eligible}, _From, State) ->
     {Expired, Ready} = ets:foldl(
         fun({Key, #{not_before := NotBefore, expires := Expires} = Delivery}, {ExpiredAcc, ReadyAcc}) ->
@@ -147,7 +162,30 @@ handle_cast(_Msg, State) ->
 terminate(_Reason, _State) ->
     dets:close(?DETS).
 
-enqueue_change({Topic, Name, _From, To}, Now, Slots) ->
+commit_changes(Id, _Changes, #{applied_commit := Id} = State) -> State;
+commit_changes(Id, Changes, State) when is_binary(Id), byte_size(Id) =:= 16 ->
+    {Count, State1} = enqueue_changes(Changes, commit, State),
+    %% A visible commit marker must never precede durable delivery rows.
+    sync(),
+    spacepush_commit:checkpoint(deliveries_saved),
+    ok = dets:insert(?DETS, {?COMMIT, {outbox_commit, 1, Id}}),
+    sync(),
+    Count > 0 andalso spacepush_apns:wake(),
+    State1#{applied_commit := Id}.
+
+enqueue_changes(Changes, Mode, #{slots := Slots} = State) ->
+    Now = erlang:system_time(millisecond),
+    {Count, Slots1} = lists:foldl(
+        fun(Change, {CountAcc, SlotsAcc}) ->
+            {Added, SlotsAcc1} = enqueue_change(Change, Now, SlotsAcc, Mode),
+            {CountAcc + Added, SlotsAcc1}
+        end,
+        {0, Slots},
+        Changes
+    ),
+    {Count, State#{slots := Slots1}}.
+
+enqueue_change({Topic, Name, _From, To}, Now, Slots, Mode) ->
     {ok, Cooldown} = application:get_env(spacepush, notification_cooldown_ms),
     {ok, Ttl} = application:get_env(spacepush, delivery_ttl_ms),
     Slot =
@@ -178,7 +216,8 @@ enqueue_change({Topic, Name, _From, To}, Now, Slots) ->
                 attempts => 0,
                 not_before => NotBefore,
                 expires => max(Now, NotBefore) + Ttl
-            })
+            }),
+            case Mode of commit -> spacepush_commit:checkpoint(delivery_written); plain -> ok end
         end,
         Subscribers
     ),
