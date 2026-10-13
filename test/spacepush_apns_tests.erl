@@ -64,7 +64,8 @@ dispatch_test_() ->
         fun successful_response_confirms_current_registration/0,
         fun failed_response_does_not_confirm_registration/0,
         fun late_success_does_not_confirm_renewed_registration/0,
-        fun dry_run_does_not_confirm_registration/0
+        fun dry_run_does_not_confirm_registration/0,
+        fun expired_registration_is_not_dispatched/0
     ]}.
 
 setup_dispatch() ->
@@ -237,12 +238,25 @@ confirmed() ->
     maps:get(<<"accepted_by_apns">>, Counts, 0).
 
 successful_response_confirms_current_registration() ->
+    application:set_env(spacepush, max_unconfirmed_registrations, 1),
     send_and_respond(200),
     ?assertEqual(1, confirmed()),
     ?assertEqual(0, spacepush_outbox:pending()),
+    ok = spacepush_registry:register(token(2), sandbox, [topic()]),
     gen_server:stop(spacepush_registry),
     start(spacepush_registry),
     ?assertEqual(1, confirmed()).
+
+expired_registration_is_not_dispatched() ->
+    Base = erlang:system_time(millisecond),
+    application:set_env(spacepush, registry_clock, fun() -> Base end),
+    ok = spacepush_registry:register(token(1), sandbox, [topic()]),
+    ok = spacepush_outbox:enqueue([{topic(), <<"Test">>, closed, open}]),
+    ?assertEqual(1, spacepush_outbox:pending()),
+    application:set_env(spacepush, registry_clock, fun() -> Base + 60 * 86400000 end),
+    {noreply, State} = spacepush_apns:handle_cast(wake, sender_state(self())),
+    ?assertEqual(#{}, maps:get(in_flight, State)),
+    ?assertEqual(0, spacepush_outbox:pending()).
 
 failed_response_does_not_confirm_registration() ->
     lists:foreach(fun(Status) ->

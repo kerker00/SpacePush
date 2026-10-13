@@ -4,6 +4,7 @@
 
 - Validate device tokens and rooms consistently at the API, registry and sender boundaries. Empty subscriptions unregister a device persistently.
 - Persist the first admission time and APNs acceptance per registration. Confirm only matching completed responses, preserve acceptance across same-environment renewals, and expose aggregate confirmation counts in local statistics. Older records migrate to format 3 as unconfirmed; downgrades require a pre-upgrade registry backup.
+- Cap unconfirmed admission at 1000 registrations and expire it after a fixed 60 days. Renewal does not extend that deadline; expired records are excluded from reads and sends before periodic cleanup. Accepted registrations retain normal renewal, while an environment change requires a provisional slot. Preserve existing unexpired records above a lowered cap and reclaim expired capacity before admitting new registrations.
 - Bound statistics ingress and weekly version dimensions; recover valid stored counters and metadata safely.
 - Share bounded fetch workers, deadlines, admission and failure backoff between reads and polling. Consume each successful response generation once and preserve the last usable response when a refresh fails.
 - Recheck directory freshness on every read, reject unusable Mainframe responses, and revalidate directory/summary responses.

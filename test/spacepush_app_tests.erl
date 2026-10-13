@@ -14,6 +14,7 @@ app_test_() ->
             ?_test(all_children_running()),
             ?_assertEqual({200, <<"ok">>}, request(get, Port, "/health")),
             ?_test(register_and_unregister(Port)),
+            ?_test(unconfirmed_admission_over_http(Port)),
             ?_test(empty_subscriptions_unregister_without_directory(Port)),
             ?_test(rejects_percent_decoded_token_bytes(Port)),
             ?_assertEqual(400, status(request(put, Port, "/v1/devices/xyz", <<"{}">>))),
@@ -81,6 +82,27 @@ register_and_unregister(Port) ->
     ?assertMatch([{_, sandbox, _}], spacepush_registry:subscribers(?TOPIC)),
     ?assertEqual(204, status(request(delete, Port, "/v1/devices/" ?TOKEN))),
     ?assertEqual([], spacepush_registry:subscribers(?TOPIC)).
+
+unconfirmed_admission_over_http(Port) ->
+    {ok, OldCap} = application:get_env(spacepush, max_unconfirmed_registrations),
+    Second = binary:copy(<<"cd">>, 32),
+    FirstPath = "/v1/devices/" ?TOKEN,
+    SecondPath = "/v1/devices/" ++ binary_to_list(Second),
+    application:set_env(spacepush, max_unconfirmed_registrations, 1),
+    try
+        ?assertEqual(204, status(request(put, Port, FirstPath, registration(?NERD2NERD)))),
+        ?assertEqual(503, status(request(put, Port, SecondPath, registration(?NERD2NERD)))),
+        %% Renewal does not need an additional slot.
+        ?assertEqual(204, status(request(put, Port, FirstPath, registration(?NERD2NERD)))),
+        Empty = iolist_to_binary(json:encode(#{<<"environment">> => <<"sandbox">>, <<"subscriptions">> => []})),
+        ?assertEqual(204, status(request(put, Port, FirstPath, Empty))),
+        ?assertEqual(204, status(request(put, Port, SecondPath, registration(?NERD2NERD)))),
+        ?assertEqual(204, status(request(delete, Port, SecondPath)))
+    after
+        application:set_env(spacepush, max_unconfirmed_registrations, OldCap),
+        spacepush_registry:unregister(list_to_binary(?TOKEN)),
+        spacepush_registry:unregister(Second)
+    end.
 
 empty_subscriptions_unregister_without_directory(Port) ->
     Path = "/v1/devices/" ?TOKEN,

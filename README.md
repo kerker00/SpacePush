@@ -41,12 +41,13 @@ Statistics recovery keeps valid recent calendar dates and nonnegative integer co
 
 Registry recovery validates tokens, environments, topics, versions and platforms; supported older formats are migrated, while malformed or empty registrations are removed. Outbox recovery removes malformed delivery records, checks their identity, payload and collapse id, and keeps valid work across restarts. Delivery payloads are bounded to 4096 bytes. Diagnostics report error categories or dropped counts, without complete registration/delivery records or device tokens.
 
-Registration format 3 also retains the first admission time and APNs acceptance.
+Registration format 3 also retains the provisional admission time and APNs acceptance.
 Only a complete HTTP 200 response for the current token, environment and
 registration version marks it accepted. Failures, dry runs and late responses
 for replaced registrations do not. Acceptance survives renewal in the same
 environment and restart; switching environment resets it. The local statistics
 expose `devices.by_confirmation` as `accepted_by_apns` or `unconfirmed`.
+They also report `devices.unconfirmed_cap` (at most the total registration cap).
 APNs acceptance does not prove receipt by the device or a genuine app installation.
 Older records migrate as unconfirmed with their saved registration time. Back up
 the registry before upgrading; older releases do not understand format 3 and
@@ -113,6 +114,23 @@ Unknown endpoints answer `404`; a space that cannot be fetched and has nothing c
 
 `GET /health` answers `200` for uptime checks. Requests are limited per client and minute: 30 writes and 300 reads by default. At most 10 000 devices can be registered; registrations not renewed within 60 days expire, and the apps renew on every launch.
 
+At most 1 000 registrations may be admitted without APNs acceptance. Unconfirmed
+registrations additionally expire exactly 60 days after their admission, even
+when renewed or switched between environments. An accepted registration renews
+under the normal inactivity rule. Switching an accepted registration to another
+APNs environment needs an available unconfirmed slot and starts a fresh 60-day
+provisional window; refusal leaves its current registration intact. Exhausting
+either admission cap answers 503. Empty subscriptions and deletion release a slot.
+
+Expired records are hidden from lookups, statistics, polling subscriptions and
+delivery selection immediately. Disk cleanup runs at startup, hourly and before
+new admission. Existing unexpired records above a lowered cap are retained and
+can renew without extending their provisional deadline; further admission waits
+for capacity. Legacy records use their saved registration time as admission time,
+and restarting does not reset the deadline. A legitimate subscription with no
+accepted notification also expires; a later app launch may register it again
+subject to capacity. APNs acceptance frees its provisional slot.
+
 ## Statistics
 
 For monitoring, SpacePush keeps daily usage statistics and serves them as JSON on the server itself:
@@ -140,7 +158,8 @@ Spaces run their own endpoints, and clients are anonymous, so SpacePush treats b
 - Passed-through documents are served with `X-Content-Type-Options: nosniff`.
 - Behind the proxy, the rate limit uses the last `X-Forwarded-For` entry, the one the proxy added. The listener accepts at most 1024 connections.
 
-Not covered: a botnet registering many devices can fill the registry (Apple's App Attest would tie registrations to genuine app installs), and spaces that only offer plain HTTP can be altered in transit.
+Clients remain anonymous; APNs acceptance does not establish installation
+authenticity. Space endpoints that offer plain HTTP lack authenticated transport.
 
 ## Notifications
 
@@ -179,6 +198,7 @@ All settings live in the `spacepush` application environment (see `src/spacepush
 | `notification_cooldown_ms` | Minimum time from the last dispatch attempt to a new state for the same device and room; retries of the same delivery use their own backoff. Kept in memory, reset on restart |
 | `rate_limit_per_minute`, `read_rate_limit_per_minute`, `http_max_connections` | Limits for clients |
 | `max_registrations`, `registration_ttl_days` | Cap and expiry for device registrations |
+| `max_unconfirmed_registrations`, `unconfirmed_registration_ttl_days` | Additional admission cap (1000) and fixed lifetime from provisional admission (60 days); renewals do not extend it |
 | `delivery_ttl_ms` | How long a delivery is retried (also sent as `apns-expiration`) |
 | `apns_max_in_flight`, `apns_request_timeout_ms` | Concurrent APNs requests and their deadline |
 | `registry_file`, `outbox_file`, `tracker_file`, `directory_file`, `stats_file` | Where state is kept on disk |
