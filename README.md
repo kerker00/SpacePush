@@ -147,7 +147,7 @@ All settings live in the `spacepush` application environment (see `src/spacepush
 | `fetch_concurrency`, `fetch_timeout_ms`, `max_body_bytes` | Limits for fetching spaces |
 | `fetch_min_interval_ms`, `fetch_backoff_max_ms` | Shared minimum time between attempts per endpoint, and maximum failure backoff |
 | `cache_max_age_ms`, `on_demand_fetch_limit`, `on_demand_waiter_limit` | Freshness of read API answers, combined parallel refreshes and total waiting callers |
-| `notification_cooldown_ms` | Minimum time between notifications for one space or room |
+| `notification_cooldown_ms` | Minimum time from the last dispatch attempt to a new state for the same device and room; retries of the same delivery use their own backoff. Kept in memory, reset on restart |
 | `rate_limit_per_minute`, `read_rate_limit_per_minute`, `http_max_connections` | Limits for clients |
 | `max_registrations`, `registration_ttl_days` | Cap and expiry for device registrations |
 | `delivery_ttl_ms` | How long a delivery is retried (also sent as `apns-expiration`) |

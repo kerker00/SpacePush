@@ -33,7 +33,11 @@ outbox_test_() ->
             fun expired_is_dropped/0,
             fun survives_restart/0,
             fun sent_topic_waits_for_cooldown/0,
-            fun changes_within_cooldown_merge/0
+            fun changes_within_cooldown_merge/0,
+            fun replacements_do_not_reserve_extra_intervals/0,
+            fun retries_use_their_own_backoff/0,
+            fun stale_selection_cannot_begin_attempt/0,
+            fun another_device_has_its_own_cooldown/0
         ]}.
 
 start(Module) ->
@@ -127,12 +131,14 @@ retry_postpones() ->
 in_flight_key_holds_back_successor() ->
     ok = spacepush_outbox:enqueue([change(open)]),
     [#{key := Key, id := OpenId}] = spacepush_outbox:due(now_ms(), [], 10),
+    Attempted = now_ms(),
+    ok = spacepush_outbox:begin_attempt(Key, OpenId, Attempted),
     ok = spacepush_outbox:enqueue([change(closed)]),
     ?assertEqual([], spacepush_outbox:due(now_ms(), [Key], 10)),
-    %% The late result for "open" leaves "closed" in place, which is due once the key is free.
+    %% The late result leaves the successor queued until the dispatch cooldown.
     ok = spacepush_outbox:complete(Key, OpenId),
-    ?assertMatch([#{key := Key}], spacepush_outbox:due(now_ms(), [], 10)),
-    [Closed] = spacepush_outbox:due(now_ms(), [], 10),
+    ?assertEqual([], spacepush_outbox:due(Attempted + 299999, [], 10)),
+    [Closed] = spacepush_outbox:due(Attempted + 300000, [], 10),
     ?assertEqual(<<"closed">>, state(Closed)).
 
 expired_is_dropped() ->
@@ -151,6 +157,7 @@ survives_restart() ->
 sent_topic_waits_for_cooldown() ->
     ok = spacepush_outbox:enqueue([change(open)]),
     [#{key := Key, id := Id}] = spacepush_outbox:due(now_ms(), [], 10),
+    ok = spacepush_outbox:begin_attempt(Key, Id, now_ms()),
     ok = spacepush_outbox:complete(Key, Id),
     ok = spacepush_outbox:enqueue([change(closed)]),
     ?assertEqual([], spacepush_outbox:due(now_ms(), [], 10)),
@@ -160,8 +167,55 @@ sent_topic_waits_for_cooldown() ->
 changes_within_cooldown_merge() ->
     ok = spacepush_outbox:enqueue([change(open)]),
     [#{key := Key, id := Id}] = spacepush_outbox:due(now_ms(), [], 10),
+    ok = spacepush_outbox:begin_attempt(Key, Id, now_ms()),
     ok = spacepush_outbox:complete(Key, Id),
     ok = spacepush_outbox:enqueue([change(closed)]),
     ok = spacepush_outbox:enqueue([change(open)]),
     [Pending] = spacepush_outbox:due(now_ms() + 300000, [], 10),
     ?assertEqual(<<"open">>, state(Pending)).
+
+replacements_do_not_reserve_extra_intervals() ->
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [#{key := Key, id := Id}] = spacepush_outbox:due(now_ms(), [], 10),
+    At = now_ms(),
+    ok = spacepush_outbox:begin_attempt(Key, Id, At),
+    ok = spacepush_outbox:complete(Key, Id),
+    [ok = spacepush_outbox:enqueue([change(State)]) || State <- [closed, member, open_plus]],
+    ?assertEqual([], spacepush_outbox:due(At + 299999, [], 10)),
+    [#{id := LatestId} = Latest] = spacepush_outbox:due(At + 300000, [], 10),
+    ?assertEqual(<<"open_plus">>, state(Latest)),
+    ok = spacepush_outbox:begin_attempt(Key, LatestId, At + 300000),
+    ok = spacepush_outbox:complete(Key, LatestId),
+    ok = spacepush_outbox:enqueue([change(closed)]),
+    ?assertMatch([#{key := Key}], spacepush_outbox:due(At + 600000, [], 10)).
+
+retries_use_their_own_backoff() ->
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [#{key := Key, id := Id}] = spacepush_outbox:due(now_ms(), [], 10),
+    At = now_ms(),
+    ok = spacepush_outbox:begin_attempt(Key, Id, At),
+    ok = spacepush_outbox:retry(Key, Id, At + 5000),
+    ?assertEqual([], spacepush_outbox:due(At + 4999, [], 10)),
+    ?assertMatch([#{id := Id}], spacepush_outbox:due(At + 5000, [], 10)),
+    ok = spacepush_outbox:begin_attempt(Key, Id, At + 5000),
+    ok = spacepush_outbox:enqueue([change(closed)]),
+    ?assertEqual([], spacepush_outbox:due(At + 304999, [], 10)),
+    ?assertMatch([#{key := Key}], spacepush_outbox:due(At + 305000, [], 10)).
+
+stale_selection_cannot_begin_attempt() ->
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [#{key := Key, id := OldId}] = spacepush_outbox:due(now_ms(), [], 10),
+    ok = spacepush_outbox:enqueue([change(closed)]),
+    ?assertEqual(skipped, spacepush_outbox:begin_attempt(Key, OldId, now_ms())),
+    [#{id := NewId}] = spacepush_outbox:due(now_ms(), [], 10),
+    ?assertEqual(ok, spacepush_outbox:begin_attempt(Key, NewId, now_ms())).
+
+another_device_has_its_own_cooldown() ->
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [#{key := Key, id := Id}] = spacepush_outbox:due(now_ms(), [], 10),
+    ok = spacepush_outbox:begin_attempt(Key, Id, now_ms()),
+    ok = spacepush_outbox:complete(Key, Id),
+    ok = spacepush_registry:register(token(2), production, [?A]),
+    ok = spacepush_outbox:enqueue([change(closed)]),
+    [#{token := Token}] = spacepush_outbox:due(now_ms(), [], 10),
+    ?assertEqual(token(2), Token).

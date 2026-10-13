@@ -20,8 +20,9 @@ What happens to a delivery depends on the result (see `classify/2`):
 
 - `delivered` and `drop`: removed from the outbox
 - `invalid_token`: removed, together with the registration it was sent for
-- `retry` and `renew_token` (429, 5xx, timeout, lost connection, expired
-  provider token): retried with exponential backoff until it expires
+- `retry` and `renew_token` (429, timeout, lost connection, expired provider
+  token): retried with exponential backoff until it expires; 5xx responses
+  wait at least 15 minutes, as Apple specifies
 - `invalid_provider_token` (wrong key, key ID or team, or a key not valid
   for this environment): logged as a configuration error; the environment
   pauses for 20 minutes and then tries once more with a fresh token
@@ -43,6 +44,7 @@ Without any key, deliveries are only logged.
 -define(TICK_MS, 1000).
 -define(BASE_BACKOFF_MS, 5000).
 -define(MAX_BACKOFF_MS, 300000).
+-define(SERVER_ERROR_RETRY_MS, 15 * 60 * 1000).
 
 -type result() :: delivered | invalid_token | renew_token | invalid_provider_token | retry | drop.
 -type environment() :: spacepush_registry:environment().
@@ -272,17 +274,21 @@ send_when_up(#{key := Key, id := Id, environment := Environment} = Delivery, #{k
                 {down, State1} -> State1
             end;
         _ ->
-            #{payload := Payload} = Delivery,
-            ?LOG_INFO(#{msg => dry_run_delivery, environment => Environment, payload => Payload}),
-            spacepush_stats:count(<<"push.dry_run">>),
-            spacepush_outbox:complete(Key, Id),
+            case spacepush_outbox:begin_attempt(Key, Id, Now) of
+                skipped -> ok;
+                ok ->
+                    #{payload := Payload} = Delivery,
+                    ?LOG_INFO(#{msg => dry_run_delivery, environment => Environment, payload => Payload}),
+                    spacepush_stats:count(<<"push.dry_run">>),
+                    spacepush_outbox:complete(Key, Id)
+            end,
             State0
     end.
 
 send(Delivery, Connection, State0) ->
-    #{token := Token, payload := Payload, collapse_id := CollapseId, expires := Expires, environment := Environment} = Delivery,
+    #{key := Key, id := Id, token := Token, collapse_id := CollapseId, expires := Expires, environment := Environment} = Delivery,
     {ProviderToken, State2} = provider_token(Environment, State0),
-    #{topic := Topic, request_timeout_ms := Timeout, in_flight := InFlight} = State2,
+    #{topic := Topic, request_timeout_ms := Timeout} = State2,
     Headers = [
         {<<"authorization">>, <<"bearer ", ProviderToken/binary>>},
         {<<"apns-topic">>, Topic},
@@ -291,6 +297,13 @@ send(Delivery, Connection, State0) ->
         {<<"apns-expiration">>, integer_to_binary(Expires div 1000)},
         {<<"apns-collapse-id">>, CollapseId}
     ],
+    case spacepush_outbox:begin_attempt(Key, Id, erlang:system_time(millisecond)) of
+        ok -> post(Delivery, Connection, Headers, Token, Timeout, State2);
+        skipped -> State2
+    end.
+
+post(#{environment := Environment, payload := Payload} = Delivery, Connection, Headers, Token, Timeout,
+    #{in_flight := InFlight} = State2) ->
     try gun:post(Connection, <<"/3/device/", Token/binary>>, Headers, Payload) of
         Ref ->
             Request = #{
@@ -345,7 +358,7 @@ finish(#{delivery := Delivery, status := Status, body := Body}, State) ->
             pause(Environment, Delivery, State);
         retry ->
             ?LOG_WARNING(#{msg => apns_temporary_failure, status => Status, reason => Reason}),
-            schedule_retry(Delivery),
+            schedule_retry(Delivery, Status),
             State;
         drop ->
             ?LOG_ERROR(#{msg => apns_rejected_delivery, status => Status, reason => Reason}),
@@ -368,6 +381,11 @@ fail_requests(Refs, Reason, #{in_flight := InFlight} = State) ->
 
 schedule_retry(#{key := Key, id := Id, attempts := Attempts}) ->
     spacepush_outbox:retry(Key, Id, erlang:system_time(millisecond) + backoff_ms(Attempts)).
+
+schedule_retry(#{key := Key, id := Id, attempts := Attempts}, Status) when Status >= 500, Status < 600 ->
+    Delay = max(?SERVER_ERROR_RETRY_MS, backoff_ms(Attempts)),
+    spacepush_outbox:retry(Key, Id, erlang:system_time(millisecond) + Delay);
+schedule_retry(Delivery, _Status) -> schedule_retry(Delivery).
 
 error_details(Body) ->
     try json:decode(Body) of

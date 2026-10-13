@@ -56,7 +56,11 @@ dispatch_test_() ->
         fun paused_environment_does_not_starve_ready_environment/0,
         fun both_environments_receive_capacity/0,
         fun one_slot_alternates_between_ready_environments/0,
-        fun selects_the_current_registration_environment/0
+        fun selects_the_current_registration_environment/0,
+        fun server_errors_wait_fifteen_minutes/0,
+        fun rate_limits_keep_exponential_backoff/0,
+        fun short_lived_server_errors_expire_without_early_retry/0,
+        fun sender_holds_in_flight_successor_until_cooldown/0
     ]}.
 
 setup_dispatch() ->
@@ -210,3 +214,50 @@ selects_the_current_registration_environment() ->
     [#{delivery := #{environment := production}}] = maps:values(maps:get(in_flight, Sent)),
     finish_only_request(Sent),
     ?assertEqual(0, spacepush_outbox:pending()).
+
+send_and_respond(Status) ->
+    ok = spacepush_registry:register(token(1), sandbox, [topic()]),
+    ok = spacepush_outbox:enqueue([{topic(), <<"Test">>, closed, open}]),
+    {noreply, Sent} = spacepush_apns:handle_cast(wake, sender_state(self())),
+    [Ref] = maps:keys(maps:get(in_flight, Sent)),
+    {noreply, Completed} = spacepush_apns:handle_info({gun_response, self(), Ref, fin, Status, []}, Sent),
+    ?assertEqual(#{}, maps:get(in_flight, Completed)).
+
+server_errors_wait_fifteen_minutes() ->
+    application:set_env(spacepush, delivery_ttl_ms, 3600000),
+    lists:foreach(fun(Status) ->
+        Before = erlang:system_time(millisecond),
+        send_and_respond(Status),
+        ?assertEqual([], spacepush_outbox:due(Before + 899999, [], 10)),
+        [#{key := Key, id := Id, attempts := 1}] = spacepush_outbox:due(erlang:system_time(millisecond) + 900000, [], 10),
+        ok = spacepush_outbox:complete(Key, Id)
+    end, [500, 503]).
+
+rate_limits_keep_exponential_backoff() ->
+    Before = erlang:system_time(millisecond),
+    send_and_respond(429),
+    ?assertEqual([], spacepush_outbox:due(Before + 4999, [], 10)),
+    ?assertMatch([#{attempts := 1}], spacepush_outbox:due(erlang:system_time(millisecond) + 5000, [], 10)).
+
+short_lived_server_errors_expire_without_early_retry() ->
+    application:set_env(spacepush, delivery_ttl_ms, 60000),
+    Before = erlang:system_time(millisecond),
+    send_and_respond(503),
+    ?assertEqual([], spacepush_outbox:due(Before + 59999, [], 10)),
+    ?assertEqual([], spacepush_outbox:due(erlang:system_time(millisecond) + 60000, [], 10)),
+    ?assertEqual(0, spacepush_outbox:pending()).
+
+sender_holds_in_flight_successor_until_cooldown() ->
+    application:set_env(spacepush, notification_cooldown_ms, 300000),
+    ok = spacepush_registry:register(token(1), sandbox, [topic()]),
+    ok = spacepush_outbox:enqueue([{topic(), <<"Test">>, closed, open}]),
+    {noreply, Sent} = spacepush_apns:handle_cast(wake, sender_state(self())),
+    [Ref] = maps:keys(maps:get(in_flight, Sent)),
+    ok = spacepush_outbox:enqueue([{topic(), <<"Test">>, open, closed}]),
+    {noreply, Completed} = spacepush_apns:handle_info({gun_response, self(), Ref, fin, 200, []}, Sent),
+    {noreply, Waiting} = spacepush_apns:handle_cast(wake, Completed),
+    ?assertEqual(#{}, maps:get(in_flight, Waiting)),
+    ?assertEqual(1, spacepush_outbox:pending()),
+    ?assertEqual([], spacepush_outbox:due(erlang:system_time(millisecond), [], 10)),
+    ?assertMatch([#{payload := _}], spacepush_outbox:due(erlang:system_time(millisecond) + 300000, [], 10)),
+    ?assertEqual({noreply, Waiting}, spacepush_apns:handle_info({gun_response, self(), Ref, fin, 200, []}, Waiting)).
