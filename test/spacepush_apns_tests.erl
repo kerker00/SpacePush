@@ -124,7 +124,12 @@ synchronous_send_failure_is_isolated() ->
              Token =:= token(1)
     ],
     %% A malformed persisted header triggers Gun's synchronous validation.
-    replace_delivery(Key, Delivery#{collapse_id := <<"invalid\n">>}),
+    %% Startup now rejects this record; inject runtime corruption to retain
+    %% coverage of the synchronous Gun failure boundary independently.
+    sys:replace_state(spacepush_outbox, fun(OutboxState) ->
+        true = ets:insert(spacepush_outbox_entries, {Key, Delivery#{collapse_id := <<"invalid\n">>}}),
+        OutboxState
+    end),
     %% Production has no key and completes via dry-run without any network.
     State = sender_state(self()),
     {noreply, Updated} = spacepush_apns:handle_cast(wake, State),

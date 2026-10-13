@@ -182,17 +182,23 @@ including an unknown format version, gives an empty tracker.
 """.
 -spec restore(term()) -> tracker().
 restore({tracker, 1, Tracker}) when is_map(Tracker) ->
-    maps:filter(fun valid_entry/2, Tracker);
+    maps:fold(fun(Topic, Entry, Acc) ->
+        case valid_entry(Topic, Entry) of
+            true -> Acc#{Topic => maps:with([confirmed, candidate], Entry)};
+            false -> Acc
+        end
+    end, #{}, Tracker);
 restore(_) ->
     #{}.
 
 valid_entry({Endpoint, Room}, #{confirmed := Confirmed, candidate := Candidate}) when
     is_binary(Endpoint), is_binary(Room)
 ->
-    lists:member(Confirmed, ?STATES) andalso valid_candidate(Candidate);
+    spacepush_persist:topic({Endpoint, Room}) andalso
+        lists:member(Confirmed, ?STATES) andalso valid_candidate(Candidate);
 valid_entry(_Topic, _Entry) ->
     false.
 
 valid_candidate(none) -> true;
-valid_candidate({State, Since}) when is_integer(Since) -> lists:member(State, ?STATES);
+valid_candidate({State, Since}) when is_integer(Since), Since >= 0, Since =< 253402300799 -> lists:member(State, ?STATES);
 valid_candidate(_) -> false.

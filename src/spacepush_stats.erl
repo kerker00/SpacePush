@@ -136,15 +136,7 @@ init([]) ->
     {ok, File} = application:get_env(spacepush, stats_file),
     Today = today(),
     State0 =
-        case spacepush_store:load(File, none) of
-            {stats, 2, Days, Weeks, LastSuccess} ->
-                #{days => Days, weeks => Weeks, last_success => LastSuccess};
-            %% Format 1 kept hashed install IDs; only the counters are carried over.
-            {stats, 1, _Salt, Days, _Installs, _Uniques, LastSuccess, _Processed} ->
-                #{days => Days, weeks => #{}, last_success => LastSuccess};
-            _ ->
-                #{days => #{}, weeks => #{}, last_success => #{}}
-        end,
+        restore(spacepush_store:load(File, none), Today),
     Limits = #{
         <<"versions">> => limit(stats_max_versions),
         <<"platforms">> => 3,
@@ -266,7 +258,7 @@ compact_week(_Week, Limits) ->
 compact_counts(Group, Counts, Limit) when is_map(Counts) ->
     maps:fold(
         fun
-            (Key, N, Acc) when is_integer(N), N >= 0 ->
+            (Key, N, Acc) when is_integer(N), N >= 0, N =< 16#7fffffffffffffff ->
                 Bucket = case valid_bucket(Group, Key) of true -> Key; false -> <<"other">> end,
                 tally(Bucket, N, Acc, Limit);
             (_Key, _N, Acc) -> Acc
@@ -280,9 +272,40 @@ compact_counts(_Group, _Counts, _Limit) ->
 valid_bucket(<<"platforms">>, Key) ->
     lists:member(Key, [<<"iOS">>, <<"iPadOS">>, <<"macOS">>, <<"other">>]);
 valid_bucket(<<"versions">>, Key) ->
-    is_binary(Key) andalso byte_size(Key) > 0 andalso byte_size(Key) =< 16;
+    spacepush_persist:text(Key, 16);
 valid_bucket(<<"os_versions">>, Key) ->
-    is_binary(Key) andalso byte_size(Key) > 0 andalso byte_size(Key) =< 32.
+    spacepush_persist:text(Key, 32).
+
+restore({stats, 2, Days, Weeks, LastSuccess}, Today) ->
+    #{days => restore_days(Days, Today), weeks => map_or_empty(Weeks), last_success => restore_success(LastSuccess)};
+restore({stats, 1, _Salt, Days, _Installs, _Uniques, LastSuccess, _Processed}, Today) ->
+    restore({stats, 2, Days, #{}, LastSuccess}, Today);
+restore(_, _Today) -> #{days => #{}, weeks => #{}, last_success => #{}}.
+
+map_or_empty(Map) when is_map(Map) -> Map;
+map_or_empty(_) -> #{}.
+
+restore_days(Days, Today) ->
+    Cutoff = add_days(Today, -?COUNTER_DAYS),
+    maps:fold(fun(Date, Counters, Acc) ->
+        case valid_date(Date) andalso Date >= Cutoff andalso Date =< Today andalso is_map(Counters) of
+            true ->
+                Good = [{Key, N} || {Key, N} <- lists:sort(maps:to_list(Counters)),
+                    spacepush_persist:text(Key, 128), spacepush_persist:counter(N)],
+                Acc#{Date => maps:from_list(lists:sublist(Good, 256))};
+            false -> Acc
+        end
+    end, #{}, map_or_empty(Days)).
+
+valid_date({Y, M, D} = Date) when is_integer(Y), Y >= 1, Y =< 9999, is_integer(M), is_integer(D) ->
+    calendar:valid_date(Date);
+valid_date(_) -> false.
+
+restore_success(Success) ->
+    Now = erlang:system_time(millisecond),
+    Good = [{Source, At} || {Source, At} <- lists:sort(maps:to_list(map_or_empty(Success))),
+        spacepush_persist:text(Source, 64), is_integer(At), At >= 0, At =< Now],
+    maps:from_list(lists:sublist(Good, 32)).
 
 limit(Key) ->
     {ok, Value} = application:get_env(spacepush, Key),

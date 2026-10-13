@@ -37,7 +37,8 @@ outbox_test_() ->
             fun replacements_do_not_reserve_extra_intervals/0,
             fun retries_use_their_own_backoff/0,
             fun stale_selection_cannot_begin_attempt/0,
-            fun another_device_has_its_own_cooldown/0
+            fun another_device_has_its_own_cooldown/0,
+            fun malformed_saved_deliveries_are_removed/0
         ]}.
 
 start(Module) ->
@@ -219,3 +220,31 @@ another_device_has_its_own_cooldown() ->
     ok = spacepush_outbox:enqueue([change(closed)]),
     [#{token := Token}] = spacepush_outbox:due(now_ms(), [], 10),
     ?assertEqual(token(2), Token).
+
+malformed_saved_deliveries_are_removed() ->
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [Good] = spacepush_outbox:due(now_ms(), [], 10),
+    gen_server:stop(spacepush_outbox),
+    {ok, File} = application:get_env(spacepush, outbox_file),
+    {ok, invalid_fixture} = dets:open_file(invalid_fixture, [{file, File}, {type, set}]),
+    Variants = [#{environment => garbage}, #{payload => []}, #{collapse_id => <<"bad\n">>},
+        #{attempts => -1}, #{id => bad}, #{version => 1 bsl 128}, #{not_before => []},
+        #{payload => binary:copy(<<"a">>, 4097)}],
+    Bad = [begin
+        Token = token(N + 1), Key = {Token, ?A},
+        {Key, maps:merge(Good#{key := Key, token := Token}, Fields)}
+    end || {N, Fields} <- lists:zip(lists:seq(1, length(Variants)), Variants)],
+    Missing = maps:remove(expires, Good#{key := {token(10), ?A}, token := token(10)}),
+    ok = dets:insert(invalid_fixture, Bad ++ [{{token(10), ?A}, Missing}, {<<"unknown">>},
+        {maps:get(key, Good), Good#{unwanted => <<"discard">>}}]),
+    ok = dets:close(invalid_fixture),
+    start(spacepush_outbox),
+    ?assertEqual([Good], spacepush_outbox:due(now_ms(), [], 10)),
+    ?assertEqual(1, spacepush_outbox:pending()),
+    gen_server:stop(spacepush_outbox),
+    {ok, invalid_fixture} = dets:open_file(invalid_fixture, [{file, File}, {type, set}]),
+    ?assertEqual(1, dets:info(invalid_fixture, size)),
+    ?assertEqual([{maps:get(key, Good), Good}], dets:lookup(invalid_fixture, maps:get(key, Good))),
+    ok = dets:close(invalid_fixture),
+    start(spacepush_outbox),
+    ?assertEqual([Good], spacepush_outbox:due(now_ms(), [], 10)).

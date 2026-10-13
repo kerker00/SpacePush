@@ -92,18 +92,29 @@ retry(Key, Id, NotBefore) ->
 init([]) ->
     process_flag(trap_exit, true),
     {ok, File} = application:get_env(spacepush, outbox_file),
-    ok = filelib:ensure_dir(File),
-    {ok, ?DETS} = dets:open_file(?DETS, [{file, File}, {type, set}]),
+    ok = spacepush_persist:open_dets(?DETS, File),
     ets:new(?TABLE, [named_table, protected, set]),
     Applied = case dets:lookup(?DETS, ?COMMIT) of
         [] -> none;
         [{?COMMIT, {outbox_commit, 1, Id}}] when is_binary(Id), byte_size(Id) =:= 16 -> Id;
         _ -> error(invalid_outbox_commit)
     end,
-    ok = dets:foldl(fun
-        ({?COMMIT, _}, ok) -> ok;
-        (Record, ok) -> true = ets:insert(?TABLE, Record), ok
-    end, ok, ?DETS),
+    Records = dets:foldl(fun(Record, Acc) -> [Record | Acc] end, [], ?DETS),
+    Dropped = lists:foldl(fun
+        ({?COMMIT, _}, Count) -> Count;
+        (Record, Count) ->
+            case valid_record(Record) of
+                true ->
+                    {Key, Delivery} = Record,
+                    Canonical = canonical(Delivery),
+                    true = ets:insert(?TABLE, {Key, Canonical}),
+                    Canonical =/= Delivery andalso save(Canonical),
+                    Count;
+                false -> ok = dets:delete_object(?DETS, Record), Count + 1
+            end
+    end, 0, Records),
+    Dropped > 0 andalso ?LOG_WARNING(#{msg => invalid_deliveries_dropped, count => Dropped}),
+    sync(),
     State = #{slots => #{}, applied_commit => Applied},
     {ok, TrackerFile} = application:get_env(spacepush, tracker_file),
     %% Complete a possibly partial batch before the supervisor starts APNs.
@@ -112,6 +123,32 @@ init([]) ->
         {CommitId, _Snapshot, Changes} -> commit_changes(CommitId, Changes, State)
     end,
     {ok, Recovered}.
+
+canonical(Delivery) ->
+    maps:with([key, id, token, environment, version, payload, collapse_id, attempts, not_before, expires], Delivery).
+
+valid_record({{Token, Topic} = Key, #{key := Key, token := Token, id := {At, Sequence},
+    environment := Environment, version := Version, payload := Payload, collapse_id := Collapse,
+    attempts := Attempts, not_before := NotBefore, expires := Expires}}) ->
+    spacepush_device:valid_token(Token) andalso spacepush_persist:topic(Topic) andalso
+        spacepush_persist:counter(At) andalso spacepush_persist:counter(Sequence) andalso Sequence > 0 andalso
+        (Environment =:= sandbox orelse Environment =:= production) andalso
+        spacepush_persist:counter(Version) andalso spacepush_persist:counter(Attempts) andalso
+        spacepush_persist:counter(NotBefore) andalso spacepush_persist:counter(Expires) andalso
+        Collapse =:= spacepush_notification:collapse_id(Topic) andalso valid_payload(Payload, Topic);
+valid_record(_) -> false.
+
+valid_payload(Payload, {Endpoint, Room}) ->
+    case spacepush_persist:text(Payload, 4096) of
+        false -> false;
+        true ->
+            try json:decode(Payload) of
+                #{<<"endpoint">> := Endpoint, <<"room">> := Room, <<"state">> := State,
+                    <<"aps">> := #{<<"alert">> := Alert}} when is_map(Alert) ->
+                    lists:member(State, [<<"open">>, <<"closed">>, <<"keyholder">>, <<"member">>, <<"open_plus">>, <<"closing">>]);
+                _ -> false
+            catch error:_ -> false end
+    end.
 
 handle_call({enqueue, Changes}, _From, State) ->
     {Count, State1} = enqueue_changes(Changes, plain, State),
