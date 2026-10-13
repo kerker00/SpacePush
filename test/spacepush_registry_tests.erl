@@ -18,6 +18,8 @@ registry_test_() ->
         [
             fun lookup/0,
             fun reregister_replaces_topics/0,
+            fun renewal_remains_visible_during_publication/0,
+            fun topic_changes_publish_with_the_registration/0,
             fun late_invalid_token_keeps_new_registration/0,
             fun invalid_token_needs_matching_environment/0,
             fun invalid_token_respects_timestamp/0,
@@ -59,6 +61,74 @@ reregister_replaces_topics() ->
     ok = spacepush_registry:register(token(1), production, [?B]),
     ?assertEqual([], spacepush_registry:subscribers(?A)),
     ?assertMatch([{_, production, _}], spacepush_registry:subscribers(?B)).
+
+with_paused_renewal(Environment, Topics, Before, After) ->
+    Parent = self(),
+    Registry = whereis(spacepush_registry),
+    application:set_env(spacepush, registry_publication_hook, fun(Stage) ->
+        Parent ! {publication, Stage, self()},
+        receive continue_publication -> ok after 2000 -> error(publication_not_resumed) end
+    end),
+    {Worker, Monitor} = spawn_monitor(fun() ->
+        Result = spacepush_registry:register(token(1), Environment, Topics),
+        Parent ! {renewal_result, self(), Result}
+    end),
+    try
+        receive {publication, indexed, Registry} -> ok after 2000 -> error(index_not_prepared) end,
+        Before(),
+        Registry ! continue_publication,
+        receive {publication, published, Registry} -> ok after 2000 -> error(registration_not_published) end,
+        After(),
+        Registry ! continue_publication,
+        receive {renewal_result, Worker, Result} -> ?assertEqual(ok, Result) after 2000 -> error(renewal_not_finished) end,
+        receive {'DOWN', Monitor, process, Worker, Reason} -> ?assertEqual(normal, Reason) after 2000 -> error(worker_not_finished) end
+    after
+        application:unset_env(spacepush, registry_publication_hook),
+        Registry ! continue_publication,
+        Registry ! continue_publication
+    end.
+
+renewal_remains_visible_during_publication() ->
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    {ok, sandbox, [?A], OldVersion} = spacepush_registry:lookup(token(1)),
+    {ok, Outbox} = spacepush_outbox:start_link(),
+    unlink(Outbox),
+    try
+        ok = spacepush_outbox:enqueue([{?A, <<"A">>, closed, open}]),
+        with_paused_renewal(sandbox, [?A], fun() ->
+            ?assertEqual({ok, sandbox, [?A], OldVersion}, spacepush_registry:lookup(token(1))),
+            ?assertEqual([{token(1), sandbox, OldVersion}], spacepush_registry:subscribers(?A)),
+            %% A confirmed change during publication must still fan out.
+            ok = spacepush_outbox:enqueue([{?A, <<"A">>, open, closed}]),
+            [#{payload := Payload}] = spacepush_outbox:due(erlang:system_time(millisecond), [], 10),
+            ?assertMatch(#{<<"state">> := <<"closed">>}, json:decode(Payload))
+        end, fun() ->
+            {ok, sandbox, [?A], NewVersion} = spacepush_registry:lookup(token(1)),
+            ?assert(NewVersion > OldVersion),
+            ?assertEqual([{token(1), sandbox, NewVersion}], spacepush_registry:subscribers(?A)),
+            ?assertEqual(1, spacepush_outbox:pending())
+        end)
+    after gen_server:stop(spacepush_outbox) end,
+    stop(),
+    start(),
+    ?assertMatch({ok, sandbox, [?A], _}, spacepush_registry:lookup(token(1))).
+
+topic_changes_publish_with_the_registration() ->
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    with_paused_renewal(production, [?B, ?B], fun() ->
+        ?assertMatch({ok, sandbox, [?A], _}, spacepush_registry:lookup(token(1))),
+        ?assertMatch([{_, sandbox, _}], spacepush_registry:subscribers(?A)),
+        ?assertEqual([], spacepush_registry:subscribers(?B)),
+        ?assertEqual([element(1, ?A)], spacepush_registry:subscribed_endpoints()),
+        ?assertMatch(#{<<"subscriptions">> := [#{<<"endpoint">> := <<"https://a.example/">>, <<"devices">> := 1}]}, spacepush_registry:summary())
+    end, fun() ->
+        ?assertMatch({ok, production, [?B, ?B], _}, spacepush_registry:lookup(token(1))),
+        ?assertEqual([], spacepush_registry:subscribers(?A)),
+        ?assertMatch([{_, production, _}], spacepush_registry:subscribers(?B)),
+        ?assertEqual([element(1, ?B)], spacepush_registry:subscribed_endpoints()),
+        ?assertMatch(#{<<"subscriptions">> := [#{<<"endpoint">> := <<"https://b.example/">>, <<"devices">> := 1}]}, spacepush_registry:summary())
+    end),
+    ?assertEqual([], ets:lookup(spacepush_topic_index, ?A)).
 
 late_invalid_token_keeps_new_registration() ->
     ok = spacepush_registry:register(token(1), sandbox, [?A]),
