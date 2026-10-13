@@ -74,14 +74,16 @@ lookup(Token) ->
 -doc "Every endpoint at least one device subscribed to, read from ETS.".
 -spec subscribed_endpoints() -> [binary()].
 subscribed_endpoints() ->
-    lists:usort([Endpoint || {{Endpoint, _Room}, _Token} <- ets:tab2list(?INDEX)]).
+    lists:usort([Endpoint || {_Token, _Environment, Topics, _Version, _Platform} <- ets:tab2list(?REGISTRATIONS),
+        {Endpoint, _Room} <- Topics]).
 
 -spec subscribers(spacepush_state:topic()) -> [subscriber()].
 subscribers(Topic) ->
     [
         {Token, Environment, Version}
      || {_Topic, Token} <- ets:lookup(?INDEX, Topic),
-        {_Token, Environment, _Topics, Version, _Platform} <- ets:lookup(?REGISTRATIONS, Token)
+        {_Token, Environment, Topics, Version, _Platform} <- ets:lookup(?REGISTRATIONS, Token),
+        lists:member(Topic, Topics)
     ].
 
 -doc """
@@ -95,7 +97,10 @@ summary() ->
         lists:foldl(fun(Registration, Acc) -> maps:update_with(Key(Registration), fun(N) -> N + 1 end, 1, Acc) end, #{}, Registrations)
     end,
     Topics = lists:foldl(
-        fun({Topic, _Token}, Acc) -> maps:update_with(Topic, fun(N) -> N + 1 end, 1, Acc) end, #{}, ets:tab2list(?INDEX)
+        fun({_Token, _Environment, DeviceTopics, _Version, _Platform}, Acc) ->
+            lists:foldl(fun(Topic, Counts) -> maps:update_with(Topic, fun(N) -> N + 1 end, 1, Counts) end,
+                Acc, lists:usort(DeviceTopics))
+        end, #{}, Registrations
     ),
     Subscriptions = [
         #{<<"endpoint">> => Endpoint, <<"room">> => Room, <<"devices">> => N}
@@ -216,12 +221,31 @@ migrate(Registration) ->
     ok = write(Registration),
     insert_ets(Registration).
 
-store({Token, _Environment, _Topics, _Version, _Platform} = Registration) ->
+store({Token, _Environment, Topics, _Version, _Platform} = Registration) ->
+    OldTopics = case ets:lookup(?REGISTRATIONS, Token) of
+        [{Token, _, Previous, _, _}] -> Previous;
+        [] -> []
+    end,
     ok = write(Registration),
     ok = dets:sync(?DETS),
-    delete_ets(Token),
-    insert_ets(Registration),
+    %% Prepare new index entries before the atomic replacement. Readers check
+    %% membership against the registration, so unpublished/stale entries are hidden.
+    true = ets:insert(?INDEX, [{Topic, Token} || Topic <- Topics]),
+    publication_checkpoint(indexed),
+    true = ets:insert(?REGISTRATIONS, Registration),
+    publication_checkpoint(published),
+    [ets:delete_object(?INDEX, {Topic, Token}) || Topic <- OldTopics, not lists:member(Topic, Topics)],
     ok.
+
+-ifdef(TEST).
+publication_checkpoint(Stage) ->
+    case application:get_env(spacepush, registry_publication_hook) of
+        {ok, Hook} -> Hook(Stage);
+        undefined -> ok
+    end.
+-else.
+publication_checkpoint(_Stage) -> ok.
+-endif.
 
 write({Token, Environment, Topics, Version, Platform}) ->
     dets:insert(?DETS, {Token, {registration, 2, Environment, Topics, Version, Platform}}).

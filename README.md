@@ -25,7 +25,7 @@ An Erlang/OTP application that:
 | `spacepush_outbox` | Pending deliveries in `data/outbox.dets` |
 | `spacepush_apns` | Sends due deliveries, at most 20 at a time, each with a 15 s deadline; selects ready environments before limiting and shares capacity fairly when both have work |
 >>>>>>> refs/remotes/origin/dev
-| `spacepush_registry` | Device registrations in `data/registry.dets`, with an ETS topic index |
+| `spacepush_registry` | Device registrations in `data/registry.dets`, with an ETS topic index; renewals atomically replace the visible registration without a lookup gap |
 | `spacepush_ratelimit` | Requests per client and minute for the HTTP API |
 
 Pending changes and deliveries are synced to disk before they count as accepted, so a restart of a process or of the whole service, even an abrupt one, loses no work. Persistent formats carry a version; older records are migrated on start.
