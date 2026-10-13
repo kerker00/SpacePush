@@ -27,7 +27,7 @@ init([]) ->
     File = env(tracker_file),
     %% Safe decoding needs the tracker's atoms to exist, so load their module first.
     {module, spacepush_state} = code:ensure_loaded(spacepush_state),
-    Tracker = spacepush_state:restore(spacepush_store:load(File, none)),
+    Tracker = spacepush_commit:recover(File),
     self() ! poll,
     {ok, #{file => File, tracker => Tracker, seen => #{}}}.
 
@@ -48,11 +48,8 @@ handle_info(poll, #{file := File, tracker := Tracker} = State) ->
      || Url := {ok, Observations} <- Results, Url =/= spacepush_state:mainframe_endpoint()
     ]),
     {Tracker1, Changes} = spacepush_state:track(Tracker, Observations, erlang:system_time(second), env(debounce_s)),
-    %% The outbox is on disk before the tracker records the change as confirmed:
-    %% a crash in between confirms the change again after the restart instead
-    %% of losing it.
-    ok = spacepush_outbox:enqueue(Changes),
-    Tracker1 =/= Tracker andalso spacepush_store:save(File, spacepush_state:snapshot(Tracker1)),
+    %% A durable intent and idempotent outbox commit recover both sides together.
+    Tracker1 =/= Tracker andalso spacepush_commit:commit(File, Tracker1, Changes),
     record_changes(Changes),
     spacepush_stats:count(<<"poll.rounds">>),
     spacepush_stats:duration(<<"poll">>, erlang:monotonic_time(millisecond) - Started),
