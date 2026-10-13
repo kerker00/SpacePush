@@ -167,6 +167,30 @@ All settings live in the `spacepush` application environment (see `src/spacepush
 | `registry_file`, `outbox_file`, `tracker_file`, `directory_file`, `stats_file` | Where state is kept on disk |
 | `state_max_bytes` | Maximum serialized snapshot or recovery intent size; default 67108864 bytes, also checked for expanded compressed ETF |
 
+## Build and regression checks
+
+For local verification, compile production code and the test profile, then run the EUnit regressions:
+
+```sh
+env -u DEBUG rebar3 compile
+env -u DEBUG rebar3 as test compile
+env -u DEBUG rebar3 eunit
+```
+
+The suite uses temporary data under `_build/test/tmp/`, mocked upstream/APNs responses, local loopback HTTP/2 peers and disposable Erlang VMs that are halted for crash tests. It needs permission to open local sockets and start those VMs, but no production configuration, APNs key or real push recipients. These checks validate the source on the test machine; they do not verify the runtime, proxy settings or release running on a different host. [CHANGELOG.md](CHANGELOG.md) describes the pending release changes.
+
+## Runtime boundaries
+
+`trust_proxy` is false by default. Enable it only for a listener reachable through a trusted proxy that appends the actual client address to `X-Forwarded-For`; earlier entries are supplied by the client. Verify the deployed routing and listener exposure separately. The provided Uberspace template is a configuration example, not evidence of the live host's settings.
+
+`GET /v1/stats` accepts only a loopback peer without `X-Forwarded-For`, `Forwarded` or `X-Real-IP`; other requests receive 404. Keep the proxy's forwarding headers intact. `GET /v1/summary` is the public aggregate endpoint. The device token in `/v1/devices/:token` authorizes registration, renewal and removal for that device; protect tokens in clients, URLs and proxy access logs. Filled-in runtime configuration and APNs keys stay outside the repository.
+
+Outbound space fetches use the directory allowlist, accept HTTP/HTTPS without redirects, check all resolved addresses and pin a permitted address for the connection. TLS verifies the hostname and trust chain. These application checks complement host-level network restrictions. Validate the actual deployed configuration and runtime separately; a code path alone is not an operational acceptance result.
+
+Budget persistent storage for registrations, up to 50 topics per device, pending deliveries and retained statistics, plus snapshot temporary files and recovery intents. Admission caps do not imply a fixed disk or process-memory ceiling. Monitor space and permissions for the configured data directory. Keep tracker, pending intent and outbox in one consistent backup set after a graceful stop. A live backup strategy needs its own application-consistency and recovery validation. Restoration and host power-loss testing are operator tasks.
+
+`GET /health` is liveness only: 200 shows that the HTTP service answered. Polling freshness, current last-success timestamps, queue progress and APNs acceptance require their own checks. Production acceptance must identify the deployed commit and exact OTP/SSL versions and exercise a controlled state change on actual clients.
+
 ## Deploy on Uberspace 7
 
 Production runs on an [Uberspace 7](https://manual.uberspace.de/) account and answers at `https://push.grafixmafia.net`. Uberspace 7 is CentOS 7: its Erlang (OTP 21) and OpenSSL (1.0.2) are far too old, so a current OpenSSL and Erlang/OTP 28 are built once in the home directory. Nothing outside the home directory changes. Templates for the configuration and the service are in `deploy/uberspace/`.
