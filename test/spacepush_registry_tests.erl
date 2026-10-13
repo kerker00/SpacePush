@@ -28,6 +28,13 @@ registry_test_() ->
             fun migrates_prototype_records/0,
             fun migrates_format_1_records/0,
             fun keeps_platform/0,
+            fun confirmation_is_persistent_and_idempotent/0,
+            fun confirmation_requires_current_identity/0,
+            fun confirmation_does_not_recreate_removed_registration/0,
+            fun renewal_preserves_admission/0,
+            fun environment_change_resets_confirmation/0,
+            fun legacy_records_are_unconfirmed/0,
+            fun rejects_invalid_admission_metadata/0,
             fun drops_unknown_records/0,
             fun rejects_invalid_registration/0,
             fun drops_invalid_persisted_tokens_and_rooms/0,
@@ -203,7 +210,8 @@ migrates_format_1_records() ->
     stop(),
     {ok, File} = application:get_env(spacepush, registry_file),
     {ok, Table} = dets:open_file(raw_registry, [{file, File}, {type, set}]),
-    ?assertEqual([{token(1), {registration, 2, production, [?A], Version, <<"unknown">>}}], dets:lookup(Table, token(1))),
+    ?assertEqual([{token(1), {registration, 3, production, [?A], Version, <<"unknown">>,
+        #{admitted_at => Version, confirmed => false}}}], dets:lookup(Table, token(1))),
     ok = dets:close(Table),
     start().
 
@@ -212,6 +220,89 @@ keeps_platform() ->
     stop(),
     start(),
     ?assertMatch(#{<<"total">> := 1, <<"by_platform">> := #{<<"macos">> := 1}}, spacepush_registry:summary()).
+
+admission(Token) ->
+    [{Token, _, _, _, _, Admission}] = ets:lookup(spacepush_registrations, Token),
+    Admission.
+
+confirmation_is_persistent_and_idempotent() ->
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    V = version(token(1), ?A),
+    Before = admission(token(1)),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, V),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, V),
+    ?assertEqual(Before#{confirmed := true}, admission(token(1))),
+    ?assertEqual(V, version(token(1), ?A)),
+    ?assertMatch(#{<<"by_confirmation">> := #{<<"accepted_by_apns">> := 1}}, spacepush_registry:summary()),
+    stop(), start(),
+    ?assertEqual(Before#{confirmed := true}, admission(token(1))).
+
+confirmation_requires_current_identity() ->
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    Old = version(token(1), ?A),
+    ok = spacepush_registry:confirm_if(token(1), production, Old),
+    ?assertEqual(false, maps:get(confirmed, admission(token(1)))),
+    ok = spacepush_registry:register(token(1), sandbox, [?B]),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, Old),
+    ?assertEqual(false, maps:get(confirmed, admission(token(1)))),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, version(token(1), ?B)),
+    ?assertEqual(true, maps:get(confirmed, admission(token(1)))).
+
+confirmation_does_not_recreate_removed_registration() ->
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    V = version(token(1), ?A),
+    ok = spacepush_registry:unregister(token(1)),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, V),
+    ?assertEqual(error, spacepush_registry:lookup(token(1))),
+    %% Re-registration in the same millisecond must not reuse the old version.
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    ?assert(version(token(1), ?A) > V),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, V),
+    ?assertEqual(false, maps:get(confirmed, admission(token(1)))).
+
+renewal_preserves_admission() ->
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    Initial = admission(token(1)),
+    ok = spacepush_registry:register(token(1), sandbox, [?B], <<"macos">>),
+    ?assertEqual(Initial, admission(token(1))),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, version(token(1), ?B)),
+    Confirmed = admission(token(1)),
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    ?assertEqual(Confirmed, admission(token(1))).
+
+environment_change_resets_confirmation() ->
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    V = version(token(1), ?A),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, V),
+    Initial = admission(token(1)),
+    ok = spacepush_registry:register(token(1), production, [?A]),
+    ?assertEqual(Initial#{confirmed := false}, admission(token(1))),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, V),
+    ?assertEqual(false, maps:get(confirmed, admission(token(1)))).
+
+legacy_records_are_unconfirmed() ->
+    V = erlang:system_time(millisecond),
+    with_raw_records([
+        {token(1), {registration, 2, sandbox, [?A], V, <<"ios">>}},
+        {token(2), {registration, 1, production, [?B], V}},
+        {token(3), sandbox, [?A], V div 1000}
+    ]),
+    [?assertEqual(#{admitted_at => At, confirmed => false}, admission(token(N)))
+        || {N, At} <- [{1, V}, {2, V}, {3, V div 1000 * 1000}]],
+    stop(), start(),
+    ?assertMatch(#{<<"by_confirmation">> := #{<<"unconfirmed">> := 3}}, spacepush_registry:summary()).
+
+rejects_invalid_admission_metadata() ->
+    V = erlang:system_time(millisecond),
+    Valid = #{admitted_at => V, confirmed => true},
+    Bad = [#{}, Valid#{admitted_at := -1}, Valid#{admitted_at := V + 1},
+        Valid#{confirmed := <<"true">>}, Valid#{extra => <<"ignored">>}],
+    with_raw_records([{token(1), {registration, 3, sandbox, [?A], V, <<"ios">>, Valid}} |
+        [{token(N), {registration, 3, sandbox, [?A], V, <<"ios">>, A}}
+            || {N, A} <- lists:zip(lists:seq(2, 6), Bad)]]),
+    ?assertEqual([{token(1), sandbox, V}], spacepush_registry:subscribers(?A)),
+    stop(), start(),
+    ?assertMatch(#{<<"total">> := 1, <<"by_confirmation">> := #{<<"accepted_by_apns">> := 1}}, spacepush_registry:summary()).
 
 drops_unknown_records() ->
     with_raw_records([{token(1), {registration, 99, sandbox, [?A], 1}}, {token(2), garbage}]),

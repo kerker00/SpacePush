@@ -41,6 +41,17 @@ Statistics recovery keeps valid recent calendar dates and nonnegative integer co
 
 Registry recovery validates tokens, environments, topics, versions and platforms; supported older formats are migrated, while malformed or empty registrations are removed. Outbox recovery removes malformed delivery records, checks their identity, payload and collapse id, and keeps valid work across restarts. Delivery payloads are bounded to 4096 bytes. Diagnostics report error categories or dropped counts, without complete registration/delivery records or device tokens.
 
+Registration format 3 also retains the first admission time and APNs acceptance.
+Only a complete HTTP 200 response for the current token, environment and
+registration version marks it accepted. Failures, dry runs and late responses
+for replaced registrations do not. Acceptance survives renewal in the same
+environment and restart; switching environment resets it. The local statistics
+expose `devices.by_confirmation` as `accepted_by_apns` or `unconfirmed`.
+APNs acceptance does not prove receipt by the device or a genuine app installation.
+Older records migrate as unconfirmed with their saved registration time. Back up
+the registry before upgrading; older releases do not understand format 3 and
+require its pre-upgrade backup when downgrading.
+
 ## Continuous integration
 
 GitHub CI compiles production code and the test profile and runs the full EUnit suite on Ubuntu 24.04 with patched OTP 28.5.0.7 and 29.1.1 and rebar3 3.27.3. The checkout/setup actions are pinned to verified release commits, use read-only repository permissions and do not persist checkout credentials.
