@@ -9,6 +9,8 @@ answers `subscribers/1` without going through this process.
 
 The number of registrations is capped, and registrations that were not
 renewed within `registration_ttl_days` expire. The apps renew on every launch.
+Unconfirmed registrations have a separate admission cap and additionally expire
+`unconfirmed_registration_ttl_days` after admission, regardless of renewals.
 An empty topic list unregisters a device; it never occupies capacity.
 
 On disk format 3 also records the admission time and whether APNs accepted a
@@ -41,7 +43,7 @@ start_link() ->
 register(Token, Environment, Topics) ->
     register(Token, Environment, Topics, <<"unknown">>).
 
--doc "Adds or replaces a registration. Fails for a new token once the cap is reached.".
+-doc "Adds or replaces a registration, subject to total and unconfirmed admission caps.".
 -spec register(binary(), environment(), [spacepush_state:topic()], platform()) -> ok | {error, full | invalid_registration}.
 register(Token, Environment, Topics, Platform) ->
     case valid_registration({Token, Environment, Topics, 0, Platform}) of
@@ -72,23 +74,28 @@ confirm_if(Token, Environment, Version) ->
 -spec lookup(binary()) -> {ok, environment(), [spacepush_state:topic()], version()} | error.
 lookup(Token) ->
     case ets:lookup(?REGISTRATIONS, Token) of
-        [{Token, Environment, Topics, Version, _Platform, _Admission}] -> {ok, Environment, Topics, Version};
+        [{Token, Environment, Topics, Version, _Platform, _Admission} = Registration] ->
+            case active(Registration, now_ms()) of
+                true -> {ok, Environment, Topics, Version};
+                false -> error
+            end;
         [] -> error
     end.
 
 -doc "Every endpoint at least one device subscribed to, read from ETS.".
 -spec subscribed_endpoints() -> [binary()].
 subscribed_endpoints() ->
-    lists:usort([Endpoint || {_Token, _Environment, Topics, _Version, _Platform, _Admission} <- ets:tab2list(?REGISTRATIONS),
+    lists:usort([Endpoint || {_Token, _Environment, Topics, _Version, _Platform, _Admission} <- active_registrations(),
         {Endpoint, _Room} <- Topics]).
 
 -spec subscribers(spacepush_state:topic()) -> [subscriber()].
 subscribers(Topic) ->
+    Cutoffs = cutoffs(now_ms()),
     [
         {Token, Environment, Version}
      || {_Topic, Token} <- ets:lookup(?INDEX, Topic),
-        {_Token, Environment, Topics, Version, _Platform, _Admission} <- ets:lookup(?REGISTRATIONS, Token),
-        lists:member(Topic, Topics)
+        {_Token, Environment, Topics, Version, _Platform, _Admission} = Registration <- ets:lookup(?REGISTRATIONS, Token),
+        lists:member(Topic, Topics), active_since(Registration, Cutoffs)
     ].
 
 -doc """
@@ -97,7 +104,7 @@ platform, and per subscribed space or room.
 """.
 -spec summary() -> map().
 summary() ->
-    Registrations = ets:tab2list(?REGISTRATIONS),
+    Registrations = active_registrations(),
     Count = fun(Key) ->
         lists:foldl(fun(Registration, Acc) -> maps:update_with(Key(Registration), fun(N) -> N + 1 end, 1, Acc) end, #{}, Registrations)
     end,
@@ -114,6 +121,7 @@ summary() ->
     #{
         <<"total">> => length(Registrations),
         <<"cap">> => env(max_registrations),
+        <<"unconfirmed_cap">> => unconfirmed_cap(),
         <<"by_environment">> => Count(fun({_Token, Environment, _Topics, _Version, _Platform, _Admission}) -> Environment end),
         <<"by_platform">> => Count(fun({_Token, _Environment, _Topics, _Version, Platform, _Admission}) -> Platform end),
         <<"by_confirmation">> => Count(fun({_Token, _Environment, _Topics, _Version, _Platform, #{confirmed := Confirmed}}) ->
@@ -136,6 +144,8 @@ init([]) ->
 handle_call({register, Token, _Environment, [], _Platform}, From, State) ->
     handle_call({unregister, Token}, From, State);
 handle_call({register, Token, Environment, Topics, Platform}, _From, State) ->
+    Now = now_ms(),
+    prepare_admission(Token, Environment, Now),
     %% Keep versions distinct even after removal and immediate re-registration.
     %% A registry restart also restarts the sender via rest_for_one, discarding
     %% requests from the previous process lifetime.
@@ -147,17 +157,20 @@ handle_call({register, Token, Environment, Topics, Platform}, _From, State) ->
     Reply =
         case ets:lookup(?REGISTRATIONS, Token) of
             [{Token, OldEnvironment, _Topics, _Previous, _Platform, Admission}] ->
-                spacepush_stats:count(<<"registrations.renewed">>),
-                Updated = Admission#{confirmed := maps:get(confirmed, Admission) andalso Environment =:= OldEnvironment},
-                store({Token, Environment, Topics, Version, Platform, Updated});
+                Reset = maps:get(confirmed, Admission) andalso Environment =/= OldEnvironment,
+                case not Reset orelse unconfirmed_available() of
+                    true ->
+                        spacepush_stats:count(<<"registrations.renewed">>),
+                        Updated = case Reset of true -> admission(Now); false -> Admission end,
+                        store({Token, Environment, Topics, Version, Platform, Updated});
+                    false -> reject_full()
+                end;
             [] ->
-                case ets:info(?REGISTRATIONS, size) < env(max_registrations) of
+                case ets:info(?REGISTRATIONS, size) < env(max_registrations) andalso unconfirmed_available() of
                     true ->
                         spacepush_stats:count(<<"registrations.new">>),
-                        store({Token, Environment, Topics, Version, Platform, admission(Version)});
-                    false ->
-                        spacepush_stats:count(<<"registrations.rejected_full">>),
-                        {error, full}
+                        store({Token, Environment, Topics, Version, Platform, admission(Now)});
+                    false -> reject_full()
                 end
         end,
     UpdatedState = case Reply of ok -> State#{last_version := Version}; _ -> State end,
@@ -176,8 +189,13 @@ handle_call({unregister_if, Token, Environment, Version, InvalidSince}, _From, S
     {reply, ok, State};
 handle_call({confirm_if, Token, Environment, Version}, _From, State) ->
     case ets:lookup(?REGISTRATIONS, Token) of
-        [{Token, Environment, Topics, Version, Platform, #{confirmed := false} = Admission}] ->
-            ok = store({Token, Environment, Topics, Version, Platform, Admission#{confirmed := true}});
+        [{Token, Environment, Topics, Version, Platform, #{confirmed := false} = Admission} = Registration] ->
+            case active(Registration, now_ms()) of
+                true -> ok = store({Token, Environment, Topics, Version, Platform, Admission#{confirmed := true}});
+                false ->
+                    spacepush_stats:count(<<"registrations.expired">>),
+                    ok = remove(Token)
+            end;
         _ -> ok
     end,
     {reply, ok, State}.
@@ -300,14 +318,69 @@ delete_ets(Token) ->
 
 %% Versions are registration times in milliseconds, but always increase per token.
 next_version(Previous) ->
-    max(erlang:system_time(millisecond), Previous + 1).
+    max(now_ms(), Previous + 1).
 
 remove_expired() ->
-    Cutoff = erlang:system_time(millisecond) - env(registration_ttl_days) * 86400000,
-    Expired = ets:select(?REGISTRATIONS, [{{'$1', '_', '_', '$2', '_', '_'}, [{'<', '$2', Cutoff}], ['$1']}]),
-    lists:foreach(fun remove/1, Expired),
+    remove_expired(now_ms()).
+
+remove_expired(Now) ->
+    Cutoffs = cutoffs(Now),
+    Expired = [Token || {Token, _, _, _, _, _} = R <- ets:tab2list(?REGISTRATIONS), not active_since(R, Cutoffs)],
+    case Expired of
+        [] -> ok;
+        _ ->
+            [ok = dets:delete(?DETS, Token) || Token <- Expired],
+            ok = dets:sync(?DETS),
+            lists:foreach(fun delete_ets/1, Expired)
+    end,
     spacepush_stats:count(<<"registrations.expired">>, length(Expired)),
     Expired =/= [] andalso ?LOG_INFO(#{msg => registrations_expired, count => length(Expired)}).
+
+active(Registration, Now) ->
+    active_since(Registration, cutoffs(Now)).
+
+cutoffs(Now) ->
+    {Now - env(registration_ttl_days) * 86400000, Now - env(unconfirmed_registration_ttl_days) * 86400000}.
+
+active_since({_Token, _Environment, _Topics, Version, _Platform, #{admitted_at := At, confirmed := Confirmed}},
+    {RenewalCutoff, AdmissionCutoff}) ->
+    Version > RenewalCutoff andalso (Confirmed orelse At > AdmissionCutoff).
+
+active_registrations() ->
+    Cutoffs = cutoffs(now_ms()),
+    [R || R <- ets:tab2list(?REGISTRATIONS), active_since(R, Cutoffs)].
+
+%% Renewals which need no new provisional slot keep their fast path, including
+%% older unconfirmed records already above a lowered admission cap. Their
+%% original deadline remains unchanged. New admission first releases expired rows.
+prepare_admission(Token, Environment, Now) ->
+    NeedsSlot = case ets:lookup(?REGISTRATIONS, Token) of
+        [{Token, OldEnvironment, _, _, _, #{confirmed := Confirmed}} = Registration] ->
+            not active(Registration, Now) orelse (Confirmed andalso OldEnvironment =/= Environment);
+        [] -> true
+    end,
+    NeedsSlot andalso remove_expired(Now),
+    ok.
+
+unconfirmed_cap() ->
+    min(env(max_registrations), env(max_unconfirmed_registrations)).
+
+unconfirmed_available() ->
+    ets:select_count(?REGISTRATIONS, [{{'_', '_', '_', '_', '_', #{confirmed => false}}, [], [true]}]) < unconfirmed_cap().
+
+reject_full() ->
+    spacepush_stats:count(<<"registrations.rejected_full">>),
+    {error, full}.
+
+-ifdef(TEST).
+now_ms() ->
+    case application:get_env(spacepush, registry_clock) of
+        {ok, Clock} -> Clock();
+        undefined -> erlang:system_time(millisecond)
+    end.
+-else.
+now_ms() -> erlang:system_time(millisecond).
+-endif.
 
 env(Key) ->
     {ok, Value} = application:get_env(spacepush, Key),

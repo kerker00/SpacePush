@@ -18,6 +18,9 @@ fixture(Name) ->
 -doc "Loads the application defaults and points all files into a fresh directory.".
 setup_env(Name) ->
     _ = application:load(spacepush),
+    application:set_env(spacepush, max_unconfirmed_registrations, 1000),
+    application:set_env(spacepush, unconfirmed_registration_ttl_days, 60),
+    application:unset_env(spacepush, registry_clock),
     Dir = tmp_dir(Name),
     application:set_env(spacepush, registry_file, filename:join(Dir, "registry.dets")),
     application:set_env(spacepush, outbox_file, filename:join(Dir, "outbox.dets")),
