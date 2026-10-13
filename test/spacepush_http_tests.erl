@@ -29,20 +29,27 @@ summary_test_() ->
     Unknown = #{<<"url">> => <<"https://b.example/">>, <<"data">> => #{<<"space">> => <<"B">>}},
     [
         ?_assertEqual(
-            #{<<"open">> => 2, <<"total">> => 4, <<"as_of">> => <<"2026-10-10T10:00:00Z">>},
+            #{<<"open">> => 2, <<"total">> => 4, <<"known">> => 3, <<"unknown">> => 1,
+                <<"as_of">> => <<"2026-10-10T08:13:20Z">>, <<"newest_as_of">> => <<"2026-10-10T10:00:00Z">>},
             spacepush_http_read:summary([Entry(true, 1791626400), Entry(false, 1791626000), Entry(true, 1791620000), Unknown])
         ),
-        ?_assertEqual(#{<<"open">> => 0, <<"total">> => 0, <<"as_of">> => null}, spacepush_http_read:summary([]))
+        ?_assertEqual(unknown_summary(0), spacepush_http_read:summary([]))
     ].
 
 summary_ignores_timestamps_without_known_states_test() ->
     Unknown = #{<<"url">> => <<"https://a.example/">>, <<"lastSeen">> => 1 bsl 200, <<"data">> => #{<<"space">> => <<"A">>}},
-    ?assertEqual(#{<<"open">> => 0, <<"total">> => 1, <<"as_of">> => null}, spacepush_http_read:summary([Unknown])).
+    ?assertEqual(unknown_summary(1), spacepush_http_read:summary([Unknown])).
 
 summary_accepts_fractional_observation_times_test() ->
     Entry = #{<<"url">> => <<"https://a.example/">>, <<"lastSeen">> => 1791626400.5,
         <<"data">> => #{<<"state">> => #{<<"open">> => true}}},
-    ?assertEqual(#{<<"open">> => 1, <<"total">> => 1, <<"as_of">> => <<"2026-10-10T10:00:00Z">>}, spacepush_http_read:summary([Entry])).
+    ?assertEqual(#{<<"open">> => 1, <<"total">> => 1, <<"known">> => 1, <<"unknown">> => 0,
+        <<"as_of">> => <<"2026-10-10T10:00:00Z">>, <<"newest_as_of">> => <<"2026-10-10T10:00:00Z">>},
+        spacepush_http_read:summary([Entry])).
+
+unknown_summary(Total) ->
+    #{<<"open">> => 0, <<"total">> => Total, <<"known">> => 0, <<"unknown">> => Total,
+        <<"as_of">> => null, <<"newest_as_of">> => null}.
 
 -define(A, <<"https://a.example/">>).
 
@@ -64,7 +71,11 @@ directory_freshness_test_() ->
         fun recent_cache_overrides_expired_aggregator/0,
         fun expired_cache_and_aggregator_are_unknown/0,
         fun future_aggregator_timestamp_is_unknown/0,
-        fun future_cache_does_not_override_current_directory/0
+        fun future_cache_does_not_override_current_directory/0,
+        fun cache_age_is_independent_of_watch_window/0,
+        fun cache_state_expires_at_the_same_limit/0,
+        fun newer_aggregator_overrides_older_cache/0,
+        fun newer_unknown_cache_does_not_revive_old_open/0
     ]}.
 
 put_directory(LastSeen, Open) ->
@@ -85,7 +96,7 @@ directory_flags_expire_without_refresh() ->
     ?assertEqual(#{<<"space">> => <<"A">>}, maps:get(<<"data">>, Expired)),
     ?assertEqual(990, maps:get(<<"lastSeen">>, Expired)),
     ?assert(spacepush_directory:known(?A)),
-    ?assertEqual(#{<<"open">> => 0, <<"total">> => 1, <<"as_of">> => null}, spacepush_http_read:summary([Expired])).
+    ?assertEqual(unknown_summary(1), spacepush_http_read:summary([Expired])).
 
 recent_cache_overrides_expired_aggregator() ->
     put_directory(990, false),
@@ -113,3 +124,31 @@ future_cache_does_not_override_current_directory() ->
     put_directory(1900, false),
     put_cache(1910000, open),
     ?assertMatch([#{<<"lastSeen">> := 1900, <<"data">> := #{<<"state">> := #{<<"open">> := false}}}], spacepush_http_read:directory(1901000)).
+
+cache_age_is_independent_of_watch_window() ->
+    put_directory(990, false),
+    put_cache(1200000, open),
+    %% Eleven minutes old: outside the default watch window, within the age limit.
+    ?assertMatch([#{<<"lastSeen">> := 1200, <<"data">> := #{<<"state">> := #{<<"open">> := true}}}],
+        spacepush_http_read:directory(1860000)).
+
+cache_state_expires_at_the_same_limit() ->
+    put_directory(990, false),
+    put_cache(1200000, open),
+    ?assertMatch([#{<<"data">> := #{<<"state">> := #{<<"open">> := true}}}],
+        spacepush_http_read:directory(2100000)),
+    ?assertEqual(unknown_summary(1), spacepush_http_read:summary(spacepush_http_read:directory(2100001))).
+
+newer_aggregator_overrides_older_cache() ->
+    put_directory(1900, false),
+    put_cache(1890000, open),
+    ?assertMatch([#{<<"lastSeen">> := 1900, <<"data">> := #{<<"state">> := #{<<"open">> := false}}}],
+        spacepush_http_read:directory(1901000)).
+
+newer_unknown_cache_does_not_revive_old_open() ->
+    put_directory(1890, true),
+    put_cache(1900000, unknown),
+    [Entry] = spacepush_http_read:directory(1901000),
+    ?assertEqual(1900, maps:get(<<"lastSeen">>, Entry)),
+    ?assertNot(maps:is_key(<<"state">>, maps:get(<<"data">>, Entry))),
+    ?assertEqual(unknown_summary(1), spacepush_http_read:summary([Entry])).

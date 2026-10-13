@@ -31,6 +31,10 @@ app_test_() ->
             ?_assertEqual({200, spacepush_test_util:fixture("mainframe-openstate.json")}, request(get, Port, "/v1/mainframe/rooms")),
             ?_assertEqual(405, status(request(post, Port, "/v1/directory", <<"{}">>))),
             ?_test(passes_documents_through_safely(Port)),
+            ?_test(document_freshness_headers(Port)),
+            ?_test(expired_documents_are_not_successful_reads(Port)),
+            ?_test(future_documents_are_not_successful_reads(Port)),
+            ?_test(recent_fallback_preserves_original_fetch_time(Port)),
             ?_test(rate_limited_requests_do_not_tally_versions(Port))
         ]
     end}.
@@ -177,6 +181,9 @@ raw(Port, Request) ->
 directory(Port) ->
     {200, Body} = request(get, Port, "/v1/directory"),
     ?assertEqual("no-cache", proplists:get_value("cache-control", headers(Port, "/v1/directory"))),
+    {ok, MaxAge} = application:get_env(spacepush, max_data_age_s),
+    ?assertEqual(integer_to_list(MaxAge),
+        proplists:get_value("x-spacepush-max-data-age", headers(Port, "/v1/directory"))),
     Entries = json:decode(Body),
     %% Entries without a name are allowlisted but not listed.
     ?assertEqual(7, length(Entries)),
@@ -192,7 +199,66 @@ summary(Port) ->
     ?assertMatch(#{<<"open">> := Open, <<"total">> := 7, <<"as_of">> := <<_/binary>>}, json:decode(Body)),
     Headers = headers(Port, "/v1/summary"),
     ?assertEqual("*", proplists:get_value("access-control-allow-origin", Headers)),
+    {ok, MaxAge} = application:get_env(spacepush, max_data_age_s),
+    ?assertEqual(integer_to_list(MaxAge), proplists:get_value("x-spacepush-max-data-age", Headers)),
+    ?assertEqual("X-SpacePush-Max-Data-Age", proplists:get_value("access-control-expose-headers", Headers)),
     ?assertEqual("no-cache", proplists:get_value("cache-control", Headers)).
+
+document_freshness_headers(Port) ->
+    {ok, MaxAge} = application:get_env(spacepush, max_data_age_s),
+    [begin
+        #{fetched_at := FetchedAt} = spacepush_cache:lookup(Endpoint),
+        Headers = headers(Port, Path),
+        ?assertEqual("no-cache", proplists:get_value("cache-control", Headers)),
+        ?assertEqual(integer_to_list(FetchedAt div 1000), proplists:get_value("x-spacepush-fetched-at", Headers)),
+        ?assertEqual(integer_to_list(MaxAge), proplists:get_value("x-spacepush-max-data-age", Headers)),
+        ?assertEqual(integer_to_list((FetchedAt + MaxAge * 1000) div 1000),
+            proplists:get_value("x-spacepush-expires-at", Headers))
+    end || {Endpoint, Path} <- document_paths()].
+
+expired_documents_are_not_successful_reads(Port) ->
+    check_fallback_documents(Port, -901000, fun(Path, _FetchedAt) ->
+        {502, Body} = request(get, Port, Path),
+        ?assertMatch(#{<<"error">> := <<"stale_data">>}, json:decode(Body)),
+        ?assertEqual(undefined, proplists:get_value("x-spacepush-fetched-at", headers(Port, Path)))
+    end).
+
+future_documents_are_not_successful_reads(Port) ->
+    check_fallback_documents(Port, 3600000, fun(Path, _FetchedAt) ->
+        {502, Body} = request(get, Port, Path),
+        ?assertMatch(#{<<"error">> := <<"stale_data">>}, json:decode(Body))
+    end).
+
+recent_fallback_preserves_original_fetch_time(Port) ->
+    check_fallback_documents(Port, -120000, fun(Path, FetchedAt) ->
+        ?assertEqual(200, status(request(get, Port, Path))),
+        Headers = headers(Port, Path),
+        ?assertEqual(integer_to_list(FetchedAt div 1000), proplists:get_value("x-spacepush-fetched-at", Headers)),
+        ?assertEqual("900", proplists:get_value("x-spacepush-max-data-age", Headers))
+    end).
+
+document_paths() ->
+    {ok, Mainframe} = application:get_env(spacepush, mainframe_url),
+    [{?NERD2NERD, "/v1/spaces?endpoint=" ?NERD2NERD_QS},
+        {list_to_binary(Mainframe), "/v1/mainframe/rooms"}].
+
+check_fallback_documents(_Port, Offset, Check) ->
+    {ok, OldMaxAge} = application:get_env(spacepush, max_data_age_s),
+    PreviousResponses = persistent_term:get({spacepush_test_util, responses}),
+    application:set_env(spacepush, max_data_age_s, 900),
+    try
+        [begin
+            Original = spacepush_cache:lookup(Endpoint),
+            FetchedAt = erlang:system_time(millisecond) + Offset,
+            spacepush_test_util:fake_responses(PreviousResponses#{Endpoint => {error, timeout}}),
+            ets:insert(spacepush_cache, {Endpoint, Original#{fetched_at := FetchedAt}}),
+            try Check(Path, FetchedAt)
+            after ets:insert(spacepush_cache, {Endpoint, Original}) end
+        end || {Endpoint, Path} <- document_paths()]
+    after
+        spacepush_test_util:fake_responses(PreviousResponses),
+        application:set_env(spacepush, max_data_age_s, OldMaxAge)
+    end.
 
 passes_documents_through_safely(Port) ->
     Headers = headers(Port, "/v1/spaces?endpoint=" ?NERD2NERD_QS),
