@@ -8,9 +8,10 @@ environment signs with its own key from `apns_keys`, or with the shared
 `apns_key_file` when `apns_keys` is not set; an environment without a key
 only logs its deliveries. Provider tokens are kept per environment and
 renewed before they expire after an hour, but at most every 20 minutes, as
-Apple requires. Requests are only sent on
-a connection that is up, so a request that times out was never queued inside
-gun. At most `apns_max_in_flight` requests are open at a time, each with a
+Apple requires. Gun's automatic reconnect/replay is disabled: requests sent
+during graceful closing fail and return to the outbox. A new connection sends
+only deliveries selected and checked again by this process. At most
+`apns_max_in_flight` requests are open at a time, each with a
 deadline, and at most one per device and topic.
 
 Right before sending, the delivery is checked against the current
@@ -35,6 +36,10 @@ Without any key, deliveries are only logged.
 
 -export([start_link/0, wake/0, classify/2, backoff_ms/1, key_config/3, token_usable/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+
+-ifdef(TEST).
+-export([connection_options/1]).
+-endif.
 
 %% Apple rejects provider tokens older than an hour, and refreshing them more
 %% often than every 20 minutes.
@@ -112,6 +117,7 @@ init([]) ->
         renew => #{},
         paused => #{},
         connections => #{},
+        connection_retry => #{},
         in_flight => #{}
     }}.
 
@@ -141,8 +147,16 @@ handle_info({gun_down, Connection, _Protocol, Reason, KilledStreams}, State) ->
 handle_info({'DOWN', _MonitorRef, process, Connection, Reason}, #{connections := Connections} = State) ->
     ?LOG_WARNING(#{msg => apns_connection_closed, reason => Reason}),
     Lost = [Ref || Ref := #{connection := Pid} <- maps:get(in_flight, State), Pid =:= Connection],
+    Retry = maps:get(connection_retry, State, #{}),
+    Retry1 = maps:fold(fun
+        (Environment, #{pid := Pid}, Acc) when Pid =:= Connection ->
+            Attempts = maps:get(attempts, maps:get(Environment, Acc, #{}), 0),
+            Acc#{Environment => #{attempts => Attempts + 1,
+                not_before => erlang:system_time(millisecond) + backoff_ms(Attempts)}};
+        (_, _, Acc) -> Acc
+    end, Retry, Connections),
     Remaining = maps:filter(fun(_Environment, #{pid := Pid}) -> Pid =/= Connection end, Connections),
-    {noreply, fail_requests(Lost, Reason, State#{connections := Remaining})};
+    {noreply, fail_requests(Lost, Reason, State#{connections := Remaining, connection_retry => Retry1})};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -437,7 +451,7 @@ new_token(Environment, Now, #{keys := Keys, team_id := TeamId, tokens := Tokens,
     Token = spacepush_jwt:token(KeyId, TeamId, Key, Now),
     {Token, State#{tokens := Tokens#{Environment => {Token, Now}}, renew := maps:remove(Environment, Renew)}}.
 
-%% Opens the connection for an environment on first use; gun reconnects on its own.
+%% Reopen through the sender, with backoff; Gun must never replay postponed POSTs.
 connection(Environment, #{connections := Connections} = State) ->
     case Connections of
         #{Environment := #{pid := Pid, up := true}} ->
@@ -445,18 +459,23 @@ connection(Environment, #{connections := Connections} = State) ->
         #{Environment := #{up := false}} ->
             {down, State};
         #{} ->
-            Host = host(Environment),
-            {ok, Pid} = gun:open(Host, 443, #{
-                protocols => [http2],
-                transport => tls,
-                tls_opts => spacepush_tls:client_opts(Host)
-            }),
-            monitor(process, Pid),
-            {down, State#{connections := Connections#{Environment => #{pid => Pid, up => false}}}}
+            Retry = maps:get(Environment, maps:get(connection_retry, State, #{}), #{}),
+            case maps:get(not_before, Retry, 0) > erlang:system_time(millisecond) of
+                true -> {down, State};
+                false ->
+                    Host = host(Environment),
+                    {ok, Pid} = gun:open(Host, 443, connection_options(Host)),
+                    monitor(process, Pid),
+                    {down, State#{connections := Connections#{Environment => #{pid => Pid, up => false}}}}
+            end
     end.
 
+connection_options(Host) ->
+    #{protocols => [http2], retry => 0, transport => tls,
+        tls_opts => spacepush_tls:client_opts(Host)}.
+
 set_up(Connection, Up, #{connections := Connections} = State) ->
-    State#{
+    Updated = State#{
         connections := maps:map(
             fun
                 (_Environment, #{pid := Pid} = Info) when Pid =:= Connection -> Info#{up := Up};
@@ -464,7 +483,14 @@ set_up(Connection, Up, #{connections := Connections} = State) ->
             end,
             Connections
         )
-    }.
+    },
+    case Up of
+        false -> Updated;
+        true ->
+            Retry = maps:get(connection_retry, State, #{}),
+            Ready = [Environment || Environment := #{pid := Pid} <- Connections, Pid =:= Connection],
+            Updated#{connection_retry => maps:without(Ready, Retry)}
+    end.
 
 host(sandbox) -> "api.sandbox.push.apple.com";
 host(production) -> "api.push.apple.com".
