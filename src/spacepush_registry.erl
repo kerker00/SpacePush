@@ -11,16 +11,16 @@ The number of registrations is capped, and registrations that were not
 renewed within `registration_ttl_days` expire. The apps renew on every launch.
 An empty topic list unregisters a device; it never occupies capacity.
 
-On disk a registration is `{Token, {registration, 2, Environment, Topics, Version, Platform}}`.
-Format 1 records, without a platform, and records of the unversioned
-prototype format, which stored seconds, are migrated on start.
+On disk format 3 also records the admission time and whether APNs accepted a
+notification for this registration. Acceptance does not prove device delivery.
+Older formats migrate as unconfirmed, retaining their recorded registration time.
 """.
 -behaviour(gen_server).
 
 -include_lib("kernel/include/logger.hrl").
 
 -export([start_link/0, register/3, register/4, unregister/1, unregister_if/4, subscribers/1, lookup/1, subscribed_endpoints/0]).
--export([summary/0]).
+-export([summary/0, confirm_if/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(DETS, spacepush_registry).
@@ -63,18 +63,23 @@ the meantime keeps its new registration.
 unregister_if(Token, Environment, Version, InvalidSince) ->
     gen_server:call(?MODULE, {unregister_if, Token, Environment, Version, InvalidSince}).
 
+-doc "Records APNs acceptance only for the current environment and registration version.".
+-spec confirm_if(binary(), environment(), version()) -> ok.
+confirm_if(Token, Environment, Version) ->
+    gen_server:call(?MODULE, {confirm_if, Token, Environment, Version}).
+
 -doc "The current registration of a token, read from ETS.".
 -spec lookup(binary()) -> {ok, environment(), [spacepush_state:topic()], version()} | error.
 lookup(Token) ->
     case ets:lookup(?REGISTRATIONS, Token) of
-        [{Token, Environment, Topics, Version, _Platform}] -> {ok, Environment, Topics, Version};
+        [{Token, Environment, Topics, Version, _Platform, _Admission}] -> {ok, Environment, Topics, Version};
         [] -> error
     end.
 
 -doc "Every endpoint at least one device subscribed to, read from ETS.".
 -spec subscribed_endpoints() -> [binary()].
 subscribed_endpoints() ->
-    lists:usort([Endpoint || {_Token, _Environment, Topics, _Version, _Platform} <- ets:tab2list(?REGISTRATIONS),
+    lists:usort([Endpoint || {_Token, _Environment, Topics, _Version, _Platform, _Admission} <- ets:tab2list(?REGISTRATIONS),
         {Endpoint, _Room} <- Topics]).
 
 -spec subscribers(spacepush_state:topic()) -> [subscriber()].
@@ -82,7 +87,7 @@ subscribers(Topic) ->
     [
         {Token, Environment, Version}
      || {_Topic, Token} <- ets:lookup(?INDEX, Topic),
-        {_Token, Environment, Topics, Version, _Platform} <- ets:lookup(?REGISTRATIONS, Token),
+        {_Token, Environment, Topics, Version, _Platform, _Admission} <- ets:lookup(?REGISTRATIONS, Token),
         lists:member(Topic, Topics)
     ].
 
@@ -97,7 +102,7 @@ summary() ->
         lists:foldl(fun(Registration, Acc) -> maps:update_with(Key(Registration), fun(N) -> N + 1 end, 1, Acc) end, #{}, Registrations)
     end,
     Topics = lists:foldl(
-        fun({_Token, _Environment, DeviceTopics, _Version, _Platform}, Acc) ->
+        fun({_Token, _Environment, DeviceTopics, _Version, _Platform, _Admission}, Acc) ->
             lists:foldl(fun(Topic, Counts) -> maps:update_with(Topic, fun(N) -> N + 1 end, 1, Counts) end,
                 Acc, lists:usort(DeviceTopics))
         end, #{}, Registrations
@@ -109,8 +114,11 @@ summary() ->
     #{
         <<"total">> => length(Registrations),
         <<"cap">> => env(max_registrations),
-        <<"by_environment">> => Count(fun({_Token, Environment, _Topics, _Version, _Platform}) -> Environment end),
-        <<"by_platform">> => Count(fun({_Token, _Environment, _Topics, _Version, Platform}) -> Platform end),
+        <<"by_environment">> => Count(fun({_Token, Environment, _Topics, _Version, _Platform, _Admission}) -> Environment end),
+        <<"by_platform">> => Count(fun({_Token, _Environment, _Topics, _Version, Platform, _Admission}) -> Platform end),
+        <<"by_confirmation">> => Count(fun({_Token, _Environment, _Topics, _Version, _Platform, #{confirmed := Confirmed}}) ->
+            case Confirmed of true -> <<"accepted_by_apns">>; false -> <<"unconfirmed">> end
+        end),
         <<"subscriptions">> => lists:reverse(lists:sort(fun(#{<<"devices">> := A}, #{<<"devices">> := B}) -> A =< B end, Subscriptions))
     }.
 
@@ -123,37 +131,54 @@ init([]) ->
     load(),
     remove_expired(),
     erlang:send_after(?EXPIRY_CHECK_MS, self(), remove_expired),
-    {ok, #{}}.
+    {ok, #{last_version => 0}}.
 
 handle_call({register, Token, _Environment, [], _Platform}, From, State) ->
     handle_call({unregister, Token}, From, State);
 handle_call({register, Token, Environment, Topics, Platform}, _From, State) ->
+    %% Keep versions distinct even after removal and immediate re-registration.
+    %% A registry restart also restarts the sender via rest_for_one, discarding
+    %% requests from the previous process lifetime.
+    FreshVersion = next_version(maps:get(last_version, State)),
+    Version = case ets:lookup(?REGISTRATIONS, Token) of
+        [{Token, _, _, PreviousVersion, _, _}] -> max(FreshVersion, PreviousVersion + 1);
+        [] -> FreshVersion
+    end,
     Reply =
         case ets:lookup(?REGISTRATIONS, Token) of
-            [{Token, _Environment, _Topics, Previous, _Platform}] ->
+            [{Token, OldEnvironment, _Topics, _Previous, _Platform, Admission}] ->
                 spacepush_stats:count(<<"registrations.renewed">>),
-                store({Token, Environment, Topics, next_version(Previous), Platform});
+                Updated = Admission#{confirmed := maps:get(confirmed, Admission) andalso Environment =:= OldEnvironment},
+                store({Token, Environment, Topics, Version, Platform, Updated});
             [] ->
                 case ets:info(?REGISTRATIONS, size) < env(max_registrations) of
                     true ->
                         spacepush_stats:count(<<"registrations.new">>),
-                        store({Token, Environment, Topics, next_version(0), Platform});
+                        store({Token, Environment, Topics, Version, Platform, admission(Version)});
                     false ->
                         spacepush_stats:count(<<"registrations.rejected_full">>),
                         {error, full}
                 end
         end,
-    {reply, Reply, State};
+    UpdatedState = case Reply of ok -> State#{last_version := Version}; _ -> State end,
+    {reply, Reply, UpdatedState};
 handle_call({unregister, Token}, _From, State) ->
     ets:member(?REGISTRATIONS, Token) andalso spacepush_stats:count(<<"registrations.removed">>),
     {reply, remove(Token), State};
 handle_call({unregister_if, Token, Environment, Version, InvalidSince}, _From, State) ->
     case ets:lookup(?REGISTRATIONS, Token) of
-        [{Token, Environment, _Topics, Version, _Platform}] when InvalidSince =:= undefined; Version =< InvalidSince ->
+        [{Token, Environment, _Topics, Version, _Platform, _Admission}] when InvalidSince =:= undefined; Version =< InvalidSince ->
             spacepush_stats:count(<<"registrations.invalid">>),
             remove(Token);
         _ ->
             ok
+    end,
+    {reply, ok, State};
+handle_call({confirm_if, Token, Environment, Version}, _From, State) ->
+    case ets:lookup(?REGISTRATIONS, Token) of
+        [{Token, Environment, Topics, Version, Platform, #{confirmed := false} = Admission}] ->
+            ok = store({Token, Environment, Topics, Version, Platform, Admission#{confirmed := true}});
+        _ -> ok
     end,
     {reply, ok, State}.
 
@@ -176,17 +201,19 @@ load() ->
     lists:foreach(fun load_record/1, Records),
     ok = dets:sync(?DETS).
 
+load_record({Token, {registration, 3, Environment, Topics, Version, Platform, Admission}}) ->
+    load_registration({Token, Environment, Topics, Version, Platform, Admission}, false);
 load_record({Token, {registration, 2, Environment, Topics, Version, Platform}}) ->
-    load_registration({Token, Environment, Topics, Version, Platform}, false);
+    load_registration({Token, Environment, Topics, Version, Platform, admission(Version)}, true);
 load_record({Token, {registration, 1, Environment, Topics, Version}}) ->
-    load_registration({Token, Environment, Topics, Version, <<"unknown">>}, true);
+    load_registration({Token, Environment, Topics, Version, <<"unknown">>, admission(Version)}, true);
 load_record({Token, Environment, Topics, UpdatedAt}) when is_integer(UpdatedAt) ->
-    load_registration({Token, Environment, Topics, UpdatedAt * 1000, <<"unknown">>}, true);
+    load_registration({Token, Environment, Topics, UpdatedAt * 1000, <<"unknown">>, admission(UpdatedAt * 1000)}, true);
 load_record(Record) ->
     ?LOG_WARNING(#{msg => registration_dropped, reason => invalid_registration}),
     ok = dets:delete_object(?DETS, Record).
 
-load_registration({Token, _Environment, Topics, _Version, _Platform} = Registration, Migrate) ->
+load_registration({Token, _Environment, Topics, _Version, _Platform, _Admission} = Registration, Migrate) ->
     case {valid_registration(Registration), Topics} of
         {true, []} ->
             ?LOG_INFO(#{msg => registration_dropped, reason => empty_subscriptions}),
@@ -201,6 +228,10 @@ drop_record(Token) ->
     ?LOG_WARNING(#{msg => registration_dropped, reason => invalid_registration}),
     ok = dets:delete(?DETS, Token).
 
+valid_registration({Token, Environment, Topics, Version, Platform, #{admitted_at := At, confirmed := Confirmed} = Admission}) ->
+    is_integer(At) andalso At >= 0 andalso is_integer(Version) andalso At =< Version andalso
+        is_boolean(Confirmed) andalso map_size(Admission) =:= 2 andalso
+        valid_registration({Token, Environment, Topics, Version, Platform});
 valid_registration({Token, Environment, Topics, Version, Platform}) when
     (Environment =:= sandbox orelse Environment =:= production),
     is_list(Topics), length(Topics) =< 50,
@@ -217,9 +248,9 @@ migrate(Registration) ->
     ok = write(Registration),
     insert_ets(Registration).
 
-store({Token, _Environment, Topics, _Version, _Platform} = Registration) ->
+store({Token, _Environment, Topics, _Version, _Platform, _Admission} = Registration) ->
     OldTopics = case ets:lookup(?REGISTRATIONS, Token) of
-        [{Token, _, Previous, _, _}] -> Previous;
+        [{Token, _, Previous, _, _, _}] -> Previous;
         [] -> []
     end,
     ok = write(Registration),
@@ -243,8 +274,10 @@ publication_checkpoint(Stage) ->
 publication_checkpoint(_Stage) -> ok.
 -endif.
 
-write({Token, Environment, Topics, Version, Platform}) ->
-    dets:insert(?DETS, {Token, {registration, 2, Environment, Topics, Version, Platform}}).
+write({Token, Environment, Topics, Version, Platform, Admission}) ->
+    dets:insert(?DETS, {Token, {registration, 3, Environment, Topics, Version, Platform, Admission}}).
+
+admission(Version) -> #{admitted_at => Version, confirmed => false}.
 
 remove(Token) ->
     ok = dets:delete(?DETS, Token),
@@ -252,13 +285,13 @@ remove(Token) ->
     delete_ets(Token),
     ok.
 
-insert_ets({Token, _Environment, Topics, _Version, _Platform} = Registration) ->
+insert_ets({Token, _Environment, Topics, _Version, _Platform, _Admission} = Registration) ->
     ets:insert(?REGISTRATIONS, Registration),
     ets:insert(?INDEX, [{Topic, Token} || Topic <- Topics]).
 
 delete_ets(Token) ->
     case ets:lookup(?REGISTRATIONS, Token) of
-        [{Token, _Environment, Topics, _Version, _Platform}] ->
+        [{Token, _Environment, Topics, _Version, _Platform, _Admission}] ->
             [ets:delete_object(?INDEX, {Topic, Token}) || Topic <- Topics],
             ets:delete(?REGISTRATIONS, Token);
         [] ->
@@ -271,7 +304,7 @@ next_version(Previous) ->
 
 remove_expired() ->
     Cutoff = erlang:system_time(millisecond) - env(registration_ttl_days) * 86400000,
-    Expired = ets:select(?REGISTRATIONS, [{{'$1', '_', '_', '$2', '_'}, [{'<', '$2', Cutoff}], ['$1']}]),
+    Expired = ets:select(?REGISTRATIONS, [{{'$1', '_', '_', '$2', '_', '_'}, [{'<', '$2', Cutoff}], ['$1']}]),
     lists:foreach(fun remove/1, Expired),
     spacepush_stats:count(<<"registrations.expired">>, length(Expired)),
     Expired =/= [] andalso ?LOG_INFO(#{msg => registrations_expired, count => length(Expired)}).

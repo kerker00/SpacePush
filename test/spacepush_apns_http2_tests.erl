@@ -138,14 +138,17 @@ partial_response_waits_for_fin() ->
         Response = receive {gun_response, Connection, Ref, nofin, 200, _} = R -> R after 2000 -> error(no_partial_headers) end,
         WithHeaders = info(Response, Sent),
         ?assertEqual(1, spacepush_outbox:pending()),
+        ?assertMatch(#{<<"by_confirmation">> := #{<<"unconfirmed">> := 1}}, spacepush_registry:summary()),
         spacepush_http2_fixture:frame(Fixture, cow_http2:data(Stream, nofin, <<"{">>)),
         First = receive {gun_data, Connection, Ref, nofin, <<"{">>} = D -> D after 2000 -> error(no_partial_body) end,
         Partial = info(First, WithHeaders),
         ?assertEqual(1, map_size(maps:get(in_flight, Partial))),
         ?assertEqual(1, spacepush_outbox:pending()),
+        ?assertMatch(#{<<"by_confirmation">> := #{<<"unconfirmed">> := 1}}, spacepush_registry:summary()),
         spacepush_http2_fixture:frame(Fixture, cow_http2:data(Stream, fin, <<"}">>)),
         Last = receive {gun_data, Connection, Ref, fin, <<"}">>} = D2 -> D2 after 2000 -> error(no_final_body) end,
         Completed = info(Last, Partial),
         ?assertEqual(#{}, maps:get(in_flight, Completed)),
-        ?assertEqual(0, spacepush_outbox:pending())
+        ?assertEqual(0, spacepush_outbox:pending()),
+        ?assertMatch(#{<<"by_confirmation">> := #{<<"accepted_by_apns">> := 1}}, spacepush_registry:summary())
     after spacepush_http2_fixture:stop(Fixture) end.

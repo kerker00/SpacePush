@@ -60,7 +60,11 @@ dispatch_test_() ->
         fun server_errors_wait_fifteen_minutes/0,
         fun rate_limits_keep_exponential_backoff/0,
         fun short_lived_server_errors_expire_without_early_retry/0,
-        fun sender_holds_in_flight_successor_until_cooldown/0
+        fun sender_holds_in_flight_successor_until_cooldown/0,
+        fun successful_response_confirms_current_registration/0,
+        fun failed_response_does_not_confirm_registration/0,
+        fun late_success_does_not_confirm_renewed_registration/0,
+        fun dry_run_does_not_confirm_registration/0
     ]}.
 
 setup_dispatch() ->
@@ -227,6 +231,42 @@ send_and_respond(Status) ->
     [Ref] = maps:keys(maps:get(in_flight, Sent)),
     {noreply, Completed} = spacepush_apns:handle_info({gun_response, self(), Ref, fin, Status, []}, Sent),
     ?assertEqual(#{}, maps:get(in_flight, Completed)).
+
+confirmed() ->
+    #{<<"by_confirmation">> := Counts} = spacepush_registry:summary(),
+    maps:get(<<"accepted_by_apns">>, Counts, 0).
+
+successful_response_confirms_current_registration() ->
+    send_and_respond(200),
+    ?assertEqual(1, confirmed()),
+    ?assertEqual(0, spacepush_outbox:pending()),
+    gen_server:stop(spacepush_registry),
+    start(spacepush_registry),
+    ?assertEqual(1, confirmed()).
+
+failed_response_does_not_confirm_registration() ->
+    lists:foreach(fun(Status) ->
+        send_and_respond(Status),
+        ?assertEqual(0, confirmed()),
+        %% Expire this case's retry before dispatching the next independent case.
+        ?assertEqual([], spacepush_outbox:due(erlang:system_time(millisecond) + 3600000, [], 10))
+    end, [429, 500, 413]).
+
+late_success_does_not_confirm_renewed_registration() ->
+    ok = spacepush_registry:register(token(1), sandbox, [topic()]),
+    ok = spacepush_outbox:enqueue([{topic(), <<"Test">>, closed, open}]),
+    {noreply, Sent} = spacepush_apns:handle_cast(wake, sender_state(self())),
+    [Ref] = maps:keys(maps:get(in_flight, Sent)),
+    ok = spacepush_registry:register(token(1), sandbox, [topic()]),
+    {noreply, _} = spacepush_apns:handle_info({gun_response, self(), Ref, fin, 200, []}, Sent),
+    ?assertEqual(0, confirmed()).
+
+dry_run_does_not_confirm_registration() ->
+    ok = spacepush_registry:register(token(1), sandbox, [topic()]),
+    ok = spacepush_outbox:enqueue([{topic(), <<"Test">>, closed, open}]),
+    {noreply, _} = spacepush_apns:handle_cast(wake, (sender_state(self()))#{keys := #{}}),
+    ?assertEqual(0, spacepush_outbox:pending()),
+    ?assertEqual(0, confirmed()).
 
 server_errors_wait_fifteen_minutes() ->
     application:set_env(spacepush, delivery_ttl_ms, 3600000),

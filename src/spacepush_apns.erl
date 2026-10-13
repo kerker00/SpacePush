@@ -356,6 +356,7 @@ finish(#{delivery := Delivery, status := Status, body := Body}, State) ->
     spacepush_stats:count(<<"push.", (atom_to_binary(Result))/binary>>),
     case Result of
         delivered ->
+            ok = spacepush_registry:confirm_if(Token, Environment, Version),
             spacepush_outbox:complete(Key, Id),
             State;
         invalid_token ->
