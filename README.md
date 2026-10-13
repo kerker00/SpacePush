@@ -102,13 +102,15 @@ Read the current state, in the shapes the apps already decode:
     GET /v1/directory                    the listed spaces, in the aggregator's format
     GET /v1/spaces?endpoint=<url>        a space's last successful SpaceAPI document
     GET /v1/mainframe/rooms              Mainframe's openState response
-    GET /v1/summary                      {"open", "total", "as_of"}: how many listed spaces are open
+    GET /v1/summary                      open-space count, coverage and observation times
 
-`/v1/directory` prefers a recent direct fetch and otherwise uses the hourly aggregator data. Every response checks the original observation time against `max_data_age_s`; expired states omit the open flag while the space's name, location and allowlisted endpoint remain available. Future timestamps do not provide a current state. Directory and summary responses use `Cache-Control: no-cache` so clients revalidate them.
+`/v1/directory` uses the newer current observation from a direct fetch or the hourly aggregator data. Every response checks the original observation time against `max_data_age_s` (900 seconds by default); expired states omit the open flag while the space's name, location and allowlisted endpoint remain available. Future timestamps do not provide a current state. The watch window controls polling activity, not observation freshness. All successful read responses use `Cache-Control: no-cache` so clients revalidate them, and expose the configured limit in `X-SpacePush-Max-Data-Age` (seconds). Summary also exposes this header to cross-origin web clients.
 
-`/v1/summary` counts the same current opening flags as `/v1/directory`; `as_of` is the newest timestamp among known current states, or `null` when none is known. It does not describe the age of every listed space. It carries `Access-Control-Allow-Origin: *`, so web pages such as the project site can show the number live.
+`/v1/summary` returns `open`, `total`, `known`, `unknown`, `as_of` and `newest_as_of`. It counts the same current opening flags as `/v1/directory`; `known` includes both current open and closed states, and `unknown = total - known`. Unknown spaces are not closed spaces. **`as_of` now describes the oldest included observation**, so one newly fetched space cannot make the whole count appear newly observed; `newest_as_of` describes the newest. Both are RFC 3339 UTC timestamps, or `null` when no current states are known. These times describe the known subset, not unknown spaces. It carries `Access-Control-Allow-Origin: *`, so web pages such as the project site can show the number live.
 
-Document responses carry `X-SpacePush-Fetched-At`. A failed refresh can serve an older last good document with its original timestamp. Mainframe responses without any usable room are treated as failed refreshes.
+Space and Mainframe document responses carry `X-SpacePush-Fetched-At` (last successful fetch, Unix seconds), `X-SpacePush-Max-Data-Age` (configured freshness limit in seconds) and `X-SpacePush-Expires-At` (fetch time plus that limit, Unix seconds). A failed or deferred refresh can serve the last good document only while its original fetch is at most `max_data_age_s` old; an expired or future-dated fallback answers `502` with `error: "stale_data"`. This applies to both spaces and rooms. Timestamp headers round down to whole seconds; clients should expire a retained answer conservatively at the advertised expiry. Mainframe responses without any usable room are treated as failed refreshes.
+
+A successful fetch records when SpacePush received usable data, not when a physical door was measured. SpaceAPI `state.lastchange` and Mainframe room timestamps describe state changes and do not reset this observation time. A client's successful read and most recent attempt are separate times. These headers provide the server policy for clients to adopt; they do not automatically expire data already retained in an app, widget, CLI cache or website. On a read error, a client may retain a labelled last known value, but must not present it as a newly observed current state or silently classify unknown as closed.
 
 Unknown endpoints answer `404`; a space that cannot be fetched and has nothing cached answers `502`, and too many spaces fetched at once `503`.
 
@@ -190,11 +192,11 @@ All settings live in the `spacepush` application environment (see `src/spacepush
 | `trust_proxy` | Rate-limit by `X-Forwarded-For`; enable only behind a trusted proxy |
 | `poll_interval_ms`, `debounce_s` | Polling interval and how long a new state must hold |
 | `aggregator_url`, `directory_refresh_ms`, `directory_max_bytes` | Source of the list of spaces, how often it is reloaded and its size limit |
-| `max_data_age_s` | Aggregator states older than this are not shown in the directory |
+| `max_data_age_s` | Maximum observation age for directory/summary states and space/room document reads |
 | `watch_window_ms` | How long a space stays fetched after an app asked for it |
 | `fetch_concurrency`, `fetch_timeout_ms`, `max_body_bytes` | Limits for fetching spaces |
 | `fetch_min_interval_ms`, `fetch_backoff_max_ms` | Shared minimum time between attempts per endpoint, and maximum failure backoff |
-| `cache_max_age_ms`, `on_demand_fetch_limit`, `on_demand_waiter_limit` | Freshness of read API answers, combined parallel refreshes and total waiting callers |
+| `cache_max_age_ms`, `on_demand_fetch_limit`, `on_demand_waiter_limit` | Time before a read attempts refresh, combined parallel refreshes and total waiting callers |
 | `notification_cooldown_ms` | Minimum time from the last dispatch attempt to a new state for the same device and room; retries of the same delivery use their own backoff. Kept in memory, reset on restart |
 | `rate_limit_per_minute`, `read_rate_limit_per_minute`, `http_max_connections` | Limits for clients |
 | `max_registrations`, `registration_ttl_days` | Cap and expiry for device registrations |

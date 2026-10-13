@@ -84,7 +84,8 @@ restored_old_list_keeps_endpoints_without_open_flags() ->
     ?assert(spacepush_directory:known(<<"https://a.example/">>)),
     Directory = spacepush_http_read:directory(erlang:system_time(millisecond)),
     ?assertMatch([#{<<"data">> := #{<<"space">> := <<"A">>}}], Directory),
-    ?assertEqual(#{<<"open">> => 0, <<"total">> => 1, <<"as_of">> => null}, spacepush_http_read:summary(Directory)).
+    ?assertEqual(#{<<"open">> => 0, <<"total">> => 1, <<"known">> => 0, <<"unknown">> => 1,
+        <<"as_of">> => null, <<"newest_as_of">> => null}, spacepush_http_read:summary(Directory)).
 
 saved_list(Entries) ->
     {ok, File} = application:get_env(spacepush, directory_file),
@@ -101,7 +102,8 @@ restored_partial_entries_are_safe_to_serve() ->
     ?assertMatch(#{name := null, address := null, lat := null, lon := null, open := null, last_seen := null}, Entry),
     Directory = spacepush_http_read:directory(erlang:system_time(millisecond)),
     ?assert(is_binary(iolist_to_binary(json:encode(Directory)))),
-    ?assertEqual(#{<<"open">> => 0, <<"total">> => 0, <<"as_of">> => null}, spacepush_http_read:summary(Directory)).
+    ?assertEqual(#{<<"open">> => 0, <<"total">> => 0, <<"known">> => 0, <<"unknown">> => 0,
+        <<"as_of">> => null, <<"newest_as_of">> => null}, spacepush_http_read:summary(Directory)).
 
 invalid_optional_metadata_preserves_the_endpoint() ->
     Endpoint = <<"https://a.example/">>,

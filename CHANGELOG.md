@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Apply `max_data_age_s` to space and room reads as well as directory states. Expired or future-dated fallback documents answer 502; current documents expose fetch, age-limit and expiry headers and require cache revalidation. Directory uses the newer current observation regardless of the polling watch window. Summary adds known/unknown coverage and `newest_as_of`; `as_of` now describes the oldest included current observation.
 - Validate device tokens and rooms consistently at the API, registry and sender boundaries. Empty subscriptions unregister a device persistently.
 - Persist the first admission time and APNs acceptance per registration. Confirm only matching completed responses, preserve acceptance across same-environment renewals, and expose aggregate confirmation counts in local statistics. Older records migrate to format 3 as unconfirmed; downgrades require a pre-upgrade registry backup.
 - Cap unconfirmed admission at 1000 registrations and expire it after a fixed 60 days. Renewal does not extend that deadline; expired records are excluded from reads and sends before periodic cleanup. Accepted registrations retain normal renewal, while an environment change requires a provisional slot. Preserve existing unexpired records above a lowered cap and reclaim expired capacity before admitting new registrations.
