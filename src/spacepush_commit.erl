@@ -51,11 +51,11 @@ recover(File) ->
 -spec pending(file:filename()) -> none | intent().
 pending(File) ->
     {module, spacepush_state} = code:ensure_loaded(spacepush_state),
-    case file:read_file(intent_file(File)) of
-        {error, enoent} -> none;
-        {error, Reason} -> error({tracker_intent_unreadable, Reason});
-        {ok, Binary} ->
-            Term = try binary_to_term(Binary, [safe]) catch error:badarg -> error(invalid_tracker_intent) end,
+    Read = try spacepush_store:read(intent_file(File))
+        catch error:{invalid_state_file, _} -> error(invalid_tracker_intent) end,
+    case Read of
+        missing -> none;
+        {ok, Term} ->
             case Term of
                 {tracker_commit, 1, Id, Snapshot, Changes} ->
                     case valid_intent(Id, Snapshot, Changes) of

@@ -37,7 +37,9 @@ registry_test_() ->
             fun empty_topics_never_consume_capacity/0,
             fun empty_topics_remove_existing_registration/0,
             fun empty_topics_work_at_full_capacity/0,
-            fun drops_persisted_empty_registrations/0
+            fun drops_persisted_empty_registrations/0,
+            fun validates_all_persisted_registration_fields/0,
+            fun corrupt_dets_file_has_explicit_start_error/0
         ]}.
 
 start() ->
@@ -307,3 +309,28 @@ drops_persisted_empty_registrations() ->
     ok = dets:close(Table),
     start(),
     ?assertMatch(#{<<"total">> := 1}, spacepush_registry:summary()).
+
+validates_all_persisted_registration_fields() ->
+    Version = erlang:system_time(millisecond),
+    with_raw_records([
+        {token(1), {registration, 2, sandbox, [?A], Version, <<"ios">>}},
+        {token(2)},
+        {token(3), {registration, 2, sandbox, [{<<255>>, <<"space">>}], Version, <<"ios">>}},
+        {token(4), {registration, 2, sandbox, [?A], 1 bsl 128, <<"ios">>}},
+        {token(5), {registration, 2, sandbox, [?A], Version, #{}}},
+        {token(6), {registration, 2, sandbox, [?A], Version, <<"unrecognized">>}}
+    ]),
+    ?assertEqual([{token(1), sandbox, Version}], spacepush_registry:subscribers(?A)),
+    stop(), start(),
+    ?assertMatch(#{<<"total">> := 1}, spacepush_registry:summary()).
+
+corrupt_dets_file_has_explicit_start_error() ->
+    stop(),
+    {ok, File} = application:get_env(spacepush, registry_file),
+    ok = file:write_file(File, <<"not a DETS file">>),
+    try
+        {Pid, Ref} = spawn_monitor(fun() -> spacepush_registry:init([]) end),
+        receive {'DOWN', Ref, process, Pid, Reason} ->
+            ?assertMatch({{state_table_open_failed, File, _}, _}, Reason)
+        after 2000 -> error(corrupt_registry_was_not_rejected) end
+    after ok = file:delete(File), start() end.

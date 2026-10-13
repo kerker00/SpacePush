@@ -21,7 +21,11 @@ server_test_() ->
         fun reports_devices/0,
         fun bounds_weekly_dimensions/0,
         fun bounds_ingress_while_suspended/0,
-        fun compacts_oversized_persisted_dimensions/0
+        fun compacts_oversized_persisted_dimensions/0,
+        fun malformed_saved_fields_do_not_prevent_start/0,
+        fun saved_counters_and_timestamps_are_sanitized/0,
+        fun invalid_saved_weekly_buckets_keep_valid_totals/0,
+        fun unsupported_saved_statistics_reset/0
     ]}.
 
 setup() ->
@@ -242,3 +246,50 @@ local_test_() ->
         ?_assertNot(spacepush_http_stats:local(Req({127, 0, 0, 1}, #{<<"x-forwarded-for">> => <<"203.0.113.7">>}))),
         ?_assertNot(spacepush_http_stats:local(Req({10, 0, 0, 1}, #{})))
     ].
+
+restart_from(Term) ->
+    gen_server:stop(spacepush_stats),
+    {ok, File} = application:get_env(spacepush, stats_file),
+    ok = spacepush_store:save(File, Term),
+    start(spacepush_stats).
+
+malformed_saved_fields_do_not_prevent_start() ->
+    [begin
+        restart_from(Term),
+        Report = spacepush_stats:report(1),
+        ?assert(is_binary(iolist_to_binary(json:encode(Report)))),
+        ?assertEqual(0, maps:get(<<"today">>, maps:get(<<"installs">>, Report)))
+    end || Term <- [{stats, 2, [], [], []}, {stats, 2, #{date() => []}, #{}, #{}},
+        {stats, 1, <<"salt">>, [], ignored, ignored, [], ignored}]].
+
+saved_counters_and_timestamps_are_sanitized() ->
+    Date = date(),
+    Future = calendar:gregorian_days_to_date(calendar:date_to_gregorian_days(Date) + 1),
+    Now = erlang:system_time(millisecond),
+    Days = #{Date => #{<<"push.delivered">> => 3, <<"negative">> => -1, <<"float">> => 1.0,
+        <<255>> => 4, garbage => 5, <<"large">> => 1 bsl 128},
+        {2026, 2, 31} => #{<<"installs.day">> => 9}, Future => #{<<"installs.day">> => 9},
+        bad_date => #{<<"installs.day">> => 9}},
+    Success = #{<<"directory">> => Now, <<"bad">> => [], <<"negative">> => -1,
+        <<"future">> => Now + 60000, <<255>> => Now},
+    restart_from({stats, 2, Days, #{}, Success}),
+    Report = spacepush_stats:report(1),
+    ?assertEqual(#{<<"date">> => label(Date), <<"push.delivered">> => 3}, today(Report)),
+    ?assertEqual([<<"directory">>], maps:keys(maps:get(<<"last_success">>, Report))),
+    ?assert(is_binary(iolist_to_binary(json:encode(Report)))),
+    gen_server:stop(spacepush_stats),
+    start(spacepush_stats),
+    ?assertEqual(today(Report), today(spacepush_stats:report(1))).
+
+invalid_saved_weekly_buckets_keep_valid_totals() ->
+    Label = spacepush_stats:week_label(date()),
+    Week = #{<<"versions">> => #{<<"2.0.0">> => 3, <<255>> => 2, <<"negative">> => -1, <<"large">> => 1 bsl 128},
+        <<"platforms">> => [], <<"os_versions">> => []},
+    restart_from({stats, 2, #{}, #{Label => Week}, #{}}),
+    Counts = weekly_counts(spacepush_stats:report(1)),
+    ?assertEqual(#{<<"2.0.0">> => 3, <<"other">> => 2}, maps:get(<<"versions">>, Counts)),
+    ?assertEqual(#{}, maps:get(<<"platforms">>, Counts)).
+
+unsupported_saved_statistics_reset() ->
+    restart_from({stats, 99, #{date() => #{<<"installs.day">> => 5}}, #{}, #{}}),
+    ?assertEqual(0, maps:get(<<"today">>, maps:get(<<"installs">>, spacepush_stats:report(1)))).

@@ -29,6 +29,18 @@ The local regression suite covers process crashes and abrupt VM termination at t
 
 Older releases do not understand the new outbox commit marker. Downgrading requires restoring a consistent pre-upgrade backup of the tracker and outbox.
 
+### Reading saved state
+
+Snapshots and recovery intents use safe ETF decoding and must contain exactly one term. `state_max_bytes` defaults to 64 MiB and limits both serialized input and output; compressed input also checks its declared expanded size before decoding. This is a serialized-data limit, not a bound on total process memory. Oversized files and filesystem read/write errors stop the operation with a named error and file path. A failed size check does not overwrite the previous snapshot.
+
+Missing snapshots start with empty state. Invalid ETF and unsupported directory, tracker or statistics snapshot versions fall back to empty state; unreadable or invalid recovery intents and unsupported outbox commit markers stop startup. Fix the file access or restore a consistent backup before restarting; do not discard a pending intent independently of its tracker and outbox.
+
+Directory recovery keeps at most 100,000 entries with nonempty UTF-8 endpoints of at most 4096 bytes. Missing or invalid optional metadata becomes `null`; geographic coordinates and observation timestamps are checked. Tracker recovery keeps valid topics, known states and bounded nonnegative candidate timestamps. Unexpected fields are removed.
+
+Statistics recovery keeps valid recent calendar dates and nonnegative integer counters, at most 256 counters per day with keys of at most 128 bytes. Weekly dimensions retain the configured limits plus `other`; malformed groups become empty maps. At most 32 last-success sources are kept, with bounded names and valid nonfuture timestamps. Format 1 counter migration remains supported, and valid totals survive within these limits.
+
+Registry recovery validates tokens, environments, topics, versions and platforms; supported older formats are migrated, while malformed or empty registrations are removed. Outbox recovery removes malformed delivery records, checks their identity, payload and collapse id, and keeps valid work across restarts. Delivery payloads are bounded to 4096 bytes. Diagnostics report error categories or dropped counts, without complete registration/delivery records or device tokens.
+
 ## Requirements
 
 - Erlang/OTP 28
@@ -153,6 +165,7 @@ All settings live in the `spacepush` application environment (see `src/spacepush
 | `delivery_ttl_ms` | How long a delivery is retried (also sent as `apns-expiration`) |
 | `apns_max_in_flight`, `apns_request_timeout_ms` | Concurrent APNs requests and their deadline |
 | `registry_file`, `outbox_file`, `tracker_file`, `directory_file`, `stats_file` | Where state is kept on disk |
+| `state_max_bytes` | Maximum serialized snapshot or recovery intent size; default 67108864 bytes, also checked for expanded compressed ETF |
 
 ## Deploy on Uberspace 7
 

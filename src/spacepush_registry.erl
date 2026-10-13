@@ -117,8 +117,7 @@ summary() ->
 init([]) ->
     process_flag(trap_exit, true),
     File = env(registry_file),
-    ok = filelib:ensure_dir(File),
-    {ok, ?DETS} = dets:open_file(?DETS, [{file, File}, {type, set}]),
+    ok = spacepush_persist:open_dets(?DETS, File),
     ets:new(?REGISTRATIONS, [named_table, protected, set, {read_concurrency, true}]),
     ets:new(?INDEX, [named_table, protected, bag, {read_concurrency, true}]),
     load(),
@@ -184,7 +183,8 @@ load_record({Token, {registration, 1, Environment, Topics, Version}}) ->
 load_record({Token, Environment, Topics, UpdatedAt}) when is_integer(UpdatedAt) ->
     load_registration({Token, Environment, Topics, UpdatedAt * 1000, <<"unknown">>}, true);
 load_record(Record) ->
-    drop_record(element(1, Record)).
+    ?LOG_WARNING(#{msg => registration_dropped, reason => invalid_registration}),
+    ok = dets:delete_object(?DETS, Record).
 
 load_registration({Token, _Environment, Topics, _Version, _Platform} = Registration, Migrate) ->
     case {valid_registration(Registration), Topics} of
@@ -204,15 +204,11 @@ drop_record(Token) ->
 valid_registration({Token, Environment, Topics, Version, Platform}) when
     (Environment =:= sandbox orelse Environment =:= production),
     is_list(Topics), length(Topics) =< 50,
-    is_integer(Version), Version >= 0, is_binary(Platform)
+    is_integer(Version), Version >= 0, Version =< 16#7fffffffffffffff
 ->
-    spacepush_device:valid_token(Token) andalso lists:all(
-        fun
-            ({Endpoint, Room}) when is_binary(Endpoint) -> spacepush_device:valid_room(Room);
-            (_) -> false
-        end,
-        Topics
-    );
+    spacepush_device:valid_token(Token) andalso
+        lists:member(Platform, [<<"ios">>, <<"macos">>, <<"unknown">>]) andalso
+        lists:all(fun spacepush_persist:topic/1, Topics);
 valid_registration(_) ->
     false.
 

@@ -196,3 +196,12 @@ restore_keeps_valid_entries_test() ->
 
 restore_rejects_unknown_formats_test_() ->
     [?_assertEqual(#{}, spacepush_state:restore(Term)) || Term <- [none, #{}, {tracker, 2, #{}}, {tracker, 1, []}]].
+
+restore_checks_topic_and_candidate_fields_test() ->
+    Good = #{confirmed => open, candidate => {closed, 60}},
+    Saved = #{?TOPIC => Good#{unwanted => <<"discard">>},
+        {<<255>>, <<"space">>} => Good,
+        {<<"https://b.example/">>, <<"bad-room">>} => Good,
+        {<<"https://c.example/">>, <<"space">>} => Good#{candidate := {closed, -1}},
+        {<<"https://d.example/">>, <<"space">>} => Good#{candidate := {closed, 1 bsl 128}}},
+    ?assertEqual(#{?TOPIC => Good}, spacepush_state:restore(spacepush_state:snapshot(Saved))).
