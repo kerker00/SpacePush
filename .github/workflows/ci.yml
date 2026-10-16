@@ -2,10 +2,10 @@ name: CI
 
 "on":
   pull_request:
-    branches: [dev, master]
+    branches: [dev, main]
     types: [opened, synchronize, reopened, ready_for_review]
   push:
-    branches: [dev, master]
+    branches: [dev, main]
   workflow_dispatch:
 
 permissions:
