@@ -57,7 +57,7 @@ require its pre-upgrade backup when downgrading.
 
 GitHub CI compiles production code and the test profile and runs the full EUnit suite on Ubuntu 24.04 with patched OTP 28.5.0.7 and 29.1.1 and rebar3 3.27.3. The checkout/setup actions are pinned to verified release commits, use read-only repository permissions and do not persist checkout credentials.
 
-Normal PR updates and pushes to `dev`/`main` run the matrix. Draft PRs skip jobs; marking a draft ready triggers them. The tests use mocked responses, temporary files, local loopback HTTP/2 peers and disposable crash-test VMs, without production configuration or genuine pushes. CI validates its runner's source and runtime, not the deployed host's version, proxy settings or release.
+Pull requests to `main` and pushes to `main` run the matrix. Draft PRs skip jobs; marking a draft ready triggers them. The tests use mocked responses, temporary files, local loopback HTTP/2 peers and disposable crash-test VMs, without production configuration or genuine pushes. CI validates its runner's source and runtime, not the deployed host's version, proxy settings or release.
 
 ## Requirements
 
@@ -297,7 +297,7 @@ Expect `28` and `OpenSSL 3.5.9`.
 ### 4. First release (once)
 
     mkdir -p ~/spacepush && cd ~/spacepush
-    git clone --branch dev https://github.com/kerker00/SpacePush.git src
+    git clone --branch main https://github.com/kerker00/SpacePush.git src
     cd src && rebar3 as prod release
     cp -a _build/prod/rel/spacepush ~/spacepush/release
 
