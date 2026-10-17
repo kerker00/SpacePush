@@ -20,7 +20,10 @@ directory_test_() ->
             fun keeps_the_saved_list_when_the_aggregator_fails/0,
             fun starts_empty_without_list/0,
             fun loads_a_list_larger_than_a_space_document/0,
-            fun restored_old_list_keeps_endpoints_without_open_flags/0
+            fun restored_old_list_keeps_endpoints_without_open_flags/0,
+            fun restored_partial_entries_are_safe_to_serve/0,
+            fun invalid_optional_metadata_preserves_the_endpoint/0,
+            fun unsupported_saved_format_starts_empty/0
         ]}.
 
 aggregator() ->
@@ -81,4 +84,37 @@ restored_old_list_keeps_endpoints_without_open_flags() ->
     ?assert(spacepush_directory:known(<<"https://a.example/">>)),
     Directory = spacepush_http_read:directory(erlang:system_time(millisecond)),
     ?assertMatch([#{<<"data">> := #{<<"space">> := <<"A">>}}], Directory),
-    ?assertEqual(#{<<"open">> => 0, <<"total">> => 1, <<"as_of">> => null}, spacepush_http_read:summary(Directory)).
+    ?assertEqual(#{<<"open">> => 0, <<"total">> => 1, <<"known">> => 0, <<"unknown">> => 1,
+        <<"as_of">> => null, <<"newest_as_of">> => null}, spacepush_http_read:summary(Directory)).
+
+saved_list(Entries) ->
+    {ok, File} = application:get_env(spacepush, directory_file),
+    ok = spacepush_store:save(File, {directory, 1, Entries}),
+    spacepush_test_util:fake_responses(#{aggregator() => {error, timeout}}),
+    start().
+
+restored_partial_entries_are_safe_to_serve() ->
+    Endpoint = <<"https://a.example/">>,
+    saved_list([#{endpoint => Endpoint}, garbage, #{endpoint => 42}, #{endpoint => <<255>>}]),
+    ?assert(spacepush_directory:known(Endpoint)),
+    ?assertEqual(1, length(spacepush_directory:entries())),
+    [Entry] = spacepush_directory:entries(),
+    ?assertMatch(#{name := null, address := null, lat := null, lon := null, open := null, last_seen := null}, Entry),
+    Directory = spacepush_http_read:directory(erlang:system_time(millisecond)),
+    ?assert(is_binary(iolist_to_binary(json:encode(Directory)))),
+    ?assertEqual(#{<<"open">> => 0, <<"total">> => 0, <<"known">> => 0, <<"unknown">> => 0,
+        <<"as_of">> => null, <<"newest_as_of">> => null}, spacepush_http_read:summary(Directory)).
+
+invalid_optional_metadata_preserves_the_endpoint() ->
+    Endpoint = <<"https://a.example/">>,
+    saved_list([#{endpoint => Endpoint, name => <<255>>, address => [], lat => 91, lon => -181,
+        open => yes, last_seen => 1 bsl 128, unwanted => <<"discard">>}]),
+    ?assertEqual([#{endpoint => Endpoint, name => null, address => null, lat => null, lon => null,
+        open => null, last_seen => null}], spacepush_directory:entries()),
+    ?assert(spacepush_directory:known(Endpoint)).
+
+unsupported_saved_format_starts_empty() ->
+    {ok, File} = application:get_env(spacepush, directory_file),
+    ok = spacepush_store:save(File, {directory, 99, [#{endpoint => <<"https://a.example/">>}]}),
+    start(),
+    ?assertNot(spacepush_directory:loaded()).

@@ -24,13 +24,21 @@ outbox_test_() ->
         [
             fun one_delivery_per_subscriber/0,
             fun newer_state_replaces_pending/0,
+            fun replacement_of_expired_row_survives_restart/0,
+            fun replacement_refreshes_live_delivery_lifetime/0,
+            fun replacement_keeps_future_retry_slot/0,
             fun late_result_cannot_complete_successor/0,
             fun retry_postpones/0,
             fun in_flight_key_holds_back_successor/0,
             fun expired_is_dropped/0,
             fun survives_restart/0,
             fun sent_topic_waits_for_cooldown/0,
-            fun changes_within_cooldown_merge/0
+            fun changes_within_cooldown_merge/0,
+            fun replacements_do_not_reserve_extra_intervals/0,
+            fun retries_use_their_own_backoff/0,
+            fun stale_selection_cannot_begin_attempt/0,
+            fun another_device_has_its_own_cooldown/0,
+            fun malformed_saved_deliveries_are_removed/0
         ]}.
 
 start(Module) ->
@@ -65,6 +73,52 @@ late_result_cannot_complete_successor() ->
     ok = spacepush_outbox:retry(Key, OldId, now_ms() + 60000),
     ?assertMatch([#{attempts := 0}], spacepush_outbox:due(now_ms(), [], 10)).
 
+replace_persisted(Delivery) ->
+    gen_server:stop(spacepush_outbox),
+    {ok, File} = application:get_env(spacepush, outbox_file),
+    {ok, replacement_fixture} = dets:open_file(replacement_fixture, [{file, File}, {type, set}]),
+    ok = dets:insert(replacement_fixture, {maps:get(key, Delivery), Delivery}),
+    ok = dets:close(replacement_fixture),
+    start(spacepush_outbox).
+
+replacement_of_expired_row_survives_restart() ->
+    application:set_env(spacepush, notification_cooldown_ms, 0),
+    application:set_env(spacepush, delivery_ttl_ms, 1000),
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [Old] = spacepush_outbox:due(now_ms(), [], 10),
+    replace_persisted(Old#{not_before := now_ms() - 2000, expires := now_ms() - 1000}),
+    Before = now_ms(),
+    ok = spacepush_outbox:enqueue([change(closed)]),
+    gen_server:stop(spacepush_outbox),
+    start(spacepush_outbox),
+    [New] = spacepush_outbox:due(Before + 500, [], 10),
+    ?assertEqual(<<"closed">>, state(New)),
+    ?assertNotEqual(maps:get(id, Old), maps:get(id, New)).
+
+replacement_refreshes_live_delivery_lifetime() ->
+    application:set_env(spacepush, delivery_ttl_ms, 1000),
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [Old] = spacepush_outbox:due(now_ms(), [], 10),
+    Slot = now_ms() - 900,
+    replace_persisted(Old#{not_before := Slot, expires := now_ms() + 100}),
+    Before = now_ms(),
+    ok = spacepush_outbox:enqueue([change(member)]),
+    [New] = spacepush_outbox:due(Before + 500, [], 10),
+    ?assertEqual(<<"member">>, state(New)),
+    ?assertEqual(Slot, maps:get(not_before, New)).
+
+replacement_keeps_future_retry_slot() ->
+    application:set_env(spacepush, delivery_ttl_ms, 1000),
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [#{key := Key, id := Id}] = spacepush_outbox:due(now_ms(), [], 10),
+    Later = now_ms() + 10000,
+    ok = spacepush_outbox:retry(Key, Id, Later),
+    ok = spacepush_outbox:enqueue([change(closed)]),
+    ?assertEqual([], spacepush_outbox:due(Later - 1, [], 10)),
+    [New] = spacepush_outbox:due(Later + 500, [], 10),
+    ?assertEqual(<<"closed">>, state(New)),
+    ?assertEqual([], spacepush_outbox:due(Later + 1000, [], 10)).
+
 retry_postpones() ->
     ok = spacepush_outbox:enqueue([change(open)]),
     [#{key := Key, id := Id}] = spacepush_outbox:due(now_ms(), [], 10),
@@ -78,12 +132,14 @@ retry_postpones() ->
 in_flight_key_holds_back_successor() ->
     ok = spacepush_outbox:enqueue([change(open)]),
     [#{key := Key, id := OpenId}] = spacepush_outbox:due(now_ms(), [], 10),
+    Attempted = now_ms(),
+    ok = spacepush_outbox:begin_attempt(Key, OpenId, Attempted),
     ok = spacepush_outbox:enqueue([change(closed)]),
     ?assertEqual([], spacepush_outbox:due(now_ms(), [Key], 10)),
-    %% The late result for "open" leaves "closed" in place, which is due once the key is free.
+    %% The late result leaves the successor queued until the dispatch cooldown.
     ok = spacepush_outbox:complete(Key, OpenId),
-    ?assertMatch([#{key := Key}], spacepush_outbox:due(now_ms(), [], 10)),
-    [Closed] = spacepush_outbox:due(now_ms(), [], 10),
+    ?assertEqual([], spacepush_outbox:due(Attempted + 299999, [], 10)),
+    [Closed] = spacepush_outbox:due(Attempted + 300000, [], 10),
     ?assertEqual(<<"closed">>, state(Closed)).
 
 expired_is_dropped() ->
@@ -102,6 +158,7 @@ survives_restart() ->
 sent_topic_waits_for_cooldown() ->
     ok = spacepush_outbox:enqueue([change(open)]),
     [#{key := Key, id := Id}] = spacepush_outbox:due(now_ms(), [], 10),
+    ok = spacepush_outbox:begin_attempt(Key, Id, now_ms()),
     ok = spacepush_outbox:complete(Key, Id),
     ok = spacepush_outbox:enqueue([change(closed)]),
     ?assertEqual([], spacepush_outbox:due(now_ms(), [], 10)),
@@ -111,8 +168,83 @@ sent_topic_waits_for_cooldown() ->
 changes_within_cooldown_merge() ->
     ok = spacepush_outbox:enqueue([change(open)]),
     [#{key := Key, id := Id}] = spacepush_outbox:due(now_ms(), [], 10),
+    ok = spacepush_outbox:begin_attempt(Key, Id, now_ms()),
     ok = spacepush_outbox:complete(Key, Id),
     ok = spacepush_outbox:enqueue([change(closed)]),
     ok = spacepush_outbox:enqueue([change(open)]),
     [Pending] = spacepush_outbox:due(now_ms() + 300000, [], 10),
     ?assertEqual(<<"open">>, state(Pending)).
+
+replacements_do_not_reserve_extra_intervals() ->
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [#{key := Key, id := Id}] = spacepush_outbox:due(now_ms(), [], 10),
+    At = now_ms(),
+    ok = spacepush_outbox:begin_attempt(Key, Id, At),
+    ok = spacepush_outbox:complete(Key, Id),
+    [ok = spacepush_outbox:enqueue([change(State)]) || State <- [closed, member, open_plus]],
+    ?assertEqual([], spacepush_outbox:due(At + 299999, [], 10)),
+    [#{id := LatestId} = Latest] = spacepush_outbox:due(At + 300000, [], 10),
+    ?assertEqual(<<"open_plus">>, state(Latest)),
+    ok = spacepush_outbox:begin_attempt(Key, LatestId, At + 300000),
+    ok = spacepush_outbox:complete(Key, LatestId),
+    ok = spacepush_outbox:enqueue([change(closed)]),
+    ?assertMatch([#{key := Key}], spacepush_outbox:due(At + 600000, [], 10)).
+
+retries_use_their_own_backoff() ->
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [#{key := Key, id := Id}] = spacepush_outbox:due(now_ms(), [], 10),
+    At = now_ms(),
+    ok = spacepush_outbox:begin_attempt(Key, Id, At),
+    ok = spacepush_outbox:retry(Key, Id, At + 5000),
+    ?assertEqual([], spacepush_outbox:due(At + 4999, [], 10)),
+    ?assertMatch([#{id := Id}], spacepush_outbox:due(At + 5000, [], 10)),
+    ok = spacepush_outbox:begin_attempt(Key, Id, At + 5000),
+    ok = spacepush_outbox:enqueue([change(closed)]),
+    ?assertEqual([], spacepush_outbox:due(At + 304999, [], 10)),
+    ?assertMatch([#{key := Key}], spacepush_outbox:due(At + 305000, [], 10)).
+
+stale_selection_cannot_begin_attempt() ->
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [#{key := Key, id := OldId}] = spacepush_outbox:due(now_ms(), [], 10),
+    ok = spacepush_outbox:enqueue([change(closed)]),
+    ?assertEqual(skipped, spacepush_outbox:begin_attempt(Key, OldId, now_ms())),
+    [#{id := NewId}] = spacepush_outbox:due(now_ms(), [], 10),
+    ?assertEqual(ok, spacepush_outbox:begin_attempt(Key, NewId, now_ms())).
+
+another_device_has_its_own_cooldown() ->
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [#{key := Key, id := Id}] = spacepush_outbox:due(now_ms(), [], 10),
+    ok = spacepush_outbox:begin_attempt(Key, Id, now_ms()),
+    ok = spacepush_outbox:complete(Key, Id),
+    ok = spacepush_registry:register(token(2), production, [?A]),
+    ok = spacepush_outbox:enqueue([change(closed)]),
+    [#{token := Token}] = spacepush_outbox:due(now_ms(), [], 10),
+    ?assertEqual(token(2), Token).
+
+malformed_saved_deliveries_are_removed() ->
+    ok = spacepush_outbox:enqueue([change(open)]),
+    [Good] = spacepush_outbox:due(now_ms(), [], 10),
+    gen_server:stop(spacepush_outbox),
+    {ok, File} = application:get_env(spacepush, outbox_file),
+    {ok, invalid_fixture} = dets:open_file(invalid_fixture, [{file, File}, {type, set}]),
+    Variants = [#{environment => garbage}, #{payload => []}, #{collapse_id => <<"bad\n">>},
+        #{attempts => -1}, #{id => bad}, #{version => 1 bsl 128}, #{not_before => []},
+        #{payload => binary:copy(<<"a">>, 4097)}],
+    Bad = [begin
+        Token = token(N + 1), Key = {Token, ?A},
+        {Key, maps:merge(Good#{key := Key, token := Token}, Fields)}
+    end || {N, Fields} <- lists:zip(lists:seq(1, length(Variants)), Variants)],
+    Missing = maps:remove(expires, Good#{key := {token(10), ?A}, token := token(10)}),
+    ok = dets:insert(invalid_fixture, Bad ++ [{{token(10), ?A}, Missing}, {<<"unknown">>},
+        {maps:get(key, Good), Good#{unwanted => <<"discard">>}}]),
+    ok = dets:close(invalid_fixture),
+    start(spacepush_outbox),
+    ?assertEqual([Good], spacepush_outbox:due(now_ms(), [], 10)),
+    ?assertEqual(1, spacepush_outbox:pending()),
+    gen_server:stop(spacepush_outbox),
+    {ok, invalid_fixture} = dets:open_file(invalid_fixture, [{file, File}, {type, set}]),
+    ?assertEqual(1, dets:info(invalid_fixture, size)),
+    ?assertEqual([{maps:get(key, Good), Good}], dets:lookup(invalid_fixture, maps:get(key, Good))),
+    ok = dets:close(invalid_fixture),
+    start(spacepush_outbox),
+    ?assertEqual([Good], spacepush_outbox:due(now_ms(), [], 10)).

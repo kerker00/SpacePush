@@ -18,6 +18,9 @@ fixture(Name) ->
 -doc "Loads the application defaults and points all files into a fresh directory.".
 setup_env(Name) ->
     _ = application:load(spacepush),
+    application:set_env(spacepush, max_unconfirmed_registrations, 1000),
+    application:set_env(spacepush, unconfirmed_registration_ttl_days, 60),
+    application:unset_env(spacepush, registry_clock),
     Dir = tmp_dir(Name),
     application:set_env(spacepush, registry_file, filename:join(Dir, "registry.dets")),
     application:set_env(spacepush, outbox_file, filename:join(Dir, "outbox.dets")),
@@ -69,6 +72,7 @@ enqueue_in_fresh_node(Dir) ->
     _ = application:load(spacepush),
     application:set_env(spacepush, registry_file, filename:join(Dir, "registry.dets")),
     application:set_env(spacepush, outbox_file, filename:join(Dir, "outbox.dets")),
+    application:set_env(spacepush, tracker_file, filename:join(Dir, "tracker.bin")),
     [begin {ok, Pid} = M:start_link(), unlink(Pid) end || M <- [spacepush_registry, spacepush_outbox]],
     Topic = {<<"https://a.example/">>, <<"space">>},
     ok = spacepush_registry:register(binary:copy(<<"ab">>, 32), sandbox, [Topic]),

@@ -18,6 +18,8 @@ registry_test_() ->
         [
             fun lookup/0,
             fun reregister_replaces_topics/0,
+            fun renewal_remains_visible_during_publication/0,
+            fun topic_changes_publish_with_the_registration/0,
             fun late_invalid_token_keeps_new_registration/0,
             fun invalid_token_needs_matching_environment/0,
             fun invalid_token_respects_timestamp/0,
@@ -26,6 +28,23 @@ registry_test_() ->
             fun migrates_prototype_records/0,
             fun migrates_format_1_records/0,
             fun keeps_platform/0,
+            fun confirmation_is_persistent_and_idempotent/0,
+            fun confirmation_requires_current_identity/0,
+            fun confirmation_does_not_recreate_removed_registration/0,
+            fun renewal_preserves_admission/0,
+            fun environment_change_resets_confirmation/0,
+            fun legacy_records_are_unconfirmed/0,
+            fun rejects_invalid_admission_metadata/0,
+            fun unconfirmed_capacity_is_separate/0,
+            fun concurrent_admission_respects_capacity/0,
+            fun unconfirmed_renewal_keeps_fixed_deadline/0,
+            fun confirmation_enables_sliding_renewal/0,
+            fun confirmed_environment_change_requires_capacity/0,
+            fun expired_rows_release_capacity_on_admission/0,
+            fun readers_and_fanout_hide_expired_rows/0,
+            fun expired_response_cannot_confirm/0,
+            fun migration_above_cap_retains_existing_registrations/0,
+            fun removal_releases_unconfirmed_capacity/0,
             fun drops_unknown_records/0,
             fun rejects_invalid_registration/0,
             fun drops_invalid_persisted_tokens_and_rooms/0,
@@ -35,7 +54,9 @@ registry_test_() ->
             fun empty_topics_never_consume_capacity/0,
             fun empty_topics_remove_existing_registration/0,
             fun empty_topics_work_at_full_capacity/0,
-            fun drops_persisted_empty_registrations/0
+            fun drops_persisted_empty_registrations/0,
+            fun validates_all_persisted_registration_fields/0,
+            fun corrupt_dets_file_has_explicit_start_error/0
         ]}.
 
 start() ->
@@ -44,6 +65,11 @@ start() ->
 
 stop() ->
     gen_server:stop(spacepush_registry).
+
+clock(Now) ->
+    application:set_env(spacepush, registry_clock, fun() -> Now end).
+
+days(N) -> N * 86400000.
 
 version(Token, Topic) ->
     [Version] = [V || {T, _Env, V} <- spacepush_registry:subscribers(Topic), T =:= Token],
@@ -59,6 +85,74 @@ reregister_replaces_topics() ->
     ok = spacepush_registry:register(token(1), production, [?B]),
     ?assertEqual([], spacepush_registry:subscribers(?A)),
     ?assertMatch([{_, production, _}], spacepush_registry:subscribers(?B)).
+
+with_paused_renewal(Environment, Topics, Before, After) ->
+    Parent = self(),
+    Registry = whereis(spacepush_registry),
+    application:set_env(spacepush, registry_publication_hook, fun(Stage) ->
+        Parent ! {publication, Stage, self()},
+        receive continue_publication -> ok after 2000 -> error(publication_not_resumed) end
+    end),
+    {Worker, Monitor} = spawn_monitor(fun() ->
+        Result = spacepush_registry:register(token(1), Environment, Topics),
+        Parent ! {renewal_result, self(), Result}
+    end),
+    try
+        receive {publication, indexed, Registry} -> ok after 2000 -> error(index_not_prepared) end,
+        Before(),
+        Registry ! continue_publication,
+        receive {publication, published, Registry} -> ok after 2000 -> error(registration_not_published) end,
+        After(),
+        Registry ! continue_publication,
+        receive {renewal_result, Worker, Result} -> ?assertEqual(ok, Result) after 2000 -> error(renewal_not_finished) end,
+        receive {'DOWN', Monitor, process, Worker, Reason} -> ?assertEqual(normal, Reason) after 2000 -> error(worker_not_finished) end
+    after
+        application:unset_env(spacepush, registry_publication_hook),
+        Registry ! continue_publication,
+        Registry ! continue_publication
+    end.
+
+renewal_remains_visible_during_publication() ->
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    {ok, sandbox, [?A], OldVersion} = spacepush_registry:lookup(token(1)),
+    {ok, Outbox} = spacepush_outbox:start_link(),
+    unlink(Outbox),
+    try
+        ok = spacepush_outbox:enqueue([{?A, <<"A">>, closed, open}]),
+        with_paused_renewal(sandbox, [?A], fun() ->
+            ?assertEqual({ok, sandbox, [?A], OldVersion}, spacepush_registry:lookup(token(1))),
+            ?assertEqual([{token(1), sandbox, OldVersion}], spacepush_registry:subscribers(?A)),
+            %% A confirmed change during publication must still fan out.
+            ok = spacepush_outbox:enqueue([{?A, <<"A">>, open, closed}]),
+            [#{payload := Payload}] = spacepush_outbox:due(erlang:system_time(millisecond), [], 10),
+            ?assertMatch(#{<<"state">> := <<"closed">>}, json:decode(Payload))
+        end, fun() ->
+            {ok, sandbox, [?A], NewVersion} = spacepush_registry:lookup(token(1)),
+            ?assert(NewVersion > OldVersion),
+            ?assertEqual([{token(1), sandbox, NewVersion}], spacepush_registry:subscribers(?A)),
+            ?assertEqual(1, spacepush_outbox:pending())
+        end)
+    after gen_server:stop(spacepush_outbox) end,
+    stop(),
+    start(),
+    ?assertMatch({ok, sandbox, [?A], _}, spacepush_registry:lookup(token(1))).
+
+topic_changes_publish_with_the_registration() ->
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    with_paused_renewal(production, [?B, ?B], fun() ->
+        ?assertMatch({ok, sandbox, [?A], _}, spacepush_registry:lookup(token(1))),
+        ?assertMatch([{_, sandbox, _}], spacepush_registry:subscribers(?A)),
+        ?assertEqual([], spacepush_registry:subscribers(?B)),
+        ?assertEqual([element(1, ?A)], spacepush_registry:subscribed_endpoints()),
+        ?assertMatch(#{<<"subscriptions">> := [#{<<"endpoint">> := <<"https://a.example/">>, <<"devices">> := 1}]}, spacepush_registry:summary())
+    end, fun() ->
+        ?assertMatch({ok, production, [?B, ?B], _}, spacepush_registry:lookup(token(1))),
+        ?assertEqual([], spacepush_registry:subscribers(?A)),
+        ?assertMatch([{_, production, _}], spacepush_registry:subscribers(?B)),
+        ?assertEqual([element(1, ?B)], spacepush_registry:subscribed_endpoints()),
+        ?assertMatch(#{<<"subscriptions">> := [#{<<"endpoint">> := <<"https://b.example/">>, <<"devices">> := 1}]}, spacepush_registry:summary())
+    end),
+    ?assertEqual([], ets:lookup(spacepush_topic_index, ?A)).
 
 late_invalid_token_keeps_new_registration() ->
     ok = spacepush_registry:register(token(1), sandbox, [?A]),
@@ -131,7 +225,8 @@ migrates_format_1_records() ->
     stop(),
     {ok, File} = application:get_env(spacepush, registry_file),
     {ok, Table} = dets:open_file(raw_registry, [{file, File}, {type, set}]),
-    ?assertEqual([{token(1), {registration, 2, production, [?A], Version, <<"unknown">>}}], dets:lookup(Table, token(1))),
+    ?assertEqual([{token(1), {registration, 3, production, [?A], Version, <<"unknown">>,
+        #{admitted_at => Version, confirmed => false}}}], dets:lookup(Table, token(1))),
     ok = dets:close(Table),
     start().
 
@@ -140,6 +235,272 @@ keeps_platform() ->
     stop(),
     start(),
     ?assertMatch(#{<<"total">> := 1, <<"by_platform">> := #{<<"macos">> := 1}}, spacepush_registry:summary()).
+
+admission(Token) ->
+    [{Token, _, _, _, _, Admission}] = ets:lookup(spacepush_registrations, Token),
+    Admission.
+
+confirmation_is_persistent_and_idempotent() ->
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    V = version(token(1), ?A),
+    Before = admission(token(1)),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, V),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, V),
+    ?assertEqual(Before#{confirmed := true}, admission(token(1))),
+    ?assertEqual(V, version(token(1), ?A)),
+    ?assertMatch(#{<<"by_confirmation">> := #{<<"accepted_by_apns">> := 1}}, spacepush_registry:summary()),
+    stop(), start(),
+    ?assertEqual(Before#{confirmed := true}, admission(token(1))).
+
+confirmation_requires_current_identity() ->
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    Old = version(token(1), ?A),
+    ok = spacepush_registry:confirm_if(token(1), production, Old),
+    ?assertEqual(false, maps:get(confirmed, admission(token(1)))),
+    ok = spacepush_registry:register(token(1), sandbox, [?B]),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, Old),
+    ?assertEqual(false, maps:get(confirmed, admission(token(1)))),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, version(token(1), ?B)),
+    ?assertEqual(true, maps:get(confirmed, admission(token(1)))).
+
+confirmation_does_not_recreate_removed_registration() ->
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    V = version(token(1), ?A),
+    ok = spacepush_registry:unregister(token(1)),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, V),
+    ?assertEqual(error, spacepush_registry:lookup(token(1))),
+    %% Re-registration in the same millisecond must not reuse the old version.
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    ?assert(version(token(1), ?A) > V),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, V),
+    ?assertEqual(false, maps:get(confirmed, admission(token(1)))).
+
+renewal_preserves_admission() ->
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    Initial = admission(token(1)),
+    ok = spacepush_registry:register(token(1), sandbox, [?B], <<"macos">>),
+    ?assertEqual(Initial, admission(token(1))),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, version(token(1), ?B)),
+    Confirmed = admission(token(1)),
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    ?assertEqual(Confirmed, admission(token(1))).
+
+environment_change_resets_confirmation() ->
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    V = version(token(1), ?A),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, V),
+    Initial = admission(token(1)),
+    ok = spacepush_registry:register(token(1), production, [?A]),
+    #{admitted_at := NewAt, confirmed := false} = admission(token(1)),
+    ?assert(NewAt >= maps:get(admitted_at, Initial)),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, V),
+    ?assertEqual(false, maps:get(confirmed, admission(token(1)))).
+
+unconfirmed_capacity_is_separate() ->
+    application:set_env(spacepush, max_unconfirmed_registrations, 1),
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    ?assertEqual({error, full}, spacepush_registry:register(token(2), sandbox, [?A])),
+    ?assertMatch(#{<<"total">> := 1, <<"cap">> := 3, <<"unconfirmed_cap">> := 1}, spacepush_registry:summary()),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, version(token(1), ?A)),
+    ok = spacepush_registry:register(token(2), sandbox, [?A]),
+    ok = spacepush_registry:confirm_if(token(2), sandbox, version(token(2), ?A)),
+    ok = spacepush_registry:register(token(3), sandbox, [?A]),
+    ?assertEqual({error, full}, spacepush_registry:register(token(4), sandbox, [?A])),
+    %% Both sorts of existing registration can renew at full total capacity.
+    Pending = admission(token(3)),
+    ok = spacepush_registry:register(token(1), sandbox, [?B]),
+    ok = spacepush_registry:register(token(3), sandbox, [?B]),
+    ?assertEqual(Pending, admission(token(3))).
+
+concurrent_admission_respects_capacity() ->
+    application:set_env(spacepush, max_registrations, 10),
+    application:set_env(spacepush, max_unconfirmed_registrations, 2),
+    Parent = self(),
+    Workers = [spawn_monitor(fun() ->
+        Parent ! {admission_result, self(), N, spacepush_registry:register(token(N), sandbox, [?A])}
+    end) || N <- lists:seq(1, 20)],
+    Results = [receive {admission_result, Pid, N, Result} -> {N, Result}
+        after 2000 -> error(admission_timeout) end || {Pid, _} <- Workers],
+    [receive {'DOWN', Ref, process, Pid, normal} -> ok
+        after 2000 -> error(admission_worker_timeout) end || {Pid, Ref} <- Workers],
+    Accepted = [N || {N, ok} <- Results],
+    ?assertEqual(2, length(Accepted)),
+    ?assertEqual(18, length([full || {_, {error, full}} <- Results])),
+    [First | _] = Accepted,
+    ok = spacepush_registry:confirm_if(token(First), sandbox, version(token(First), ?A)),
+    ok = spacepush_registry:register(token(21), sandbox, [?A]),
+    ?assertMatch(#{<<"by_confirmation">> := #{<<"accepted_by_apns">> := 1, <<"unconfirmed">> := 2}}, spacepush_registry:summary()).
+
+unconfirmed_renewal_keeps_fixed_deadline() ->
+    Base = erlang:system_time(millisecond),
+    clock(Base),
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    Initial = admission(token(1)),
+    clock(Base + days(59)),
+    ok = spacepush_registry:register(token(1), production, [?B]),
+    ?assertEqual(Initial, admission(token(1))),
+    stop(), start(),
+    ?assertMatch({ok, production, [?B], _}, spacepush_registry:lookup(token(1))),
+    ?assertEqual(Initial, admission(token(1))),
+    clock(Base + days(60) - 1),
+    ?assertMatch({ok, production, [?B], _}, spacepush_registry:lookup(token(1))),
+    clock(Base + days(60)),
+    ?assertEqual(error, spacepush_registry:lookup(token(1))),
+    stop(), start(),
+    ?assertEqual([], ets:lookup(spacepush_registrations, token(1))),
+    ?assertEqual([], dets:lookup(spacepush_registry, token(1))).
+
+confirmation_enables_sliding_renewal() ->
+    Base = erlang:system_time(millisecond),
+    clock(Base),
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, version(token(1), ?A)),
+    clock(Base + days(59)),
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    clock(Base + days(60)),
+    ?assertMatch({ok, sandbox, [?A], _}, spacepush_registry:lookup(token(1))),
+    stop(), start(),
+    ?assertEqual(true, maps:get(confirmed, admission(token(1)))),
+    clock(Base + days(119) - 1),
+    ?assertMatch({ok, sandbox, [?A], _}, spacepush_registry:lookup(token(1))),
+    clock(Base + days(119)),
+    ?assertEqual(error, spacepush_registry:lookup(token(1))).
+
+confirmed_environment_change_requires_capacity() ->
+    Base = erlang:system_time(millisecond),
+    clock(Base),
+    application:set_env(spacepush, max_unconfirmed_registrations, 1),
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, version(token(1), ?A)),
+    clock(Base + days(59)),
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    clock(Base + days(61)),
+    ok = spacepush_registry:register(token(2), sandbox, [?B]),
+    Before = ets:lookup(spacepush_registrations, token(1)),
+    ?assertEqual({error, full}, spacepush_registry:register(token(1), production, [?B])),
+    ?assertEqual(Before, ets:lookup(spacepush_registrations, token(1))),
+    ?assertMatch({ok, sandbox, [?A], _}, spacepush_registry:lookup(token(1))),
+    ok = spacepush_registry:unregister(token(2)),
+    ok = spacepush_registry:register(token(1), production, [?B]),
+    ?assertEqual(#{admitted_at => Base + days(61), confirmed => false}, admission(token(1))),
+    %% A confirmed device gets a fresh provisional window in its new environment.
+    clock(Base + days(120)),
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    ?assertEqual(Base + days(61), maps:get(admitted_at, admission(token(1)))),
+    clock(Base + days(121)),
+    ?assertEqual(error, spacepush_registry:lookup(token(1))).
+
+expired_rows_release_capacity_on_admission() ->
+    Base = erlang:system_time(millisecond),
+    clock(Base),
+    application:set_env(spacepush, max_unconfirmed_registrations, 1),
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    clock(Base + days(59)),
+    ok = spacepush_registry:register(token(1), sandbox, [?B]),
+    clock(Base + days(60)),
+    ok = spacepush_registry:register(token(2), sandbox, [?A]),
+    ?assertEqual([], dets:lookup(spacepush_registry, token(1))),
+    ?assertEqual([], ets:lookup(spacepush_topic_index, ?B)),
+    ?assertMatch(#{<<"total">> := 1, <<"by_confirmation">> := #{<<"unconfirmed">> := 1}}, spacepush_registry:summary()),
+    stop(), start(),
+    ?assertEqual(error, spacepush_registry:lookup(token(1))),
+    ?assertMatch({ok, sandbox, [?A], _}, spacepush_registry:lookup(token(2))).
+
+readers_and_fanout_hide_expired_rows() ->
+    Base = erlang:system_time(millisecond),
+    clock(Base),
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    clock(Base + days(59)),
+    ok = spacepush_registry:register(token(1), sandbox, [?B]),
+    clock(Base + days(60)),
+    %% This row still exists physically before the periodic sweep.
+    ?assertMatch([_], ets:lookup(spacepush_registrations, token(1))),
+    ?assertEqual(error, spacepush_registry:lookup(token(1))),
+    ?assertEqual([], spacepush_registry:subscribers(?B)),
+    ?assertEqual([], spacepush_registry:subscribed_endpoints()),
+    ?assertMatch(#{<<"total">> := 0, <<"subscriptions">> := []}, spacepush_registry:summary()),
+    {ok, Outbox} = spacepush_outbox:start_link(), unlink(Outbox),
+    try
+        ok = spacepush_outbox:enqueue([{?B, <<"B">>, closed, open}]),
+        ?assertEqual(0, spacepush_outbox:pending())
+    after gen_server:stop(spacepush_outbox) end,
+    whereis(spacepush_registry) ! remove_expired,
+    %% A call is a barrier for the previously enqueued sweep.
+    ok = spacepush_registry:unregister(token(2)),
+    ?assertEqual([], ets:lookup(spacepush_registrations, token(1))),
+    ?assertEqual([], dets:lookup(spacepush_registry, token(1))).
+
+expired_response_cannot_confirm() ->
+    Base = erlang:system_time(millisecond),
+    clock(Base),
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    clock(Base + days(59)),
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    V = version(token(1), ?A),
+    clock(Base + days(60)),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, V),
+    ?assertEqual(error, spacepush_registry:lookup(token(1))),
+    ?assertEqual([], dets:lookup(spacepush_registry, token(1))),
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    ?assertEqual(#{admitted_at => Base + days(60), confirmed => false}, admission(token(1))),
+    ok = spacepush_registry:confirm_if(token(1), sandbox, V),
+    ?assertEqual(false, maps:get(confirmed, admission(token(1)))).
+
+migration_above_cap_retains_existing_registrations() ->
+    Base = erlang:system_time(millisecond),
+    clock(Base),
+    application:set_env(spacepush, max_registrations, 5),
+    application:set_env(spacepush, max_unconfirmed_registrations, 1),
+    with_raw_records([
+        {token(1), {registration, 2, sandbox, [?A], Base, <<"ios">>}},
+        {token(2), {registration, 1, sandbox, [?A], Base}},
+        {token(3), sandbox, [?A], Base div 1000}
+    ]),
+    ?assertEqual(3, length(spacepush_registry:subscribers(?A))),
+    ?assertEqual({error, full}, spacepush_registry:register(token(4), sandbox, [?A])),
+    clock(Base + days(59)),
+    ok = spacepush_registry:register(token(1), production, [?B]),
+    ?assertEqual(Base, maps:get(admitted_at, admission(token(1)))),
+    stop(), start(),
+    ?assertEqual(3, maps:get(<<"total">>, spacepush_registry:summary())),
+    clock(Base + days(60)),
+    ok = spacepush_registry:register(token(4), sandbox, [?A]),
+    ?assertEqual(1, maps:get(<<"total">>, spacepush_registry:summary())),
+    stop(), start(),
+    ?assertEqual([{token(4), sandbox, Base + days(60)}], spacepush_registry:subscribers(?A)).
+
+removal_releases_unconfirmed_capacity() ->
+    application:set_env(spacepush, max_unconfirmed_registrations, 1),
+    ok = spacepush_registry:register(token(1), sandbox, [?A]),
+    ok = spacepush_registry:register(token(1), sandbox, []),
+    ok = spacepush_registry:register(token(2), sandbox, [?A]),
+    ok = spacepush_registry:unregister_if(token(2), sandbox, version(token(2), ?A), undefined),
+    ok = spacepush_registry:register(token(3), sandbox, [?A]),
+    ?assertMatch(#{<<"total">> := 1, <<"by_confirmation">> := #{<<"unconfirmed">> := 1}}, spacepush_registry:summary()).
+
+legacy_records_are_unconfirmed() ->
+    V = erlang:system_time(millisecond),
+    with_raw_records([
+        {token(1), {registration, 2, sandbox, [?A], V, <<"ios">>}},
+        {token(2), {registration, 1, production, [?B], V}},
+        {token(3), sandbox, [?A], V div 1000}
+    ]),
+    [?assertEqual(#{admitted_at => At, confirmed => false}, admission(token(N)))
+        || {N, At} <- [{1, V}, {2, V}, {3, V div 1000 * 1000}]],
+    stop(), start(),
+    ?assertMatch(#{<<"by_confirmation">> := #{<<"unconfirmed">> := 3}}, spacepush_registry:summary()).
+
+rejects_invalid_admission_metadata() ->
+    V = erlang:system_time(millisecond),
+    Valid = #{admitted_at => V, confirmed => true},
+    Bad = [#{}, Valid#{admitted_at := -1}, Valid#{admitted_at := V + 1},
+        Valid#{confirmed := <<"true">>}, Valid#{extra => <<"ignored">>}],
+    with_raw_records([{token(1), {registration, 3, sandbox, [?A], V, <<"ios">>, Valid}} |
+        [{token(N), {registration, 3, sandbox, [?A], V, <<"ios">>, A}}
+            || {N, A} <- lists:zip(lists:seq(2, 6), Bad)]]),
+    ?assertEqual([{token(1), sandbox, V}], spacepush_registry:subscribers(?A)),
+    stop(), start(),
+    ?assertMatch(#{<<"total">> := 1, <<"by_confirmation">> := #{<<"accepted_by_apns">> := 1}}, spacepush_registry:summary()).
 
 drops_unknown_records() ->
     with_raw_records([{token(1), {registration, 99, sandbox, [?A], 1}}, {token(2), garbage}]),
@@ -237,3 +598,28 @@ drops_persisted_empty_registrations() ->
     ok = dets:close(Table),
     start(),
     ?assertMatch(#{<<"total">> := 1}, spacepush_registry:summary()).
+
+validates_all_persisted_registration_fields() ->
+    Version = erlang:system_time(millisecond),
+    with_raw_records([
+        {token(1), {registration, 2, sandbox, [?A], Version, <<"ios">>}},
+        {token(2)},
+        {token(3), {registration, 2, sandbox, [{<<255>>, <<"space">>}], Version, <<"ios">>}},
+        {token(4), {registration, 2, sandbox, [?A], 1 bsl 128, <<"ios">>}},
+        {token(5), {registration, 2, sandbox, [?A], Version, #{}}},
+        {token(6), {registration, 2, sandbox, [?A], Version, <<"unrecognized">>}}
+    ]),
+    ?assertEqual([{token(1), sandbox, Version}], spacepush_registry:subscribers(?A)),
+    stop(), start(),
+    ?assertMatch(#{<<"total">> := 1}, spacepush_registry:summary()).
+
+corrupt_dets_file_has_explicit_start_error() ->
+    stop(),
+    {ok, File} = application:get_env(spacepush, registry_file),
+    ok = file:write_file(File, <<"not a DETS file">>),
+    try
+        {Pid, Ref} = spawn_monitor(fun() -> spacepush_registry:init([]) end),
+        receive {'DOWN', Ref, process, Pid, Reason} ->
+            ?assertMatch({{state_table_open_failed, File, _}, _}, Reason)
+        after 2000 -> error(corrupt_registry_was_not_rejected) end
+    after ok = file:delete(File), start() end.

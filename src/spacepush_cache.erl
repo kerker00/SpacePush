@@ -5,7 +5,8 @@ The latest response of every fetched space, and which spaces apps asked for.
 The poller keeps needed entries refreshed. `get/1` serves the HTTP API: it answers
 from the cache while the entry is younger than `cache_max_age_ms`, and
 otherwise fetches the URL once, however many requests wait for it at the same
-time. If that fetch fails, the last good response is served. Every `get/1`
+time. If that fetch fails, the last good response is returned to the caller;
+the HTTP handler checks its observation age before serving it. Every `get/1`
 also marks the URL as watched, so the poller keeps it fresh for a while.
 
 `refresh/1` is the poller's path through the same workers and per-URL admission.
@@ -46,7 +47,7 @@ get(Url) ->
     ets:insert(?WATCH, {Url, Now}),
     {ok, MaxAge} = application:get_env(spacepush, cache_max_age_ms),
     case lookup(Url) of
-        #{fetched_at := FetchedAt} = Entry when Now - FetchedAt < MaxAge ->
+        #{fetched_at := FetchedAt} = Entry when FetchedAt =< Now, Now - FetchedAt < MaxAge ->
             {ok, Entry};
         _ ->
             request(Url, read)

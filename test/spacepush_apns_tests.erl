@@ -56,7 +56,16 @@ dispatch_test_() ->
         fun paused_environment_does_not_starve_ready_environment/0,
         fun both_environments_receive_capacity/0,
         fun one_slot_alternates_between_ready_environments/0,
-        fun selects_the_current_registration_environment/0
+        fun selects_the_current_registration_environment/0,
+        fun server_errors_wait_fifteen_minutes/0,
+        fun rate_limits_keep_exponential_backoff/0,
+        fun short_lived_server_errors_expire_without_early_retry/0,
+        fun sender_holds_in_flight_successor_until_cooldown/0,
+        fun successful_response_confirms_current_registration/0,
+        fun failed_response_does_not_confirm_registration/0,
+        fun late_success_does_not_confirm_renewed_registration/0,
+        fun dry_run_does_not_confirm_registration/0,
+        fun expired_registration_is_not_dispatched/0
     ]}.
 
 setup_dispatch() ->
@@ -120,7 +129,12 @@ synchronous_send_failure_is_isolated() ->
              Token =:= token(1)
     ],
     %% A malformed persisted header triggers Gun's synchronous validation.
-    replace_delivery(Key, Delivery#{collapse_id := <<"invalid\n">>}),
+    %% Startup now rejects this record; inject runtime corruption to retain
+    %% coverage of the synchronous Gun failure boundary independently.
+    sys:replace_state(spacepush_outbox, fun(OutboxState) ->
+        true = ets:insert(spacepush_outbox_entries, {Key, Delivery#{collapse_id := <<"invalid\n">>}}),
+        OutboxState
+    end),
     %% Production has no key and completes via dry-run without any network.
     State = sender_state(self()),
     {noreply, Updated} = spacepush_apns:handle_cast(wake, State),
@@ -210,3 +224,99 @@ selects_the_current_registration_environment() ->
     [#{delivery := #{environment := production}}] = maps:values(maps:get(in_flight, Sent)),
     finish_only_request(Sent),
     ?assertEqual(0, spacepush_outbox:pending()).
+
+send_and_respond(Status) ->
+    ok = spacepush_registry:register(token(1), sandbox, [topic()]),
+    ok = spacepush_outbox:enqueue([{topic(), <<"Test">>, closed, open}]),
+    {noreply, Sent} = spacepush_apns:handle_cast(wake, sender_state(self())),
+    [Ref] = maps:keys(maps:get(in_flight, Sent)),
+    {noreply, Completed} = spacepush_apns:handle_info({gun_response, self(), Ref, fin, Status, []}, Sent),
+    ?assertEqual(#{}, maps:get(in_flight, Completed)).
+
+confirmed() ->
+    #{<<"by_confirmation">> := Counts} = spacepush_registry:summary(),
+    maps:get(<<"accepted_by_apns">>, Counts, 0).
+
+successful_response_confirms_current_registration() ->
+    application:set_env(spacepush, max_unconfirmed_registrations, 1),
+    send_and_respond(200),
+    ?assertEqual(1, confirmed()),
+    ?assertEqual(0, spacepush_outbox:pending()),
+    ok = spacepush_registry:register(token(2), sandbox, [topic()]),
+    gen_server:stop(spacepush_registry),
+    start(spacepush_registry),
+    ?assertEqual(1, confirmed()).
+
+expired_registration_is_not_dispatched() ->
+    Base = erlang:system_time(millisecond),
+    application:set_env(spacepush, registry_clock, fun() -> Base end),
+    ok = spacepush_registry:register(token(1), sandbox, [topic()]),
+    ok = spacepush_outbox:enqueue([{topic(), <<"Test">>, closed, open}]),
+    ?assertEqual(1, spacepush_outbox:pending()),
+    application:set_env(spacepush, registry_clock, fun() -> Base + 60 * 86400000 end),
+    {noreply, State} = spacepush_apns:handle_cast(wake, sender_state(self())),
+    ?assertEqual(#{}, maps:get(in_flight, State)),
+    ?assertEqual(0, spacepush_outbox:pending()).
+
+failed_response_does_not_confirm_registration() ->
+    lists:foreach(fun(Status) ->
+        send_and_respond(Status),
+        ?assertEqual(0, confirmed()),
+        %% Expire this case's retry before dispatching the next independent case.
+        ?assertEqual([], spacepush_outbox:due(erlang:system_time(millisecond) + 3600000, [], 10))
+    end, [429, 500, 413]).
+
+late_success_does_not_confirm_renewed_registration() ->
+    ok = spacepush_registry:register(token(1), sandbox, [topic()]),
+    ok = spacepush_outbox:enqueue([{topic(), <<"Test">>, closed, open}]),
+    {noreply, Sent} = spacepush_apns:handle_cast(wake, sender_state(self())),
+    [Ref] = maps:keys(maps:get(in_flight, Sent)),
+    ok = spacepush_registry:register(token(1), sandbox, [topic()]),
+    {noreply, _} = spacepush_apns:handle_info({gun_response, self(), Ref, fin, 200, []}, Sent),
+    ?assertEqual(0, confirmed()).
+
+dry_run_does_not_confirm_registration() ->
+    ok = spacepush_registry:register(token(1), sandbox, [topic()]),
+    ok = spacepush_outbox:enqueue([{topic(), <<"Test">>, closed, open}]),
+    {noreply, _} = spacepush_apns:handle_cast(wake, (sender_state(self()))#{keys := #{}}),
+    ?assertEqual(0, spacepush_outbox:pending()),
+    ?assertEqual(0, confirmed()).
+
+server_errors_wait_fifteen_minutes() ->
+    application:set_env(spacepush, delivery_ttl_ms, 3600000),
+    lists:foreach(fun(Status) ->
+        Before = erlang:system_time(millisecond),
+        send_and_respond(Status),
+        ?assertEqual([], spacepush_outbox:due(Before + 899999, [], 10)),
+        [#{key := Key, id := Id, attempts := 1}] = spacepush_outbox:due(erlang:system_time(millisecond) + 900000, [], 10),
+        ok = spacepush_outbox:complete(Key, Id)
+    end, [500, 503]).
+
+rate_limits_keep_exponential_backoff() ->
+    Before = erlang:system_time(millisecond),
+    send_and_respond(429),
+    ?assertEqual([], spacepush_outbox:due(Before + 4999, [], 10)),
+    ?assertMatch([#{attempts := 1}], spacepush_outbox:due(erlang:system_time(millisecond) + 5000, [], 10)).
+
+short_lived_server_errors_expire_without_early_retry() ->
+    application:set_env(spacepush, delivery_ttl_ms, 60000),
+    Before = erlang:system_time(millisecond),
+    send_and_respond(503),
+    ?assertEqual([], spacepush_outbox:due(Before + 59999, [], 10)),
+    ?assertEqual([], spacepush_outbox:due(erlang:system_time(millisecond) + 60000, [], 10)),
+    ?assertEqual(0, spacepush_outbox:pending()).
+
+sender_holds_in_flight_successor_until_cooldown() ->
+    application:set_env(spacepush, notification_cooldown_ms, 300000),
+    ok = spacepush_registry:register(token(1), sandbox, [topic()]),
+    ok = spacepush_outbox:enqueue([{topic(), <<"Test">>, closed, open}]),
+    {noreply, Sent} = spacepush_apns:handle_cast(wake, sender_state(self())),
+    [Ref] = maps:keys(maps:get(in_flight, Sent)),
+    ok = spacepush_outbox:enqueue([{topic(), <<"Test">>, open, closed}]),
+    {noreply, Completed} = spacepush_apns:handle_info({gun_response, self(), Ref, fin, 200, []}, Sent),
+    {noreply, Waiting} = spacepush_apns:handle_cast(wake, Completed),
+    ?assertEqual(#{}, maps:get(in_flight, Waiting)),
+    ?assertEqual(1, spacepush_outbox:pending()),
+    ?assertEqual([], spacepush_outbox:due(erlang:system_time(millisecond), [], 10)),
+    ?assertMatch([#{payload := _}], spacepush_outbox:due(erlang:system_time(millisecond) + 300000, [], 10)),
+    ?assertEqual({noreply, Waiting}, spacepush_apns:handle_info({gun_response, self(), Ref, fin, 200, []}, Waiting)).

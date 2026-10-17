@@ -57,10 +57,14 @@ handle_info(refresh, #{file := File} = State) ->
                 [] ->
                     ?LOG_WARNING(#{msg => directory_empty, url => Url});
                 Entries ->
-                    replace(Entries),
-                    spacepush_store:save(File, {directory, 1, Entries}),
-                    spacepush_stats:count(<<"directory.refresh_ok">>),
-                    spacepush_stats:success(<<"directory">>)
+                    case restore({directory, 1, Entries}) of
+                        [] -> ?LOG_WARNING(#{msg => directory_empty, url => Url});
+                        Normalized ->
+                            replace(Normalized),
+                            spacepush_store:save(File, {directory, 1, Normalized}),
+                            spacepush_stats:count(<<"directory.refresh_ok">>),
+                            spacepush_stats:success(<<"directory">>)
+                    end
             catch
                 Class:Reason ->
                     ?LOG_WARNING(#{msg => directory_unreadable, url => Url, class => Class, reason => Reason})
@@ -84,9 +88,25 @@ replace(Entries) ->
 
 %% Keeps only well-formed entries of a saved list in a known format.
 restore({directory, 1, Entries}) when is_list(Entries) ->
-    [Entry || #{endpoint := Endpoint} = Entry <- Entries, is_binary(Endpoint)];
+    [normalize(Entry) || #{endpoint := Endpoint} = Entry <- lists:sublist(Entries, 100000),
+        spacepush_persist:text(Endpoint, 4096)];
 restore(_) ->
     [].
+
+normalize(#{endpoint := Endpoint} = Entry) ->
+    #{endpoint => Endpoint,
+        name => optional_text(maps:get(name, Entry, null)),
+        address => optional_text(maps:get(address, Entry, null)),
+        lat => coordinate(maps:get(lat, Entry, null), 90),
+        lon => coordinate(maps:get(lon, Entry, null), 180),
+        open => case maps:get(open, Entry, null) of Flag when is_boolean(Flag) -> Flag; _ -> null end,
+        last_seen => timestamp(maps:get(last_seen, Entry, null))}.
+
+optional_text(Value) -> case spacepush_persist:text(Value, 4096) of true -> Value; false -> null end.
+coordinate(Value, Bound) when is_number(Value), Value >= -Bound, Value =< Bound -> Value;
+coordinate(_, _) -> null.
+timestamp(Value) when is_number(Value), Value >= 0, Value =< 253402300799 -> Value;
+timestamp(_) -> null.
 
 env(Key) ->
     {ok, Value} = application:get_env(spacepush, Key),
