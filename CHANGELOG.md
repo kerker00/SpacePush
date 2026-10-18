@@ -1,10 +1,12 @@
 # Changes
 
-## Unreleased
+## 2.1.0
 
 - Poll subscribed endpoints every two minutes and other directory spaces every ten minutes. Spread initial background deadlines, prioritize subscribers in bounded batches and observe fresh on-demand read generations without extra requests. Mainframe rooms follow the same subscription tier; read activity no longer enables frequent polling (`watch_window_ms` is unused). Keep shared cache admission, failure backoff and observation expiry unchanged.
 
 - Add server-local `POST /v1/test?endpoint=...&room=space` to broadcast a fixed test alert to active subscribers. Keep tests separate from state notifications in the persistent outbox and APNs collapse identifiers, apply a per-topic cooldown and retain registration/environment checks. Older releases discard pending test records on downgrade.
+
+## 2.0.0
 
 - Apply `max_data_age_s` to space and room reads as well as directory states. Expired or future-dated fallback documents answer 502; current documents expose fetch, age-limit and expiry headers and require cache revalidation. Directory uses the newer current observation regardless of the polling watch window. Summary adds known/unknown coverage and `newest_as_of`; `as_of` now describes the oldest included current observation.
 - Validate device tokens and rooms consistently at the API, registry and sender boundaries. Empty subscriptions unregister a device persistently.
