@@ -15,6 +15,7 @@ start(_StartType, _StartArgs) ->
             {"/v1/spaces", spacepush_http_read, space},
             {"/v1/mainframe/rooms", spacepush_http_read, mainframe_rooms},
             {"/health", spacepush_http_health, []},
+            {"/v1/test", spacepush_http_test, []},
             {"/v1/stats", spacepush_http_stats, []}
         ]}
     ]),

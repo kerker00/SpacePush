@@ -2,12 +2,14 @@
 -moduledoc """
 The latest response of every fetched space, and which spaces apps asked for.
 
-The poller keeps needed entries refreshed. `get/1` serves the HTTP API: it answers
+The poller refreshes directory entries on their subscription-based schedule.
+`get/1` serves the HTTP API: it answers
 from the cache while the entry is younger than `cache_max_age_ms`, and
 otherwise fetches the URL once, however many requests wait for it at the same
 time. If that fetch fails, the last good response is returned to the caller;
-the HTTP handler checks its observation age before serving it. Every `get/1`
-also marks the URL as watched, so the poller keeps it fresh for a while.
+the HTTP handler checks its observation age before serving it. `get/1` records
+read activity for `watched/1` diagnostics; read activity does not change
+scheduled polling intervals.
 
 `refresh/1` is the poller's path through the same workers and per-URL admission.
 Attempts start at least `fetch_min_interval_ms` apart. Failures back off from

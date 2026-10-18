@@ -3,6 +3,10 @@
 %% Do not commit the filled-in copy.
 [
     {spacepush, [
+        %% Regular polling; app reads still use the shared on-demand cache.
+        {poll_interval_ms, 120000},
+        {background_poll_interval_ms, 600000},
+        {poll_tick_ms, 5000},
         %% Uberspace's web backend connects to this port; it is not reachable from outside.
         {http_ip, {0, 0, 0, 0}},
         {http_port, 52184},

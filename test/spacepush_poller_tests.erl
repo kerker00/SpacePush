@@ -8,6 +8,9 @@
 
 shared_fetch_test_() ->
     {foreach, fun setup/0, fun cleanup/1, [
+        fun background_space_is_refreshed_without_subscribers/0,
+        fun on_demand_read_does_not_promote_background_space/0,
+        fun mainframe_room_subscription_uses_active_interval/0,
         fun reader_failure_defers_poller_without_stale_observation/0,
         fun poller_failure_defers_reads/0,
         fun read_and_poll_share_one_worker/0,
@@ -24,7 +27,8 @@ setup() ->
     application:set_env(spacepush, fetch_timeout_ms, 10000),
     application:set_env(spacepush, cache_max_age_ms, 0),
     ets:new(spacepush_directory, [named_table, protected, set]),
-    ets:insert(spacepush_directory, [{?A, #{}}, {?B, #{}}]),
+    ets:insert(spacepush_directory, [{?A, #{endpoint => ?A}}, {?B, #{endpoint => ?B}},
+        {spacepush_state:mainframe_endpoint(), #{endpoint => spacepush_state:mainframe_endpoint()}}]),
     [begin {ok, Pid} = Module:start_link(), unlink(Pid) end || Module <- [spacepush_cache, spacepush_registry, spacepush_outbox]],
     ok = spacepush_registry:register(binary:copy(<<"ab">>, 32), sandbox, [?TOPIC]),
     ok.
@@ -39,7 +43,11 @@ responses(AResult) ->
 
 poll() ->
     {ok, File} = application:get_env(spacepush, tracker_file),
-    poll(#{file => File, tracker => #{}}).
+    {ok, Mainframe} = application:get_env(spacepush, mainframe_url),
+    Now = erlang:monotonic_time(millisecond),
+    poll(#{file => File, tracker => #{}, schedule => #{
+        ?B => #{next => Now + 600000, interval => 600000},
+        list_to_binary(Mainframe) => #{next => Now, interval => 600000}}}).
 
 poll(Previous) ->
     {noreply, State} = spacepush_poller:handle_info(poll, Previous),
@@ -160,3 +168,38 @@ wait_for_shared_callers(Deadline) ->
             timer:sleep(1),
             wait_for_shared_callers(Deadline)
     end.
+
+background_space_is_refreshed_without_subscribers() ->
+    spacepush_test_util:fake_responses((responses({ok, ?SPACE}))#{?B => {ok, ?SPACE}}),
+    State = poll(),
+    #{schedule := Schedule} = State,
+    Due = Schedule#{?B := #{next => erlang:monotonic_time(millisecond), interval => 600000}},
+    Next = poll(State#{schedule := Due}),
+    ?assertMatch(#{body := ?SPACE}, spacepush_cache:lookup(?B)),
+    #{schedule := #{?A := #{interval := 120000}, ?B := #{interval := 600000}}} = Next,
+    Calls = spacepush_test_util:fake_calls(x),
+    ?assertEqual(Next, poll(Next)),
+    ?assertEqual(Calls, spacepush_test_util:fake_calls(x)).
+
+on_demand_read_does_not_promote_background_space() ->
+    spacepush_test_util:fake_responses((responses({ok, ?SPACE}))#{?B => {ok, ?SPACE}}),
+    #{schedule := Schedule} = State = poll(),
+    #{next := Deadline} = maps:get(?B, Schedule),
+    ?assertMatch({ok, #{body := ?SPACE}}, spacepush_cache:get(?B)),
+    ?assert(lists:member(?B, spacepush_cache:watched(0))),
+    Calls = spacepush_test_util:fake_calls(x),
+    #{schedule := #{?B := #{next := Deadline, interval := 600000}}} = poll(State),
+    ?assertEqual(Calls, spacepush_test_util:fake_calls(x)).
+
+mainframe_room_subscription_uses_active_interval() ->
+    MainframeEndpoint = spacepush_state:mainframe_endpoint(),
+    {ok, Mainframe} = application:get_env(spacepush, mainframe_url),
+    RoomUrl = list_to_binary(Mainframe),
+    ok = spacepush_registry:register(binary:copy(<<"ab">>, 32), sandbox, [{MainframeEndpoint, <<"radstelle">>}]),
+    spacepush_test_util:fake_responses((responses({ok, ?SPACE}))#{MainframeEndpoint => {ok, ?SPACE}}),
+    #{schedule := Schedule} = State = poll(),
+    ?assertMatch(#{interval := 120000}, maps:get(RoomUrl, Schedule)),
+    ?assertMatch(#{body := _}, spacepush_cache:lookup(RoomUrl)),
+    ok = spacepush_registry:unregister(binary:copy(<<"ab">>, 32)),
+    #{schedule := Later} = poll(State),
+    ?assertMatch(#{interval := 600000}, maps:get(RoomUrl, Later)).

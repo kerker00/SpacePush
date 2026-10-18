@@ -5,7 +5,8 @@ Sends push notifications to the [SpaceState](https://github.com/kerker00/SpaceSt
 An Erlang/OTP application that:
 
 - loads the list of spaces from the [SpaceAPI](https://spaceapi.io) aggregator (`api.spaceapi.io`) at start and hourly; the list is also the allowlist of endpoints SpacePush talks to,
-- fetches directly, every minute, only the spaces that are needed: subscribed by a device or asked for by an app within the last ten minutes,
+- fetches subscribed spaces directly every two minutes and all other listed spaces every ten minutes, spreading background work across the interval,
+- handles app requests on demand through the same shared cache, without promoting unsubscribed spaces to frequent polling,
 - also fetches Mainframe Oldenburg's `openState` endpoint for its rooms (Radstelle, 3D Lab, Machining) and finer states (members only, closing, …),
 - confirms a new state only when fresh data still shows it two minutes later, so short flaps send nothing,
 - queues one delivery per device and topic in a persistent outbox, where a newer state replaces an unsent older one,
@@ -17,7 +18,7 @@ An Erlang/OTP application that:
 | --- | --- |
 | `spacepush_directory` | The list of spaces and allowlist, refreshed hourly and saved to `data/directory.bin` |
 | `spacepush_cache` | Latest response per space; fetches on demand for the read API, once per space however many requests wait |
-| `spacepush_poller` | Requests needed spaces through the shared cache workers every minute, at most 10 at a time, and confirms changes (`spacepush_state:track/4`); the tracker is saved to `data/tracker.bin` |
+| `spacepush_poller` | Schedules subscribed spaces every two minutes and other listed spaces every ten minutes through shared cache workers, at most 10 per tick, and confirms changes (`spacepush_state:track/4`); the tracker is saved to `data/tracker.bin` |
 | `spacepush_outbox` | Pending deliveries in `data/outbox.dets`; replacement states receive a fresh lifetime while keeping a live delivery's scheduled slot |
 | `spacepush_apns` | Sends due deliveries, at most 20 at a time, each with a 15 s deadline; selects ready environments before limiting and shares capacity fairly when both have work |
 | `spacepush_registry` | Device registrations in `data/registry.dets`, with an ETS topic index; renewals atomically replace the visible registration without a lookup gap |
@@ -28,6 +29,35 @@ Confirmed changes first write a versioned intent beside the tracker (`tracker.bi
 The local regression suite covers process crashes and abrupt VM termination at the hand-off boundaries. It does not establish durability under host power loss: parent directories are not synced. An APNs request accepted remotely before its local result is recorded can still be retried after a crash; end-to-end exactly-once delivery is not promised.
 
 Older releases do not understand the new outbox commit marker. Downgrading requires restoring a consistent pre-upgrade backup of the tracker and outbox.
+
+### Polling intervals
+
+All allowlisted spaces are refreshed directly: subscribed endpoints every two
+minutes, others every ten minutes. Mainframe's room endpoint uses two minutes
+when any Mainframe space/room subscription is active and ten minutes otherwise;
+its SpaceAPI document is also refreshed for the directory. App reads retain the
+existing on-demand path: by default a document under one minute old is reused,
+and concurrent reads/polls share a single fetch. Read activity does not change a
+space's subscription tier; the former `watch_window_ms` option is no longer used.
+
+The scheduler checks deadlines every five seconds and starts at most ten fetches
+per tick, prioritizing subscribers. Initial background deadlines are distributed
+across the first ten minutes, also after a restart. New subscriptions become due
+on the next tick; removal lengthens the interval from the last scheduled attempt.
+Removed directory entries lose their deadlines. Polling intervals are targets:
+slow requests, concurrency limits and the shared failure backoff can delay them.
+They do not extend the 15-minute observation expiry. The list of endpoints still
+reloads hourly from the aggregator. Existing deployment overrides must be updated
+to `poll_interval_ms = 120000`, `background_poll_interval_ms = 600000` and
+`poll_tick_ms = 5000` as shown in the deployment template; an explicitly set old
+poll interval overrides the new application default.
+
+The two-minute change confirmation remains enabled. Without on-demand reads, a
+stable subscribed-space change is normally detected and confirmed in roughly
+two to four minutes, plus scheduling, delivery cooldown and APNs delays. Only
+new successful observations confirm a state; a repeated cached generation does
+not. Fresh read results for subscribed endpoints can be observed at the next
+tick without issuing an extra request.
 
 ### Reading saved state
 
@@ -104,7 +134,7 @@ Read the current state, in the shapes the apps already decode:
     GET /v1/mainframe/rooms              Mainframe's openState response
     GET /v1/summary                      open-space count, coverage and observation times
 
-`/v1/directory` uses the newer current observation from a direct fetch or the hourly aggregator data. Every response checks the original observation time against `max_data_age_s` (900 seconds by default); expired states omit the open flag while the space's name, location and allowlisted endpoint remain available. Future timestamps do not provide a current state. The watch window controls polling activity, not observation freshness. All successful read responses use `Cache-Control: no-cache` so clients revalidate them, and expose the configured limit in `X-SpacePush-Max-Data-Age` (seconds). Summary also exposes this header to cross-origin web clients.
+`/v1/directory` uses the newer current observation from a direct fetch or the hourly aggregator data. Every response checks the original observation time against `max_data_age_s` (900 seconds by default); expired states omit the open flag while the space's name, location and allowlisted endpoint remain available. Future timestamps do not provide a current state. Polling deadlines control fetch activity, not observation freshness. All successful read responses use `Cache-Control: no-cache` so clients revalidate them, and expose the configured limit in `X-SpacePush-Max-Data-Age` (seconds). Summary also exposes this header to cross-origin web clients.
 
 `/v1/summary` returns `open`, `total`, `known`, `unknown`, `as_of` and `newest_as_of`. It counts the same current opening flags as `/v1/directory`; `known` includes both current open and closed states, and `unknown = total - known`. Unknown spaces are not closed spaces. **`as_of` now describes the oldest included observation**, so one newly fetched space cannot make the whole count appear newly observed; `newest_as_of` describes the newest. Both are RFC 3339 UTC timestamps, or `null` when no current states are known. These times describe the known subset, not unknown spaces. It carries `Access-Control-Allow-Origin: *`, so web pages such as the project site can show the number live.
 
@@ -132,6 +162,47 @@ for capacity. Legacy records use their saved registration time as admission time
 and restarting does not reset the deadline. A legitimate subscription with no
 accepted notification also expires; a later app launch may register it again
 subject to capacity. APNs acceptance frees its provisional slot.
+
+## Test notifications
+
+Broadcast a fixed, clearly marked test alert to all active subscribers of one
+space or room, including sandbox and production registrations:
+
+```sh
+curl --get --request POST --data-urlencode 'endpoint=<exact SpaceAPI endpoint from /v1/directory>' \
+  'http://127.0.0.1:<port>/v1/test'
+```
+
+The `endpoint` query parameter is required and must be in the directory. Optional
+`room` defaults to `space`; add `--data-urlencode 'room=radstelle'` for a specific
+Mainframe room. The body is unused: callers cannot choose alert text, tokens or
+APNs environments. This is a real broadcast to the selected subscription, not a
+simulation. Run it directly on the server. Like statistics, the endpoint only
+accepts loopback peers without `X-Forwarded-For`, `Forwarded` or `X-Real-IP`;
+public/proxied requests receive 404. The deployment proxy must supply a forwarding
+header and the listener must remain private as described below.
+
+Success answers `202` with `{"test":true,"recipients":N}`. The count is the number
+of active matching registrations targeted (including already pending tests), not
+APNs acceptance or receipt. Zero means no active subscribers matched. Invalid or
+missing parameters answer 400, an unknown space 404, an unavailable directory 503,
+and a local method other than POST 405. The normal write limit applies; additional
+tests for the same space/room answer 429 during `notification_cooldown_ms` (at least
+60 seconds, normally five minutes). This admission cooldown is in memory and
+resets on restart.
+
+Tests carry `test: true`, the endpoint and room, and no opening-state value. They
+use a separate durable outbox key and APNs collapse id, leaving real state
+notifications and the poller's tracker untouched. Pending tests are retained
+instead of replaced by another test call. Existing delivery expiry, retry and
+registration checks apply; unsubscribed/expired devices are skipped at dispatch.
+Existing apps can display the alert and open the space without an app update.
+`test_push_enqueued` logs the target count; `test_push_result` logs each completed
+APNs response without device tokens. Without APNs credentials, the existing dry
+run logs and consumes the work without sending or confirming registrations.
+
+Older releases discard pending test records on startup, while ordinary deliveries
+keep their existing format. A downgrade therefore loses pending tests.
 
 ## Statistics
 
@@ -190,10 +261,10 @@ All settings live in the `spacepush` application environment (see `src/spacepush
 | `apns_topic` | App bundle ID |
 | `http_ip`, `http_port` | Listener; defaults to `127.0.0.1:8080` behind a reverse proxy |
 | `trust_proxy` | Rate-limit by `X-Forwarded-For`; enable only behind a trusted proxy |
-| `poll_interval_ms`, `debounce_s` | Polling interval and how long a new state must hold |
+| `poll_interval_ms`, `background_poll_interval_ms`, `poll_tick_ms` | Subscribed/background polling intervals (120000/600000 ms) and scheduler tick (5000 ms) |
+| `debounce_s` | Minimum time a changed state must hold before a fresh observation confirms it (120 s) |
 | `aggregator_url`, `directory_refresh_ms`, `directory_max_bytes` | Source of the list of spaces, how often it is reloaded and its size limit |
 | `max_data_age_s` | Maximum observation age for directory/summary states and space/room document reads |
-| `watch_window_ms` | How long a space stays fetched after an app asked for it |
 | `fetch_concurrency`, `fetch_timeout_ms`, `max_body_bytes` | Limits for fetching spaces |
 | `fetch_min_interval_ms`, `fetch_backoff_max_ms` | Shared minimum time between attempts per endpoint, and maximum failure backoff |
 | `cache_max_age_ms`, `on_demand_fetch_limit`, `on_demand_waiter_limit` | Time before a read attempts refresh, combined parallel refreshes and total waiting callers |
