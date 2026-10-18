@@ -15,10 +15,11 @@
         {directory_max_bytes, 4194304},
         %% Aggregator states older than this are not shown.
         {max_data_age_s, 900},
-        %% Fetching spaces directly: those subscribed or asked for within the window.
+        %% Scheduled direct fetches: subscribers every two minutes, others every ten.
         {mainframe_url, "https://status.kreativitaet-trifft-technik.de/api/openState"},
-        {poll_interval_ms, 60000},
-        {watch_window_ms, 600000},
+        {poll_interval_ms, 120000},
+        {background_poll_interval_ms, 600000},
+        {poll_tick_ms, 5000},
         {fetch_concurrency, 10},
         {fetch_timeout_ms, 10000},
         %% Shared per-endpoint admission for polling and read requests.

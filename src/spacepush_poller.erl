@@ -1,16 +1,18 @@
 -module(spacepush_poller).
 -moduledoc """
-Fetches the spaces that are needed every `poll_interval_ms`, stores the
-responses in the cache, confirms state changes with `spacepush_state:track/4`
-and hands them to the outbox.
+Refreshes subscribed spaces every `poll_interval_ms`, all other directory
+spaces every `background_poll_interval_ms`, through the shared cache workers.
+Background deadlines are spread across their interval. Every scheduler tick
+selects at most `fetch_concurrency` endpoints, prioritizing subscribers.
+Mainframe's openState follows the subscription interval when Mainframe has
+subscribers and the background interval otherwise. Its SpaceAPI document is
+also refreshed for the directory but not used to track room changes.
 
-A space is needed while a device subscribed to it or an app asked for it
-within `watch_window_ms`, and only if the directory lists it. Mainframe's
-openState is requested every round for its rooms; its SpaceAPI document is
-cached for the apps but not tracked, since openState is the finer source.
-Polling and read requests share the cache's per-endpoint admission and
-failure backoff. Each successful response generation is observed only once,
-including responses already fetched by readers before the poll.
+App reads keep their on-demand cache path; they do not promote an unsubscribed
+space to frequent polling. Fresh read generations for subscribed spaces can be
+observed at a scheduler tick without waiting for their next scheduled fetch.
+Polling and reads retain their shared admission, failure backoff and freshness
+checks. Failed or repeated cached observations never confirm a change.
 
 The tracker is saved to disk, so a restart neither forgets a pending change
 nor misses one that happened while the service was down.
@@ -40,9 +42,21 @@ handle_cast(_Msg, State) ->
 handle_info(poll, #{file := File, tracker := Tracker} = State) ->
     Started = erlang:monotonic_time(millisecond),
     MainframeUrl = unicode:characters_to_binary(env(mainframe_url)),
-    Fetched = spacepush_cache:refresh_many([MainframeUrl | needed()], env(fetch_concurrency)),
-    {Results, Seen} = observations(Fetched, maps:get(seen, State, #{})),
-    record_fetches(MainframeUrl, Results),
+    Known = [Url || #{endpoint := Url} <- spacepush_directory:entries()],
+    Subscribed = [Url || Url <- spacepush_registry:subscribed_endpoints(), spacepush_directory:known(Url)],
+    Active = case lists:member(spacepush_state:mainframe_endpoint(), Subscribed) of
+        true -> [MainframeUrl | Subscribed];
+        false -> Subscribed
+    end,
+    {Due, Schedule} = spacepush_schedule:select([MainframeUrl | Known], Active,
+        maps:get(schedule, State, #{}), Started, env(poll_interval_ms),
+        env(background_poll_interval_ms), env(fetch_concurrency)),
+    Fetched = spacepush_cache:refresh_many(Due, env(fetch_concurrency)),
+    Cached = maps:from_list([{Url, {ok, Entry}} || Url <- Active,
+        Entry <- [spacepush_cache:lookup(Url)], Entry =/= none]),
+    {Results, Seen} = observations(maps:merge(Cached, Fetched), maps:get(seen, State, #{})),
+    %% Count fetch activity only; inspecting a read generation is not a fetch.
+    record_fetches(MainframeUrl, maps:with(Due, Results)),
     Observations = lists:append([
         Observations
      || Url := {ok, Observations} <- Results, Url =/= spacepush_state:mainframe_endpoint()
@@ -53,8 +67,8 @@ handle_info(poll, #{file := File, tracker := Tracker} = State) ->
     record_changes(Changes),
     spacepush_stats:count(<<"poll.rounds">>),
     spacepush_stats:duration(<<"poll">>, erlang:monotonic_time(millisecond) - Started),
-    erlang:send_after(env(poll_interval_ms), self(), poll),
-    {noreply, State#{tracker := Tracker1, seen => Seen}};
+    erlang:send_after(env(poll_tick_ms), self(), poll),
+    {noreply, State#{tracker := Tracker1, seen => maps:with([MainframeUrl | Known], Seen), schedule => Schedule}};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -82,12 +96,6 @@ record_changes(Changes) ->
     Mainframe = spacepush_state:mainframe_endpoint(),
     spacepush_stats:count(<<"changes.total">>, length(Changes)),
     spacepush_stats:count(<<"changes.mainframe">>, length([C || {{Endpoint, _Room}, _, _, _} = C <- Changes, Endpoint =:= Mainframe])).
-
-%% Subscribed or recently requested, and listed in the directory.
-needed() ->
-    Since = erlang:system_time(millisecond) - env(watch_window_ms),
-    Candidates = lists:usort(spacepush_registry:subscribed_endpoints() ++ spacepush_cache:watched(Since)),
-    [Url || Url <- Candidates, spacepush_directory:known(Url)].
 
 %% The cache owns response publication; the poller never rewrites its timestamp.
 observations(Fetched, Seen) ->

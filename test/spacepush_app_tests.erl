@@ -35,6 +35,7 @@ app_test_() ->
             ?_test(expired_documents_are_not_successful_reads(Port)),
             ?_test(future_documents_are_not_successful_reads(Port)),
             ?_test(recent_fallback_preserves_original_fetch_time(Port)),
+            ?_test(test_push_endpoint(Port)),
             ?_test(rate_limited_requests_do_not_tally_versions(Port))
         ]
     end}.
@@ -296,3 +297,31 @@ reported_request(Method, Port, Path, Version) ->
         put -> httpc:request(put, {url(Port, Path), Headers, "application/json", registration(?NERD2NERD)}, [], [{body_format, binary}])
     end,
     status(reply(Result)).
+
+test_push_endpoint(Port) ->
+    ets:delete_all_objects(spacepush_ratelimit),
+    Path = "/v1/test?endpoint=" ?NERD2NERD_QS,
+    ?assertEqual(405, status(request(get, Port, Path))),
+    ?assertEqual(400, status(request(post, Port, "/v1/test", <<>>))),
+    ?assertEqual(400, status(request(post, Port, Path ++ "&room=%0A", <<>>))),
+    ?assertEqual(404, status(request(post, Port, "/v1/test?endpoint=https%3A%2F%2Funknown.example", <<>>))),
+    [begin
+        Response = httpc:request(post, {url(Port, Path), [{Header, "127.0.0.1"}], "application/json", <<>>}, [], [{body_format, binary}]),
+        ?assertEqual(404, status(reply(Response)))
+    end || Header <- ["x-forwarded-for", "forwarded", "x-real-ip"]],
+    Token = list_to_binary(?TOKEN),
+    Second = binary:copy(<<"cd">>, 32),
+    ok = spacepush_registry:register(Token, sandbox, [?TOPIC]),
+    ok = spacepush_registry:register(Second, production, [?TOPIC]),
+    ok = sys:suspend(spacepush_apns),
+    try
+        {202, Body} = request(post, Port, Path, <<>>),
+        ?assertEqual(#{<<"recipients">> => 2, <<"test">> => true}, json:decode(Body)),
+        Tests = [D || #{key := {_, ?TOPIC, test}} = D <- spacepush_outbox:due(erlang:system_time(millisecond), [], 100)],
+        ?assertEqual(2, length(Tests)),
+        ?assertEqual(429, status(request(post, Port, Path, <<>>)))
+    after
+        ok = spacepush_registry:unregister(Token),
+        ok = spacepush_registry:unregister(Second),
+        sys:resume(spacepush_apns)
+    end.

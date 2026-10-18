@@ -50,6 +50,8 @@ backoff_grows_and_is_capped_test() ->
 
 dispatch_test_() ->
     {foreach, fun setup_dispatch/0, fun(_) -> stop_dispatch() end, [
+        fun test_delivery_uses_registered_subscription/0,
+        fun unsubscribed_test_is_discarded/0,
         fun rejects_invalid_persisted_delivery/0,
         fun synchronous_send_failure_is_isolated/0,
         fun down_environment_does_not_starve_ready_environment/0,
@@ -320,3 +322,21 @@ sender_holds_in_flight_successor_until_cooldown() ->
     ?assertEqual([], spacepush_outbox:due(erlang:system_time(millisecond), [], 10)),
     ?assertMatch([#{payload := _}], spacepush_outbox:due(erlang:system_time(millisecond) + 300000, [], 10)),
     ?assertEqual({noreply, Waiting}, spacepush_apns:handle_info({gun_response, self(), Ref, fin, 200, []}, Waiting)).
+
+test_delivery_uses_registered_subscription() ->
+    ok = spacepush_registry:register(token(1), sandbox, [topic()]),
+    {ok, 1} = spacepush_outbox:enqueue_test(topic(), <<"A">>),
+    ok = spacepush_registry:register(token(1), production, [topic()]),
+    {noreply, Sent} = spacepush_apns:handle_cast(wake, fair_sender(1)),
+    [#{delivery := #{key := {_, _, test}, environment := production}}] = maps:values(maps:get(in_flight, Sent)),
+    finish_only_request(Sent),
+    ?assertEqual(0, spacepush_outbox:pending()),
+    ?assertEqual(1, confirmed()).
+
+unsubscribed_test_is_discarded() ->
+    ok = spacepush_registry:register(token(1), sandbox, [topic()]),
+    {ok, 1} = spacepush_outbox:enqueue_test(topic(), <<"A">>),
+    ok = spacepush_registry:unregister(token(1)),
+    State = sender_state(self()),
+    ?assertEqual({noreply, State}, spacepush_apns:handle_cast(wake, State)),
+    ?assertEqual(0, spacepush_outbox:pending()).

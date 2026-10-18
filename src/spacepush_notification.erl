@@ -6,7 +6,7 @@ The body is a localization key, so the apps show it in the user's language.
 The apps' string catalogs must define every key returned by `loc_key/1`.
 """.
 
--export([payload/3, loc_key/1, collapse_id/1]).
+-export([payload/3, test_payload/2, test_collapse_id/1, loc_key/1, collapse_id/1]).
 
 -define(MAX_TITLE, 64).
 
@@ -56,3 +56,14 @@ room_name(Room) -> Room.
 -spec collapse_id(spacepush_state:topic()) -> binary().
 collapse_id({Endpoint, Room}) ->
     binary:encode_hex(crypto:hash(sha256, <<Endpoint/binary, "#", Room/binary>>), lowercase).
+
+-doc "A visible test without an opening-state claim; works with existing apps.".
+test_payload({Endpoint, Room}, Name) ->
+    #{<<"aps">> => #{
+        <<"alert">> => #{<<"title">> => <<(title(Name, Room))/binary, " – Push-Test"/utf8>>,
+            <<"body">> => <<"Test notification from SpacePush. This is not a status change.">>},
+        <<"sound">> => <<"default">>, <<"thread-id">> => Endpoint},
+      <<"endpoint">> => Endpoint, <<"room">> => Room, <<"test">> => true}.
+
+test_collapse_id(Topic) ->
+    binary:encode_hex(crypto:hash(sha256, <<"test:", (collapse_id(Topic))/binary>>), lowercase).

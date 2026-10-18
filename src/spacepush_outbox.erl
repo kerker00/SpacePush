@@ -21,14 +21,14 @@ Every change is synced to disk before the call returns.
 
 -include_lib("kernel/include/logger.hrl").
 
--export([start_link/0, enqueue/1, apply_commit/2, begin_attempt/3, due/3, due/4, complete/2, retry/3, pending/0]).
+-export([start_link/0, enqueue/1, enqueue_test/2, identity/1, apply_commit/2, begin_attempt/3, due/3, due/4, complete/2, retry/3, pending/0]).
 -export([init/1, handle_call/3, handle_cast/2, terminate/2]).
 
 -define(DETS, spacepush_outbox).
 -define(TABLE, spacepush_outbox_entries).
 -define(COMMIT, '$spacepush_commit').
 
--type key() :: {Token :: binary(), spacepush_state:topic()}.
+-type key() :: {binary(), spacepush_state:topic()} | {binary(), spacepush_state:topic(), test}.
 -type id() :: {integer(), pos_integer()}.
 -type delivery() :: #{
     key := key(),
@@ -53,6 +53,15 @@ enqueue([]) ->
     ok;
 enqueue(Changes) ->
     gen_server:call(?MODULE, {enqueue, Changes}).
+
+-doc "Queues a test for all current subscribers, independently of state changes.".
+enqueue_test(Topic, Name) ->
+    gen_server:call(?MODULE, {enqueue_test, Topic, Name}).
+
+-doc "The registered device and subscription underlying a delivery key.".
+identity({Token, Topic, test}) -> {Token, Topic};
+identity({Token, Topic}) -> {Token, Topic};
+identity(_) -> {undefined, undefined}.
 
 -doc "Checks the current delivery id and reserves a dispatch attempt under the cooldown.".
 -spec begin_attempt(key(), id(), integer()) -> ok | skipped.
@@ -127,16 +136,22 @@ init([]) ->
 canonical(Delivery) ->
     maps:with([key, id, token, environment, version, payload, collapse_id, attempts, not_before, expires], Delivery).
 
-valid_record({{Token, Topic} = Key, #{key := Key, token := Token, id := {At, Sequence},
+valid_record({Key, #{key := Key, token := Token, id := {At, Sequence},
     environment := Environment, version := Version, payload := Payload, collapse_id := Collapse,
     attempts := Attempts, not_before := NotBefore, expires := Expires}}) ->
-    spacepush_device:valid_token(Token) andalso spacepush_persist:topic(Topic) andalso
+    {KeyToken, Topic} = identity(Key),
+    KeyToken =:= Token andalso spacepush_device:valid_token(Token) andalso spacepush_persist:topic(Topic) andalso
         spacepush_persist:counter(At) andalso spacepush_persist:counter(Sequence) andalso Sequence > 0 andalso
         (Environment =:= sandbox orelse Environment =:= production) andalso
         spacepush_persist:counter(Version) andalso spacepush_persist:counter(Attempts) andalso
         spacepush_persist:counter(NotBefore) andalso spacepush_persist:counter(Expires) andalso
-        Collapse =:= spacepush_notification:collapse_id(Topic) andalso valid_payload(Payload, Topic);
+        valid_content(Key, Topic, Collapse, Payload);
 valid_record(_) -> false.
+
+valid_content({_, _, test}, Topic, Collapse, Payload) ->
+    Collapse =:= spacepush_notification:test_collapse_id(Topic) andalso valid_test_payload(Payload, Topic);
+valid_content({_, _}, Topic, Collapse, Payload) ->
+    Collapse =:= spacepush_notification:collapse_id(Topic) andalso valid_payload(Payload, Topic).
 
 valid_payload(Payload, {Endpoint, Room}) ->
     case spacepush_persist:text(Payload, 4096) of
@@ -150,6 +165,46 @@ valid_payload(Payload, {Endpoint, Room}) ->
             catch error:_ -> false end
     end.
 
+valid_test_payload(Payload, {Endpoint, Room}) ->
+    case spacepush_persist:text(Payload, 4096) of
+        false -> false;
+        true ->
+            try json:decode(Payload) of
+                #{<<"endpoint">> := Endpoint, <<"room">> := Room, <<"test">> := true,
+                    <<"aps">> := #{<<"alert">> := #{<<"title">> := Title, <<"body">> := Body}}} = Map ->
+                    is_binary(Title) andalso is_binary(Body) andalso not maps:is_key(<<"state">>, Map);
+                _ -> false
+            catch error:_ -> false end
+    end.
+
+handle_call({enqueue_test, Topic, Name}, _From, #{slots := Slots} = State) ->
+    Now = erlang:system_time(millisecond),
+    Gate = {broadcast_test, Topic},
+    {ok, Cooldown} = application:get_env(spacepush, notification_cooldown_ms),
+    case maps:get(Gate, Slots, {undefined, 0}) of
+        {_, At} when Now < At + max(60000, Cooldown) ->
+            {reply, {error, cooldown}, State};
+        _ ->
+            Subscribers = spacepush_registry:subscribers(Topic),
+            {ok, Ttl} = application:get_env(spacepush, delivery_ttl_ms),
+            Payload = iolist_to_binary(json:encode(spacepush_notification:test_payload(Topic, Name))),
+            lists:foreach(fun({Token, Environment, Version}) ->
+                Key = {Token, Topic, test},
+                %% Repeated calls never replace a test already waiting for APNs.
+                case ets:lookup(?TABLE, Key) of
+                    [{Key, #{expires := Expires}}] when Expires > Now -> ok;
+                    _ -> save(#{key => Key, token => Token, environment => Environment, version => Version,
+                        id => {erlang:system_time(microsecond), erlang:unique_integer([positive])},
+                        payload => Payload, collapse_id => spacepush_notification:test_collapse_id(Topic),
+                        attempts => 0, not_before => Now, expires => Now + Ttl})
+                end
+            end, Subscribers),
+            sync(),
+            Count = length(Subscribers),
+            Count > 0 andalso spacepush_apns:wake(),
+            ?LOG_INFO(#{msg => test_push_enqueued, topic => Topic, recipients => Count}),
+            {reply, {ok, Count}, State#{slots := Slots#{Gate => {test, Now}}}}
+    end;
 handle_call({enqueue, Changes}, _From, State) ->
     {Count, State1} = enqueue_changes(Changes, plain, State),
     sync(),
@@ -197,7 +252,8 @@ handle_call({due, Now, InFlight, Limit, Eligible}, _From, State) ->
     Oldest = lists:sort(fun(#{not_before := A}, #{not_before := B}) -> A =< B end, Ready),
     {ok, Cooldown} = application:get_env(spacepush, notification_cooldown_ms),
     Cutoff = erlang:system_time(millisecond) - Cooldown,
-    Slots1 = maps:filter(fun(_Key, {_Id, At}) -> At > Cutoff end, maps:get(slots, State)),
+    Slots1 = maps:filter(fun({broadcast_test, _}, {_Id, At}) -> At > erlang:system_time(millisecond) - max(60000, Cooldown);
+        (_Key, {_Id, At}) -> At > Cutoff end, maps:get(slots, State)),
     {reply, lists:sublist(Oldest, Limit), State#{slots := Slots1}};
 handle_call({complete, Key, Id}, _From, State) ->
     case ets:lookup(?TABLE, Key) of

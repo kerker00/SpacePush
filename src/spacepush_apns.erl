@@ -225,7 +225,8 @@ dispatch_environment(Environment, Due, State) ->
     Next = case Environment of sandbox -> production; production -> sandbox end,
     (lists:foldl(fun prepare/2, State, Due))#{next_environment => Next}.
 
-delivery_environment(#{key := {Token, Topic}} = Delivery) ->
+delivery_environment(#{key := Key} = Delivery) ->
+    {Token, Topic} = spacepush_outbox:identity(Key),
     case valid_identity(Token, Topic, maps:get(token, Delivery, undefined)) of
         false -> discard;
         true ->
@@ -243,7 +244,8 @@ valid_identity(Token, Topic, StoredToken) ->
 
 %% Checks a due delivery against the current registration and sends it once
 %% the connection for its environment is up.
-prepare(#{key := {Token, Topic} = Key, id := Id} = Delivery, State) ->
+prepare(#{key := Key, id := Id} = Delivery, State) ->
+    {Token, Topic} = spacepush_outbox:identity(Key),
     case valid_identity(Token, Topic, maps:get(token, Delivery, undefined)) of
         true -> prepare_registered(Delivery, State);
         false ->
@@ -257,7 +259,8 @@ prepare(#{key := {Token, Topic} = Key, id := Id} = Delivery, State) ->
             State
     end.
 
-prepare_registered(#{key := {Token, Topic} = Key, id := Id} = Delivery, State) ->
+prepare_registered(#{key := Key, id := Id} = Delivery, State) ->
+    {Token, Topic} = spacepush_outbox:identity(Key),
     case spacepush_registry:lookup(Token) of
         {ok, Environment, Topics, Version} ->
             case lists:member(Topic, Topics) of
@@ -353,6 +356,11 @@ finish(#{delivery := Delivery, status := Status, body := Body}, State) ->
     #{key := Key, id := Id, token := Token, environment := Environment, version := Version} = Delivery,
     {Reason, InvalidSince} = error_details(Body),
     Result = classify(Status, Reason),
+    case Key of
+        {_, Topic, test} -> ?LOG_INFO(#{msg => test_push_result, topic => Topic,
+            environment => Environment, status => Status, result => Result});
+        _ -> ok
+    end,
     spacepush_stats:count(<<"push.", (atom_to_binary(Result))/binary>>),
     case Result of
         delivered ->

@@ -22,6 +22,8 @@ outbox_test_() ->
             gen_server:stop(spacepush_registry)
         end,
         [
+            fun broadcast_test_is_separate_and_persistent/0,
+            fun broadcast_test_excludes_expired_registrations/0,
             fun one_delivery_per_subscriber/0,
             fun newer_state_replaces_pending/0,
             fun replacement_of_expired_row_survives_restart/0,
@@ -248,3 +250,38 @@ malformed_saved_deliveries_are_removed() ->
     ok = dets:close(invalid_fixture),
     start(spacepush_outbox),
     ?assertEqual([Good], spacepush_outbox:due(now_ms(), [], 10)).
+
+broadcast_test_is_separate_and_persistent() ->
+    Other = {<<"https://other.example/">>, <<"space">>},
+    ok = spacepush_registry:register(token(2), production, [?A]),
+    ok = spacepush_registry:register(token(3), sandbox, [Other]),
+    ok = spacepush_outbox:enqueue([change(open)]),
+    {ok, 2} = spacepush_outbox:enqueue_test(?A, <<"A">>),
+    ?assertEqual({error, cooldown}, spacepush_outbox:enqueue_test(?A, <<"A">>)),
+    gen_server:stop(spacepush_outbox),
+    start(spacepush_outbox),
+    Due = spacepush_outbox:due(now_ms(), [], 10),
+    Tests = [D || #{key := {_, _, test}} = D <- Due],
+    States = [D || #{key := {_, _}} = D <- Due],
+    ?assertEqual(2, length(Tests)),
+    ?assertEqual(2, length(States)),
+    ?assertEqual(lists:sort([token(1), token(2)]), lists:sort([T || #{token := T} <- Tests])),
+    ?assertEqual([production, sandbox], lists:sort([E || #{environment := E} <- Tests])),
+    [begin
+        Map = json:decode(maps:get(payload, Test)),
+        ?assertMatch(#{<<"test">> := true, <<"endpoint">> := _}, Map),
+        ?assertNot(maps:is_key(<<"state">>, Map)),
+        ?assertNotEqual(spacepush_notification:collapse_id(?A), maps:get(collapse_id, Test))
+    end || Test <- Tests],
+    {ok, 2} = spacepush_outbox:enqueue_test(?A, <<"A">>),
+    ?assertEqual(lists:sort([maps:get(id, D) || D <- Tests]),
+        lists:sort([Id || #{key := {_, _, test}, id := Id} <- spacepush_outbox:due(now_ms(), [], 10)])),
+    ok = spacepush_outbox:enqueue([change(closed)]),
+    ?assertEqual(4, spacepush_outbox:pending()).
+
+broadcast_test_excludes_expired_registrations() ->
+    application:set_env(spacepush, registry_clock, fun() -> erlang:system_time(millisecond) + 61 * 86400000 end),
+    try
+        ?assertEqual({ok, 0}, spacepush_outbox:enqueue_test(?A, <<"A">>)),
+        ?assertEqual(0, spacepush_outbox:pending())
+    after application:unset_env(spacepush, registry_clock) end.
