@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>SpacePush · Statistik</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/stats/dashboard.css">
+  <script src="/stats/dashboard.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#overview">Zum Inhalt</a>
+  <aside class="sidebar">
+    <a class="brand" href="/stats/"><span class="brand-mark" aria-hidden="true">S<span>↗</span></span>SpacePush</a>
+    <p class="eyebrow sidebar-label">MONITORING</p>
+    <nav aria-label="Bereiche">
+      <a href="#overview">Überblick <span>01</span></a>
+      <a href="#usage">App-Nutzung <span>02</span></a>
+      <a href="#delivery">Push &amp; Geräte <span>03</span></a>
+      <a href="#service">Server <span>04</span></a>
+    </nav>
+    <div class="sidebar-footer"><span class="lock" aria-hidden="true">▣</span> Privater Bereich<br><small>Zugang mit Benutzer &amp; Passwort</small></div>
+  </aside>
+  <main id="overview">
+    <header class="page-header">
+      <div><p class="eyebrow">SPACE STATE / OPERATIONS</p><h1>Alles im Blick<span>.</span></h1><p class="subtitle">Nutzung, Zustellung und der Puls deines Push-Servers.</p></div>
+      <div class="header-actions"><span class="connection" id="connection" role="status">Verbinde …</span><button id="refresh" type="button">↻ Aktualisieren</button></div>
+    </header>
+    <div id="error" class="error" role="alert" hidden></div>
+    <div class="section-heading"><h2>Überblick</h2><span id="updated" class="muted">Warte auf Statistik …</span></div>
+    <section class="metrics" aria-label="Aktuelle Kennzahlen">
+      <article class="metric"><p>Aktive Apps heute</p><strong id="today">—</strong><span>Erster App-Aufruf pro Tag</span></article>
+      <article class="metric"><p>Diese Woche</p><strong id="week">—</strong><span>Aktive Apps · ISO-Kalenderwoche</span></article>
+      <article class="metric"><p>Diesen Monat</p><strong id="month">—</strong><span>Aktive Apps · Kalendermonat</span></article>
+      <article class="metric accent"><p>Registrierte Geräte</p><strong id="devices">—</strong><span id="device-cap">Push-Registrierungen</span></article>
+    </section>
+    <section id="usage" class="section">
+      <div class="section-heading"><h2>App-Nutzung</h2><span class="muted">Anonyme Zähler · keine Nutzer-IDs</span></div>
+      <div class="chart-grid">
+        <article class="panel"><div class="panel-heading"><div><p class="eyebrow">AKTIVITÄT</p><h3>Apps im Verlauf</h3></div><label class="sr-only" for="period">Aktivitätszeitraum</label><select id="period"><option value="days">Tage</option><option value="weeks">Wochen</option><option value="months">Monate</option></select></div><div id="installs-chart" class="chart"></div><p class="caption">Abgeschlossene Zeiträume; die laufenden stehen oben.</p></article>
+        <article class="panel"><div class="panel-heading"><div><p class="eyebrow">TRAFFIC</p><h3>API-Anfragen <span id="request-total" class="heading-value">—</span></h3></div><label class="sr-only" for="days">Zeitraum für Tageszähler</label><select id="days"><option value="14">14 Tage</option><option value="30">30 Tage</option><option value="90">90 Tage</option></select></div><div id="requests-chart" class="chart"></div><p class="caption">Alle API-Endpunkte · einschließlich heute</p></article>
+      </div>
+      <div class="three-grid">
+        <article class="panel"><p class="eyebrow">DIESE WOCHE</p><h3>App-Versionen</h3><div id="versions" class="distribution"></div></article>
+        <article class="panel"><p class="eyebrow">DIESE WOCHE</p><h3>Plattformen</h3><div id="platforms" class="distribution"></div></article>
+        <article class="panel"><p class="eyebrow">DIESE WOCHE</p><h3>Betriebssysteme</h3><div id="os-versions" class="distribution"></div></article>
+      </div>
+      <p class="caption">Die Apps melden ihren ersten Aufruf pro Zeitraum. Diese Zähler sind keine verifizierten Personen- oder Installationszahlen. Tage richten sich nach der lokalen Zeit des Servers.</p>
+    </section>
+    <section id="delivery" class="section">
+      <div class="section-heading"><h2>Push &amp; Geräte</h2><span class="muted">Aktueller Bestand und gewählter Tageszeitraum</span></div>
+      <div class="three-grid">
+        <article class="panel"><p class="eyebrow">ZUSTELLUNG</p><h3>Push-Ergebnisse</h3><div id="push-results" class="distribution"></div><p class="caption">APNs-Annahme bestätigt keinen Empfang am Gerät. Wiederholungen zählen als Versuche.</p></article>
+        <article class="panel"><p class="eyebrow">REGISTRIERTE GERÄTE</p><h3>Umgebung &amp; Plattform</h3><div id="environments" class="distribution"></div><div id="device-platforms" class="distribution divided"></div></article>
+        <article class="panel"><p class="eyebrow">REGISTRIERTE GERÄTE</p><h3>APNs-Bestätigung</h3><div id="confirmation" class="distribution"></div><p id="confirmation-cap" class="caption"></p></article>
+      </div>
+      <article class="panel subscriptions"><div class="panel-heading"><div><p class="eyebrow">ABONNEMENTS</p><h3>Spaces &amp; Räume <span id="subscription-count" class="heading-value">—</span></h3></div><label class="sr-only" for="search">Spaces oder Räume filtern</label><input id="search" type="search" placeholder="Space oder Raum suchen …" autocomplete="off"></div><div class="table-scroll"><table><thead><tr><th>Space / Endpoint</th><th>Raum</th><th class="numeric">Geräte</th></tr></thead><tbody id="subscriptions"></tbody></table></div><p id="subscriptions-empty" class="caption" hidden>Keine passenden Abonnements.</p><p class="caption">Ein Gerät kann mehrere Spaces oder Räume abonnieren.</p></article>
+    </section>
+    <section id="service" class="section">
+      <div class="section-heading"><h2>Server</h2><span id="version" class="muted">SpacePush</span></div>
+      <div class="metrics compact">
+        <article class="metric"><p>Laufzeit</p><strong id="uptime">—</strong><span>Seit Start der Erlang-VM</span></article>
+        <article class="metric"><p>Arbeitsspeicher</p><strong id="memory">—</strong><span>Erlang-VM · MB</span></article>
+        <article class="metric"><p>Prozesse</p><strong id="processes">—</strong><span>Erlang-Prozesse</span></article>
+        <article class="metric"><p>Warteschlange</p><strong id="pending">—</strong><span>Ausstehende Push-Zustellungen</span></article>
+      </div>
+      <div class="chart-grid">
+        <article class="panel"><p class="eyebrow">QUELLEN</p><h3>Letzte erfolgreiche Abfrage</h3><dl id="last-success" class="key-values"></dl><p class="caption">Zeitpunkte erfolgreicher Abrufe; keine Aussage über den aktuellen Türstatus.</p></article>
+        <article class="panel"><p class="eyebrow">POLLING · GEWÄHLTER ZEITRAUM</p><h3>Abrufe &amp; Verarbeitung</h3><dl id="polling" class="key-values"></dl></article>
+      </div>
+      <details class="panel raw"><summary>Alle Tageszähler <span class="muted">Rohwerte ansehen</span></summary><p class="caption">Fehlende Zähler werden als 0 dargestellt. Dauerwerte in Millisekunden. Der Durchschnitt gilt jeweils pro Tag.</p><div id="counters" class="table-scroll"></div></details>
+    </section>
+    <footer><span>SpacePush <span class="footer-dot">/</span> Statistik</span><span>Automatische Aktualisierung alle 30 Sekunden</span></footer>
+    <noscript><p class="error">Bitte JavaScript aktivieren, um die Statistik zu laden.</p></noscript>
+  </main>
+</body>
+</html>

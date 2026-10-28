@@ -18,6 +18,11 @@
         {outbox_file, "/home/USER/spacepush/data/outbox.dets"},
         {tracker_file, "/home/USER/spacepush/data/tracker.bin"},
         {stats_file, "/home/USER/spacepush/data/stats.bin"},
+        %% Statistics API + /stats/ dashboard, accessed through an SSH tunnel.
+        %% Set binary strings in ~/spacepush/sys.config, e.g. <<"your-login">>.
+        %% Generate a password with openssl rand -hex 32. No default credentials.
+        {stats_username, undefined},
+        {stats_password, undefined},
 
         %% One key per APNs environment. A key valid for both ("Sandbox & Production")
         %% can instead be set once with apns_key_file and apns_key_id.

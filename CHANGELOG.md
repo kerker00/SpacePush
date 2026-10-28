@@ -1,5 +1,10 @@
 # Changes
 
+## Unreleased
+
+- Require a configured HTTP Basic login for the local statistics API and new `/stats/` dashboard. Set `stats_username` and `stats_password` only in the external runtime `sys.config`; missing credentials disable access. Retain the loopback and proxy-header restrictions, including for dashboard assets and data.
+- Add a responsive statistics dashboard with activity/traffic charts, weekly version and OS distributions, APNs outcomes, device confirmation, searchable subscriptions, polling, VM metrics and raw daily counters. Serve all assets inside the release without external dependencies. Document SSH tunneling, configuration and password-prompted curl access.
+
 ## 2.1.0
 
 - Poll subscribed endpoints every two minutes and other directory spaces every ten minutes. Spread initial background deadlines, prioritize subscribers in bounded batches and observe fresh on-demand read generations without extra requests. Mainframe rooms follow the same subscription tier; read activity no longer enables frequent polling (`watch_window_ms` is unused). Keep shared cache admission, failure backoff and observation expiry unchanged.

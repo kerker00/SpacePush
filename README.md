@@ -208,9 +208,9 @@ keep their existing format. A downgrade therefore loses pending tests.
 
 For monitoring, SpacePush keeps daily usage statistics and serves them as JSON on the server itself:
 
-    curl -s http://127.0.0.1:<port>/v1/stats?days=14
+    curl --fail --user '<your-login>' 'http://127.0.0.1:<port>/v1/stats?days=14'
 
-The endpoint answers only requests from a loopback address that did not pass a proxy (no `X-Forwarded-For`); through the public domain it answers `404`. It reports:
+`curl` asks for the password interactively, so it is not written to shell history or the process command line. Both the API and the dashboard at `/stats/` require HTTP Basic authentication **in addition to** a loopback peer without `X-Forwarded-For`, `Forwarded` or `X-Real-IP`. Other users on the same host therefore need the credentials too. Public/proxied requests still receive `404`, even with correct credentials. Missing or wrong credentials receive `401`; if credentials are not configured, local access receives `503` and stays disabled. It reports:
 
 - **Devices:** registered devices in total, per APNs environment, per platform and per subscribed space or room.
 - **Installs:** active app installs today, this week and this month, the last 10 days, 12 weeks and 13 months, and the app versions, platforms and OS versions of this week.
@@ -218,6 +218,40 @@ The endpoint answers only requests from a loopback address that did not pass a p
 - **Current state:** pending deliveries, last successful fetch per source, version, uptime, memory and process count.
 
 Installs are counted without an identifier. With its first request of a day, ISO week and month, the app sends `X-SpaceState-First` naming the periods it opens, such as `day, week, month`, together with a user agent such as `SpaceState/2.0.0 (iOS 26.0)`; SpacePush adds one per named period. Widgets send no such header. Client addresses are not recorded. Daily counters are kept for 430 days, weekly version tallies for 13 weeks. Days follow the server's local time.
+
+### Configure the login on Uberspace
+
+Add these entries **inside the existing `{spacepush, [...]}` section** of `~/spacepush/sys.config` on the host:
+
+```erlang
+{stats_username, <<"YOUR_LOGIN">>},
+{stats_password, <<"YOUR_RANDOM_PASSWORD">>},
+```
+
+Replace both placeholders in that external file only. Use binary strings (`<<"...">>`); a username must not contain a colon. Generate a long password, for example with `openssl rand -hex 32`. No credentials are shipped in the source, release or dashboard; both defaults are `undefined`. There is no anonymous fallback. The service already loads this external config through `RELX_CONFIG_PATH` (see `deploy/uberspace/spacepush.ini`). Protect it and restart after a change:
+
+```sh
+chmod 600 ~/spacepush/sys.config
+supervisorctl restart spacepush
+curl --fail --user 'YOUR_LOGIN' 'http://127.0.0.1:52184/v1/stats?days=14'
+```
+
+Keep filled-in configuration outside the checkout. For local development, put credentials in an untracked external config and start the release with `RELX_CONFIG_PATH` pointing to it. Do not add real credentials to the tracked `config/sys.config`.
+
+### Open the dashboard through SSH
+
+Run this **on your Mac** and keep the connection open:
+
+```sh
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:18080:127.0.0.1:52184 <user>@<host>.uberspace.de
+```
+
+Open **http://127.0.0.1:18080/stats/** in your browser. Its login dialog asks for the username and password from the host's `sys.config`. The local port is explicitly bound to loopback; `52184` is the remote SpacePush port, while `18080` can be changed if already in use. Stop the tunnel with Ctrl-C. Basic credentials travel inside SSH; use this tunnel for browser access rather than exposing an HTTP port publicly.
+
+The dashboard runs inside SpacePush with no additional service, build step, CDN, fonts, or external scripts. It visualizes active-app histories (days/weeks/months), API traffic, weekly app/OS/platform breakdowns, APNs outcomes, device counts and confirmation, searchable space/room subscriptions, polling, queue and VM metrics. Choose 14, 30 or 90 days for daily counters; the full raw counters are expandable. Refresh is automatic every 30 seconds while the tab is visible. A failed refresh keeps the previous data and explicitly labels it as outdated. `/stats/data.json` is the same authenticated report as `/v1/stats`, within the browser login's path scope. All dashboard assets and data require authentication and use `Cache-Control: no-store`.
+
+The browser manages the Basic login; the dashboard does not store a password in JavaScript or browser storage. Use a private browser window and close it when finished to end that browser session. APNs acceptance is not proof of receipt at a device; app activity consists of anonymous client-reported counters, not verified users. This dashboard does not change the public app API or the separate local test-notification endpoint.
 
 ## Security
 
@@ -261,6 +295,7 @@ All settings live in the `spacepush` application environment (see `src/spacepush
 | `apns_topic` | App bundle ID |
 | `http_ip`, `http_port` | Listener; defaults to `127.0.0.1:8080` behind a reverse proxy |
 | `trust_proxy` | Rate-limit by `X-Forwarded-For`; enable only behind a trusted proxy |
+| `stats_username`, `stats_password` | HTTP Basic login for the local statistics API and `/stats/` dashboard; binary strings in external runtime config, disabled unless both are nonempty |
 | `poll_interval_ms`, `background_poll_interval_ms`, `poll_tick_ms` | Subscribed/background polling intervals (120000/600000 ms) and scheduler tick (5000 ms) |
 | `debounce_s` | Minimum time a changed state must hold before a fresh observation confirms it (120 s) |
 | `aggregator_url`, `directory_refresh_ms`, `directory_max_bytes` | Source of the list of spaces, how often it is reloaded and its size limit |
@@ -285,7 +320,10 @@ For local verification, compile production code and the test profile, then run t
 env -u DEBUG rebar3 compile
 env -u DEBUG rebar3 as test compile
 env -u DEBUG rebar3 eunit
+node --test test/dashboard.test.cjs
 ```
+
+Node.js 18+ is only needed for the dashboard calculation tests, not to build or run SpacePush.
 
 The suite uses temporary data under `_build/test/tmp/`, mocked upstream/APNs responses, local loopback HTTP/2 peers and disposable Erlang VMs that are halted for crash tests. It needs permission to open local sockets and start those VMs, but no production configuration, APNs key or real push recipients. These checks validate the source on the test machine; they do not verify the runtime, proxy settings or release running on a different host. [CHANGELOG.md](CHANGELOG.md) describes the pending release changes.
 
@@ -293,7 +331,7 @@ The suite uses temporary data under `_build/test/tmp/`, mocked upstream/APNs res
 
 `trust_proxy` is false by default. Enable it only for a listener reachable through a trusted proxy that appends the actual client address to `X-Forwarded-For`; earlier entries are supplied by the client. Verify the deployed routing and listener exposure separately. The provided Uberspace template is a configuration example, not evidence of the live host's settings.
 
-`GET /v1/stats` accepts only a loopback peer without `X-Forwarded-For`, `Forwarded` or `X-Real-IP`; other requests receive 404. Keep the proxy's forwarding headers intact. `GET /v1/summary` is the public aggregate endpoint. The device token in `/v1/devices/:token` authorizes registration, renewal and removal for that device; protect tokens in clients, URLs and proxy access logs. Filled-in runtime configuration and APNs keys stay outside the repository.
+`GET /v1/stats` and `/stats/` (including assets and dashboard data) accept only a loopback peer without `X-Forwarded-For`, `Forwarded` or `X-Real-IP`; other requests receive 404. Local requests also require the configured Basic login. Keep the proxy's forwarding headers intact. `GET /v1/summary` is the public aggregate endpoint. The device token in `/v1/devices/:token` authorizes registration, renewal and removal for that device; protect tokens in clients, URLs and proxy access logs. Filled-in runtime configuration and APNs keys stay outside the repository.
 
 Outbound space fetches use the directory allowlist, accept HTTP/HTTPS without redirects, check all resolved addresses and pin a permitted address for the connection. TLS verifies the hostname and trust chain. These application checks complement host-level network restrictions. Validate the actual deployed configuration and runtime separately; a code path alone is not an operational acceptance result.
 
@@ -453,7 +491,7 @@ Build the new version into its own directory under `~/opt` as in steps 1 and 2, 
     supervisorctl status spacepush        # running?
     supervisorctl tail -f spacepush       # log; the level is notice, so only noteworthy events appear
     supervisorctl restart spacepush
-    curl -s http://127.0.0.1:52184/v1/stats | python3 -m json.tool    # usage statistics, see Statistics
+    curl --fail --user 'YOUR_LOGIN' http://127.0.0.1:52184/v1/stats | python3 -m json.tool    # prompts for password; see Statistics
 
 Remote shell into the running node, for inspection (`Ctrl-G q` leaves without stopping it):
 

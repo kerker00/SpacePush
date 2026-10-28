@@ -36,6 +36,10 @@ app_test_() ->
             ?_test(future_documents_are_not_successful_reads(Port)),
             ?_test(recent_fallback_preserves_original_fetch_time(Port)),
             ?_test(test_push_endpoint(Port)),
+            ?_test(statistics_require_configured_credentials(Port)),
+            ?_test(statistics_reject_invalid_logins(Port)),
+            ?_test(statistics_stay_hidden_through_proxies(Port)),
+            ?_test(statistics_and_dashboard_work_with_login(Port)),
             ?_test(rate_limited_requests_do_not_tally_versions(Port))
         ]
     end}.
@@ -325,3 +329,98 @@ test_push_endpoint(Port) ->
         ok = spacepush_registry:unregister(Second),
         sys:resume(spacepush_apns)
     end.
+
+stats_paths() ->
+    ["/v1/stats", "/stats", "/stats/", "/stats/data.json", "/stats/dashboard.css", "/stats/dashboard.js"].
+
+stats_login() ->
+    [{"authorization", "Basic " ++ binary_to_list(base64:encode(<<"viewer:stats-test:password">>))}].
+
+with_stats_login(Fun) ->
+    OldUser = application:get_env(spacepush, stats_username, undefined),
+    OldPassword = application:get_env(spacepush, stats_password, undefined),
+    application:set_env(spacepush, stats_username, <<"viewer">>),
+    application:set_env(spacepush, stats_password, <<"stats-test:password">>),
+    try Fun()
+    after
+        application:set_env(spacepush, stats_username, OldUser),
+        application:set_env(spacepush, stats_password, OldPassword)
+    end.
+
+stats_request(Method, Port, Path, Headers) ->
+    Request = case Method of
+        get -> {url(Port, Path), Headers};
+        head -> {url(Port, Path), Headers};
+        _ -> {url(Port, Path), Headers, "application/json", <<>>}
+    end,
+    {ok, {{_, Status, _}, ResponseHeaders, Body}} = httpc:request(Method, Request, [], [{body_format, binary}]),
+    {Status, ResponseHeaders, Body}.
+
+statistics_require_configured_credentials(Port) ->
+    with_stats_login(fun() ->
+        [begin
+            application:set_env(spacepush, stats_username, User),
+            application:set_env(spacepush, stats_password, Password),
+            [begin
+                {503, Headers, Body} = stats_request(get, Port, Path, stats_login()),
+                ?assertEqual("no-store", proplists:get_value("cache-control", Headers)),
+                ?assertEqual(#{<<"error">> => <<"stats_unavailable">>}, json:decode(Body))
+            end || Path <- stats_paths()]
+        end || {User, Password} <- [{undefined, undefined}, {<<"viewer">>, undefined},
+            {undefined, <<"stats-test:password">>}, {<<>>, <<"password">>}, {<<"viewer">>, <<>>},
+            {"viewer", "password"}, {<<"bad:user">>, <<"password">>}]]
+    end).
+
+statistics_reject_invalid_logins(Port) ->
+    with_stats_login(fun() ->
+        BadLogins = [[], [{"authorization", "Basic !!!"}], [{"authorization", "Bearer abc"}],
+            [{"authorization", "Basic " ++ binary_to_list(base64:encode(<<"no-colon">>))}]],
+        Wrong = [[{"authorization", "Basic " ++ binary_to_list(base64:encode(Value))}]
+            || Value <- [<<"viewer:wrong">>, <<"wrong:stats-test:password">>, <<":">>]],
+        [begin
+            {401, Headers, Body} = stats_request(get, Port, Path, Login),
+            ?assertEqual("Basic realm=\"SpacePush statistics\", charset=\"UTF-8\"",
+                proplists:get_value("www-authenticate", Headers)),
+            ?assertEqual("no-store", proplists:get_value("cache-control", Headers)),
+            ?assertEqual(#{<<"error">> => <<"unauthorized">>}, json:decode(Body))
+        end || Path <- stats_paths(), Login <- BadLogins ++ Wrong]
+    end).
+
+statistics_stay_hidden_through_proxies(Port) ->
+    with_stats_login(fun() ->
+        [begin
+            {404, Headers, Body} = stats_request(get, Port, Path, [{Header, "127.0.0.1"} | stats_login()]),
+            ?assertEqual(undefined, proplists:get_value("www-authenticate", Headers)),
+            ?assertEqual(#{<<"error">> => <<"not_found">>}, json:decode(Body))
+        end || Path <- stats_paths(), Header <- ["x-forwarded-for", "forwarded", "x-real-ip"]]
+    end).
+
+statistics_and_dashboard_work_with_login(Port) ->
+    with_stats_login(fun() ->
+        [begin
+            {200, Headers, Body} = stats_request(get, Port, Path ++ "?days=3", stats_login()),
+            ?assertEqual("no-store", proplists:get_value("cache-control", Headers)),
+            ?assertEqual(undefined, proplists:get_value("access-control-allow-origin", Headers)),
+            ?assertMatch(#{<<"days">> := [_, _, _], <<"service">> := #{<<"version">> := _}}, json:decode(Body))
+        end || Path <- ["/v1/stats", "/stats/data.json"]],
+        [begin
+            {200, _, Body} = stats_request(get, Port, "/v1/stats?days=" ++ Days, stats_login()),
+            ?assertEqual(Count, length(maps:get(<<"days">>, json:decode(Body))))
+        end || {Days, Count} <- [{"garbage", 14}, {"0", 1}, {"900", 400}]],
+        [begin
+            {200, Headers, Body} = stats_request(get, Port, Path, stats_login()),
+            ?assertEqual(Type, proplists:get_value("content-type", Headers)),
+            ?assertEqual("no-store", proplists:get_value("cache-control", Headers)),
+            ?assertEqual("DENY", proplists:get_value("x-frame-options", Headers)),
+            ?assertEqual("nosniff", proplists:get_value("x-content-type-options", Headers)),
+            ?assertNotEqual(undefined, proplists:get_value("content-security-policy", Headers)),
+            ?assertNotEqual(nomatch, binary:match(Body, Marker))
+        end || {Path, Type, Marker} <- [
+            {"/stats/", "text/html; charset=utf-8", <<"/stats/dashboard.js">>},
+            {"/stats/dashboard.css", "text/css; charset=utf-8", <<"--accent">>},
+            {"/stats/dashboard.js", "text/javascript; charset=utf-8", <<"/stats/data.json">>}]],
+        ?assertMatch({200, _, <<>>}, stats_request(head, Port, "/stats/", stats_login())),
+        ?assertMatch({405, _, _}, stats_request(post, Port, "/stats/data.json", stats_login())),
+        ?assertMatch({404, _, _}, stats_request(get, Port, "/stats/sys.config", stats_login())),
+        ?assertMatch({404, _, _}, stats_request(get, Port, "/stats/%2e%2e/config/sys.config", stats_login()))
+    end).

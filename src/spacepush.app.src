@@ -65,7 +65,10 @@
         {apns_key_id, undefined},
         {apns_team_id, <<"7E3BJ546SA">>},
         {apns_topic, <<"net.grafixmafia.spacepush">>},
-        %% Usage statistics, served on GET /v1/stats to local requests only.
+        %% Statistics API and dashboard: local requests AND HTTP Basic auth.
+        %% Set both in the external runtime sys.config; undefined disables access.
+        {stats_username, undefined},
+        {stats_password, undefined},
         {stats_file, "data/stats.bin"},
         %% Per ISO week, with one additional "other" bucket for overflow.
         {stats_max_versions, 64},

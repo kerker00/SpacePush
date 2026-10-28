@@ -41,3 +41,5 @@ jobs:
         run: env -u DEBUG rebar3 as test compile
       - name: Run EUnit regressions
         run: env -u DEBUG rebar3 eunit
+      - name: Verify dashboard calculations
+        run: node --test test/dashboard.test.cjs

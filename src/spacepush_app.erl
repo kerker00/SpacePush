@@ -16,7 +16,9 @@ start(_StartType, _StartArgs) ->
             {"/v1/mainframe/rooms", spacepush_http_read, mainframe_rooms},
             {"/health", spacepush_http_health, []},
             {"/v1/test", spacepush_http_test, []},
-            {"/v1/stats", spacepush_http_stats, []}
+            {"/v1/stats", spacepush_http_stats, api},
+            {"/stats", spacepush_http_stats, dashboard},
+            {"/stats/[...]", spacepush_http_stats, dashboard}
         ]}
     ]),
     {ok, Ip} = application:get_env(spacepush, http_ip),
