@@ -51,7 +51,8 @@ start_stream_listener() ->
             {ok, Lifetime} = application:get_env(spacepush, stream_max_lifetime_ms),
             Dispatch = cowboy_router:compile([
                 {'_', [
-                    {"/v1/stream", spacepush_http_stream, []}
+                    {"/v1/stream", spacepush_http_stream, []},
+                    {"/v1/stream/test", spacepush_http_stream_test, []}
                 ]}
             ]),
             TransportOptions = #{socket_opts => [{ip, Ip}, {port, Port}], max_connections => MaxConnections},

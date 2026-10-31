@@ -30,6 +30,7 @@ stream_test_() ->
             ?_test(ends_after_lifetime(Ports)),
             ?_test(limits_streams_per_client(Ports)),
             ?_test(scope_restart_ends_streams(Ports)),
+            ?_test(test_events_are_local(Ports)),
             ?_test(api_listener_has_no_stream(Ports))
         ]
     end}.
@@ -105,6 +106,16 @@ scope_restart_ends_streams({_Api, Port}) ->
     gen_tcp:close(Socket),
     %% Only the scope itself restarts; the APNs pipeline keeps its processes.
     ?assertEqual(Before, [Pid || {Id, Pid, _, _} <- supervisor:which_children(spacepush_sup), Id =/= spacepush_stream]).
+
+test_events_are_local({_Api, Port}) ->
+    Socket = open(Port),
+    wait(Socket, <<"retry:">>),
+    {202, Body} = request(Port, "POST", "/v1/stream/test?endpoint=" ?NERD2NERD_QS),
+    ?assertEqual(#{<<"recipients">> => 1, <<"test">> => true}, json:decode(Body)),
+    ?assertMatch({_, _}, wait(Socket, <<"event: test\n">>)),
+    gen_tcp:close(Socket),
+    ?assertMatch({404, _}, request(Port, "POST", "/v1/stream/test?endpoint=" ?NERD2NERD_QS, "X-Forwarded-For: 203.0.113.7\r\n")),
+    ?assertMatch({405, _}, request(Port, "GET", "/v1/stream/test?endpoint=" ?NERD2NERD_QS)).
 
 api_listener_has_no_stream({Api, _Port}) ->
     ?assertMatch({404, _}, request(Api, "GET", "/v1/stream?sub=" ?NERD2NERD_QS)).
