@@ -14,6 +14,8 @@ An Erlang/OTP application that:
 
 ## Architecture
 
+[`docs/architecture.drawio`](docs/architecture.drawio) shows the components, their files and the path of a confirmed state change. It also shows the planned Linux desktop stream, highlighted in green ([plan](docs/linux-desktop-stream-plan.md)). Open it with [diagrams.net](https://app.diagrams.net) or the draw.io desktop app.
+
 | Process | Role |
 | --- | --- |
 | `spacepush_directory` | The list of spaces and allowlist, refreshed hourly and saved to `data/directory.bin` |
