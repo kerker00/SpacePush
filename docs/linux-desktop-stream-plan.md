@@ -4,7 +4,7 @@ Status: draft for review · branch `feat/linux-desktop-stream` · diagram: [arch
 
 ## Goal
 
-A Linux desktop client (first target: Hyprland) receives the same confirmed
+A Linux desktop client (first target: Hyprland; built on SpaceStateKit and SpaceStateCLI) receives the same confirmed
 open/close changes the iOS and macOS apps receive through APNs, without a
 third-party push service.
 
@@ -107,25 +107,53 @@ mako, swaync, dunst).
 - O4: README sections: API (`/v1/stream`), Configuration, Deploy step 7,
   Security (public, unauthenticated, limits) and a CHANGELOG entry.
 
-## Linux client (separate repository)
+## Linux client (Swift: SpaceStateKit + SpaceStateCLI)
 
-- C1: Language: D1. Small static binary, systemd `--user` unit, config in
-  `~/.config/spacepush/` (subscribed endpoints and rooms).
-- C2: Connect loop:
-  1. read the current state,
-  2. open `/v1/stream`,
-  3. on error, retry with exponential backoff plus jitter (cap about 5 min),
-  4. resync after every reconnect.
+There is no new repository. The client builds on the existing Swift packages,
+whose CI already runs on Ubuntu 24.04 with Swift 6.2.
 
-  React to network changes and suspend/resume (logind `PrepareForSleep`) by
-  reconnecting immediately.
-- C3: Notifications through D-Bus `org.freedesktop.Notifications.Notify`, with
-  `replaces_id` per topic so a newer state replaces the older one. The text is
-  localised in the client; the keys match the apps' `PUSH_STATE_*`.
-- C4: Optional Waybar custom module (JSON output: open count and tooltip).
-- C5: Packaging: AUR (`spacepush-desktop` / `-git`), later possibly a Flatpak.
-- C6: Picking spaces: CLI first (`spacepush-desktop add <endpoint>`, search via
-  `/v1/directory`); a GUI picker (e.g. walker/fuzzel integration) is optional.
+### SpaceStateKit (platform-neutral)
+
+- K0: Spike first. Check that `URLSession` from swift-corelibs-foundation
+  (libcurl) delivers small SSE chunks through `didReceive data` without
+  buffering, against a local test server that sends one event every few
+  seconds. If it does not, the fallback is `AsyncHTTPClient` in the Linux
+  target only.
+- K1: A pure SSE parser that turns bytes into events (`event`, `data`,
+  `retry`, comments) and handles lines split across chunks. Fully unit-tested.
+- K2: `SpacePushClient.changes(for: [PushSubscription]) -> AsyncThrowingStream<StateChange, Error>`.
+  It uses a delegate-based transfer like `BoundedHTTPTransfer`, without a
+  resource timeout. Instead it has an idle timeout of about twice the
+  heartbeat, a limit per event, and cancellation.
+- K3: A reconnect loop:
+  1. read the current state through `spaceObservation(at:)` and
+     `mainframeRoomsObservation()`,
+  2. open the stream,
+  3. on error, wait with exponential backoff plus jitter (cap about 5 min)
+     and start again.
+
+  Each step is injectable, as in the CLI's `WatchLoop`, for deterministic tests.
+- K4: Release a new Kit version. The Apple apps can adopt `changes(for:)` for
+  live updates while they run; that is optional and not part of this plan.
+
+### SpaceStateCLI (Linux desktop)
+
+- L1: `spacestate watch --push`, which uses K3 instead of interval polling.
+  The output formats (`text`, `--json`, `--waybar`) and `WatchState` stay as
+  they are. Expiry wakes keep working, and so does the existing Waybar module,
+  which now updates live.
+- L2: `spacestate notify [<space> ...]`, a daemon mode that shows notifications
+  through `notify-send --app-name SpaceState --replace-id <id>`. It keeps one id
+  per topic, so a newer state replaces the older one, and needs libnotify ≥ 0.8.
+  Texts are localised in the CLI, mirroring the apps' `PUSH_STATE_*` keys. A
+  direct `sd-bus` C shim is a later option.
+- L3: Reconnect immediately on resume. Listening to logind `PrepareForSleep`
+  needs D-Bus; until then, a wall-clock jump check in the loop is enough.
+- L4: A systemd `--user` unit (`spacestate-notify.service`) plus install docs.
+  Spaces come from the CLI's saved spaces.
+- L5: Distribution. A static Linux binary via the Static Linux SDK
+  (`x86_64-swift-linux-musl`), which removes the Swift runtime dependency.
+  Then AUR packages `spacestate` / `spacestate-git`.
 
 ## Order of work and commits on this branch
 
@@ -136,13 +164,13 @@ mako, swaync, dunst).
 5. S7 + S8.
 6. O4 documentation.
 7. PR to `main` (CI must be green), then O1 to O3 on the host.
-8. Client in its own repository, against the deployed server.
+8. Client work in SpaceStateKit (K0 can start in parallel with server step 2), then SpaceStateCLI against the deployed server.
 
 ## Open decisions
 
 | # | Question | Proposal |
 | --- | --- | --- |
-| D1 | Client language | Rust (single binary, `zbus`, `reqwest`/`eventsource`); Go is the alternative |
+| D1 | Client language | **Decided:** Swift, in SpaceStateKit and SpaceStateCLI |
 | D2 | Subscription encoding in the URL | `sub=<endpoint>` and `sub=<endpoint>\|<room>` as above |
 | D3 | Supervisor placement of the pg scope | Before `spacepush_poller`. With `rest_for_one`, a scope crash then restarts the poller, sender-side order stays as it is |
 | D4 | Should `/v1/test` also reach streams? | Yes, as `event: test`, so the desktop path can be checked end to end |
