@@ -1,6 +1,6 @@
 # Plan: Linux desktop notifications via a server-sent event stream
 
-Status: draft for review · branch `feat/linux-desktop-stream` · diagram: [architecture.drawio](architecture.drawio) (pages *Architecture* and *State change flow*)
+Status: server part implemented (S1–S6, S8, O4); client pending · branch `feat/linux-desktop-stream` · diagram: [architecture.drawio](architecture.drawio) (pages *Architecture* and *State change flow*)
 
 ## Goal
 
@@ -58,7 +58,7 @@ mako, swaync, dunst).
 
   - `name` is cleaned the same way as the APNs title (`spacepush_notification`).
   - The ping comment is sent every `stream_heartbeat_ms` (default 25 s).
-  - `event: test` is used for `/v1/test` broadcasts (D4).
+  - `event: test` is sent by the local `POST /v1/stream/test` (D4).
 - No `id:` and no `Last-Event-ID` replay. Resync goes through the read API
   (principle 3).
 
@@ -72,7 +72,7 @@ mako, swaync, dunst).
 | S4 | SSE handler as a `cowboy_loop`: validate the subscriptions, rate-limit (`read` bucket), `cowboy_req:stream_reply/3`, join groups, heartbeat timer, idle limit (`stream_max_lifetime_ms`, e.g. 1 h, so clients reconnect regularly and pick up server restarts), monitor the pg scope and end the stream if it restarts | `src/spacepush_http_stream.erl` (new) |
 | S5 | Second cowboy listener `spacepush_stream_http` on `stream_http_port`, with its own `stream_max_connections`; stop it in `prep_stop/1` | `src/spacepush_app.erl` |
 | S6 | Limit concurrent streams per client (e.g. 10 per address) through a small ETS counter in `spacepush_stream`, released by monitor | `src/spacepush_stream.erl` |
-| S7 | Statistics: `stream.connects`, `stream.rejected`, `stream.events`; gauge `stream.open` in the report; dashboard tile optional | `src/spacepush_stats.erl`, `priv/stats/*` |
+| S7 | Statistics: counters `stream.connects`, `stream.rejected`, `stream.events` (shown under raw counters). A `stream.open` gauge and dashboard tile are deferred, so `spacepush_stats` stays unchanged | `src/spacepush_stream.erl`, `src/spacepush_http_stream.erl` |
 | S8 | Config defaults: `stream_http_ip`, `stream_http_port`, `stream_max_connections`, `stream_max_per_client`, `stream_max_topics`, `stream_heartbeat_ms`, `stream_max_lifetime_ms` | `src/spacepush.app.src`, `config/sys.config`, `deploy/uberspace/sys.config.example` |
 
 ### Tests (EUnit, same style as the existing suites)
@@ -171,8 +171,8 @@ whose CI already runs on Ubuntu 24.04 with Swift 6.2.
 | # | Question | Proposal |
 | --- | --- | --- |
 | D1 | Client language | **Decided:** Swift, in SpaceStateKit and SpaceStateCLI |
-| D2 | Subscription encoding in the URL | `sub=<endpoint>` and `sub=<endpoint>\|<room>` as above |
-| D3 | Supervisor placement of the pg scope | Before `spacepush_poller`. With `rest_for_one`, a scope crash then restarts the poller, sender-side order stays as it is |
-| D4 | Should `/v1/test` also reach streams? | Yes, as `event: test`, so the desktop path can be checked end to end |
-| D5 | Apply the 5-min notification cooldown to streams? | No: changes are already debounced for 120 s, and the client replaces the notification per topic |
-| D6 | Separate port vs. the same listener | Separate port (principle 4), if O1 path backends work as expected |
+| D2 | Subscription encoding in the URL | **Decided:** `sub=<endpoint>` and `sub=<endpoint>\|<room>` |
+| D3 | Supervisor placement of the pg scope | **Decided:** last child. A scope crash restarts nothing in the APNs pipeline; streams end and clients reconnect |
+| D4 | Should `/v1/test` also reach streams? | **Decided:** no; `/v1/test` stays unchanged. A separate local `POST /v1/stream/test` sends `event: test` to streams only |
+| D5 | Apply the 5-min notification cooldown to streams? | **Decided:** no; changes are already debounced for 120 s, and the client replaces the notification per topic |
+| D6 | Separate port vs. the same listener | **Decided:** separate listener, off unless `stream_http_port` is set |
