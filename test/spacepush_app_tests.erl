@@ -75,7 +75,8 @@ all_children_running() ->
             spacepush_outbox,
             spacepush_apns,
             spacepush_poller,
-            spacepush_stats
+            spacepush_stats,
+            spacepush_stream
         ],
         lists:reverse([Id || {Id, Pid, worker, _} <- Children, is_pid(Pid)])
     ).

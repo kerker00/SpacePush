@@ -13,6 +13,8 @@ start_link() ->
 %% Pending work survives in the outbox and the tracker file.
 %% The statistics come last: recording uses their optional bounded ETS buffer,
 %% and a crash there restarts nothing else.
+%% The stream scope is last for the same reason: it is volatile, and placing
+%% it after the APNs pipeline means its crash never restarts any of it.
 init([]) ->
     Children = [
         worker(spacepush_ratelimit),
@@ -22,7 +24,8 @@ init([]) ->
         worker(spacepush_outbox),
         worker(spacepush_apns),
         worker(spacepush_poller),
-        worker(spacepush_stats)
+        worker(spacepush_stats),
+        spacepush_stream:child_spec()
     ],
     {ok, {#{strategy => rest_for_one, intensity => 5, period => 60}, Children}}.
 
