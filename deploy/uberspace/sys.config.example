@@ -23,6 +23,10 @@
         %% Generate a password with openssl rand -hex 32. No default credentials.
         {stats_username, undefined},
         {stats_password, undefined},
+        %% Change stream for desktop clients (README: Change stream). Off by default;
+        %% enable both lines and add the /v1/stream web backend to use it.
+        %% {stream_http_ip, {0, 0, 0, 0}},
+        %% {stream_http_port, 52185},
 
         %% One key per APNs environment. A key valid for both ("Sandbox & Production")
         %% can instead be set once with apns_key_file and apns_key_id.

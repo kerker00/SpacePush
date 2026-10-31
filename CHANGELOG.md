@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add `GET /v1/stream`, server-sent events of confirmed state changes for desktop clients, on a separate listener that is disabled unless `stream_http_port` is set. Events are sent after the APNs outbox commit; the APNs pipeline, its persistent formats and `/v1/test` are unchanged. Add a server-local `POST /v1/stream/test` that reaches only open streams.
 - Require a configured HTTP Basic login for the local statistics API and new `/stats/` dashboard. Set `stats_username` and `stats_password` only in the external runtime `sys.config`; missing credentials disable access. Retain the loopback and proxy-header restrictions, including for dashboard assets and data.
 - Add a responsive statistics dashboard with activity/traffic charts, weekly version and OS distributions, APNs outcomes, device confirmation, searchable subscriptions, polling, VM metrics and raw daily counters. Serve all assets inside the release without external dependencies. Document SSH tunneling, configuration and password-prompted curl access.
 
