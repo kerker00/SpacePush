@@ -65,6 +65,8 @@ handle_info(poll, #{file := File, tracker := Tracker} = State) ->
     %% A durable intent and idempotent outbox commit recover both sides together.
     Tracker1 =/= Tracker andalso spacepush_commit:commit(File, Tracker1, Changes),
     record_changes(Changes),
+    %% Streams are volatile and fed only after the durable commit returned.
+    Changes =/= [] andalso spacepush_stream:broadcast(Changes),
     spacepush_stats:count(<<"poll.rounds">>),
     spacepush_stats:duration(<<"poll">>, erlang:monotonic_time(millisecond) - Started),
     erlang:send_after(env(poll_tick_ms), self(), poll),

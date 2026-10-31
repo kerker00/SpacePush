@@ -203,3 +203,46 @@ mainframe_room_subscription_uses_active_interval() ->
     ok = spacepush_registry:unregister(binary:copy(<<"ab">>, 32)),
     #{schedule := Later} = poll(State),
     ?assertMatch(#{interval := 600000}, maps:get(RoomUrl, Later)).
+
+stream_test_() ->
+    {foreach, fun() ->
+        setup(),
+        application:set_env(spacepush, stream_max_per_client, 10),
+        {ok, Scope} = pg:start_link(spacepush_stream),
+        unlink(Scope),
+        Scope
+    end, fun(Scope) ->
+        exit(Scope, kill),
+        cleanup(ok)
+    end, [
+        fun confirmed_change_is_streamed_after_commit/0,
+        fun poll_without_scope_still_commits/0
+    ]}.
+
+%% A candidate seen long enough ago is confirmed by this poll.
+confirmed_poll() ->
+    spacepush_test_util:fake_responses(responses({ok, ?SPACE})),
+    {ok, File} = application:get_env(spacepush, tracker_file),
+    poll(#{file => File, tracker => #{?TOPIC => #{confirmed => closed, candidate => {open, 0}}}, schedule => #{}}).
+
+confirmed_change_is_streamed_after_commit() ->
+    Test = self(),
+    Subscriber = spawn(fun() ->
+        ok = spacepush_stream:subscribe([?TOPIC], test_client),
+        Test ! joined,
+        %% Record the outbox at the moment the event arrives.
+        receive {spacepush_stream, Event} -> Test ! {streamed, Event, spacepush_outbox:pending()} end
+    end),
+    receive joined -> ok end,
+    #{tracker := #{?TOPIC := #{confirmed := open}}} = confirmed_poll(),
+    receive
+        {streamed, Event, Pending} ->
+            ?assertMatch(<<"event: change\n", _/binary>>, Event),
+            ?assertEqual(1, Pending)
+    after 1000 -> error({no_event, Subscriber})
+    end.
+
+poll_without_scope_still_commits() ->
+    exit(whereis(spacepush_stream), kill),
+    #{tracker := #{?TOPIC := #{confirmed := open}}} = confirmed_poll(),
+    ?assertEqual(1, spacepush_outbox:pending()).
