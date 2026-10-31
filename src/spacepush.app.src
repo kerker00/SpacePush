@@ -44,6 +44,16 @@
         {rate_limit_per_minute, 30},
         {read_rate_limit_per_minute, 300},
         {http_body_timeout_ms, 10000},
+        %% Server-sent event streams for desktop clients, on their own listener.
+        %% Disabled while stream_http_port is undefined.
+        {stream_http_ip, {127, 0, 0, 1}},
+        {stream_http_port, undefined},
+        {stream_max_connections, 10000},
+        {stream_max_per_client, 10},
+        {stream_max_topics, 50},
+        {stream_heartbeat_ms, 25000},
+        {stream_max_lifetime_ms, 3600000},
+        {stream_retry_ms, 10000},
         %% Device registrations; the apps re-register on every launch.
         {registry_file, "data/registry.dets"},
         {max_registrations, 10000},

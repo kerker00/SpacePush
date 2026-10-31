@@ -12,6 +12,7 @@ app_test_() ->
     {setup, fun start/0, fun stop/1, fun(Port) ->
         [
             ?_test(all_children_running()),
+            ?_assertNot(maps:is_key(spacepush_stream_http, ranch:info())),
             ?_assertEqual({200, <<"ok">>}, request(get, Port, "/health")),
             ?_test(register_and_unregister(Port)),
             ?_test(unconfirmed_admission_over_http(Port)),
