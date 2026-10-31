@@ -1,6 +1,13 @@
 # Plan: Linux desktop notifications via a server-sent event stream
 
-Status: server part implemented (S1–S6, S8, O4); client pending · branch `feat/linux-desktop-stream` · diagram: [architecture.drawio](architecture.drawio) (pages *Architecture* and *State change flow*)
+Status (2026-10-31):
+- Server: S1–S6, S8 and O4 are done on this branch; S7 is reduced to counters.
+  O1–O3 (host setup) are still open.
+- SpaceStateKit: K0–K3 are done on `feat/linux-desktop-stream`. K0 showed that
+  URLSession on Linux delivers events unbuffered. K4 (a release) is open.
+- SpaceStateCLI: L1, L2 and L4 are done on `feat/linux-desktop-stream`. L3 relies
+  on the 60-second idle timeout. L5 (static binary, AUR) is open. The CLI needs
+  the Kit release before its pin can be updated and CI can pass. · branch `feat/linux-desktop-stream` · diagram: [architecture.drawio](architecture.drawio) (pages *Architecture* and *State change flow*)
 
 ## Goal
 
