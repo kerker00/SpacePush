@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "label": "EUnit coverage",
+  "message": "88.2%",
+  "color": "green",
+  "sourceSha": "fc376b5d7622bacb8808d816ef436f94589466dc",
+  "coveredLines": 1490,
+  "totalLines": 1689,
+  "otp": "28",
+  "runUrl": "https://github.com/kerker00/SpacePush/actions/runs/41460372008"
+}
