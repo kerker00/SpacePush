@@ -544,7 +544,17 @@ topology, allowing headroom for API traffic, in-progress/rejected connections,
 outbound sockets and data files. Ranch's transport limit is soft and applies
 per connection supervisor; the stream listener uses one, and the volatile
 registry independently enforces the total stream admission limit. Shell
-`ulimit -n` alone does not prove the running service has the same limit.
+`ulimit -n` alone does not prove the running service has the same limit:
+
+    grep 'open files' /proc/$(supervisorctl pid spacepush)/limits
+
+The default `stream_max_connections` (10000) assumes a far higher limit than a
+hosted account has. `deploy/uberspace/spacepush.ini` raises the soft limit to the
+hard one, so update `~/etc/services.d/spacepush.ini` from it, and set
+`stream_max_connections` below that limit. With a hard limit of 4096, 2500 streams
+plus `http_max_connections` (1024) leave about 570 descriptors for outbound
+connections and files. Beyond the limit, further streams are refused while API and
+push delivery keep working.
 
 ### Updating to a new release
 

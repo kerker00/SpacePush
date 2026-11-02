@@ -27,6 +27,9 @@
         %% enable both lines and add the /v1/stream web backend to use it.
         %% {stream_http_ip, {0, 0, 0, 0}},
         %% {stream_http_port, 52185},
+        %% Below the open-file limit, leaving room for the API listener and outbound
+        %% connections. 2500 suits a limit of 4096 (README: Change stream).
+        %% {stream_max_connections, 2500},
 
         %% One key per APNs environment. A key valid for both ("Sandbox & Production")
         %% can instead be set once with apns_key_file and apns_key_id.
