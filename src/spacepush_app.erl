@@ -55,7 +55,10 @@ start_stream_listener() ->
                     {"/v1/stream/test", spacepush_http_stream_test, []}
                 ]}
             ]),
-            TransportOptions = #{socket_opts => [{ip, Ip}, {port, Port}], max_connections => MaxConnections},
+            %% Ranch's soft socket limit is per connection supervisor. The
+            %% stream registry separately enforces a hard admission budget.
+            TransportOptions = #{socket_opts => [{ip, Ip}, {port, Port}],
+                num_conns_sups => 1, max_connections => MaxConnections},
             %% Heartbeats are sent, not received, so the idle timeout only has to outlast a stream.
             ProtocolOptions = #{env => #{dispatch => Dispatch}, idle_timeout => Lifetime + 60000},
             case cowboy:start_clear(?STREAM_LISTENER, TransportOptions, ProtocolOptions) of

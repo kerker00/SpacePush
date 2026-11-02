@@ -1,7 +1,9 @@
 # Plan: Linux desktop notifications via a server-sent event stream
 
-Status (2026-10-31):
+Status (2026-11-02):
 - Server: S1–S6, S8 and O4 are done on this branch; S7 is reduced to counters.
+  Admission is serialized in a volatile registry with an ETS topic index;
+  total/client limits and registry restarts during setup have regressions.
   O1–O3 (host setup) are still open.
 - SpaceStateKit: K0–K3 are done on `feat/linux-desktop-stream`. K0 showed that
   URLSession on Linux delivers events unbuffered. K4 (a release) is open.
@@ -73,12 +75,12 @@ mako, swaync, dunst).
 
 | Step | Change | Files |
 | --- | --- | --- |
-| S1 | `spacepush_stream`: owns a `pg` scope; `subscribe(Topics)` joins the calling process, `broadcast([change()])` sends `{spacepush_change, Change, At}` to each topic's members; never blocks and never fails the caller | `src/spacepush_stream.erl` (new) |
+| S1 | `spacepush_stream`: owns a volatile ETS topic index; `subscribe(Topics, Client)` atomically admits the calling process and returns its exact registry monitor; `broadcast(Changes)` reads the index directly and sends SSE messages without waiting for the registry or subscribers | `src/spacepush_stream.erl` (new) |
 | S2 | Supervisor child for the scope (placement: D3); add to `registered` | `src/spacepush_sup.erl`, `src/spacepush.app.src` |
 | S3 | Poller: call `spacepush_stream:broadcast(Changes)` after `commit/3`, only when `Changes =/= []` | `src/spacepush_poller.erl:66` |
-| S4 | SSE handler as a `cowboy_loop`: validate the subscriptions, rate-limit (`read` bucket), `cowboy_req:stream_reply/3`, join groups, heartbeat timer, idle limit (`stream_max_lifetime_ms`, e.g. 1 h, so clients reconnect regularly and pick up server restarts), monitor the pg scope and end the stream if it restarts | `src/spacepush_http_stream.erl` (new) |
+| S4 | SSE handler as a `cowboy_loop`: validate subscriptions, rate-limit (`read` bucket), monitor the exact admitting registry PID before writes, stream the response, heartbeat timer and lifetime limit; end the stream if its registry restarts, including during setup | `src/spacepush_http_stream.erl` (new) |
 | S5 | Second cowboy listener `spacepush_stream_http` on `stream_http_port`, with its own `stream_max_connections`; stop it in `prep_stop/1` | `src/spacepush_app.erl` |
-| S6 | Limit concurrent streams per client (e.g. 10 per address) through a small ETS counter in `spacepush_stream`, released by monitor | `src/spacepush_stream.erl` |
+| S6 | Atomically enforce total and per-client admission limits in `spacepush_stream`, release both on handler DOWN; use one Ranch connection supervisor for the additional soft socket limit | `src/spacepush_stream.erl`, `src/spacepush_app.erl` |
 | S7 | Statistics: counters `stream.connects`, `stream.rejected`, `stream.events` (shown under raw counters). A `stream.open` gauge and dashboard tile are deferred, so `spacepush_stats` stays unchanged | `src/spacepush_stream.erl`, `src/spacepush_http_stream.erl` |
 | S8 | Config defaults: `stream_http_ip`, `stream_http_port`, `stream_max_connections`, `stream_max_per_client`, `stream_max_topics`, `stream_heartbeat_ms`, `stream_max_lifetime_ms` | `src/spacepush.app.src`, `config/sys.config`, `deploy/uberspace/sys.config.example` |
 
@@ -89,6 +91,8 @@ mako, swaync, dunst).
   - a dead subscriber is ignored,
   - broadcasting with no members is a no-op,
   - the per-client limit is released when a stream ends.
+  - concurrent admissions cannot exceed client or total limits,
+  - a crashed handler frees its total reservation and topic index entries.
 - `spacepush_http_stream_tests`, against a real loopback listener with `gun`:
   - status codes for invalid, unknown and too many subscriptions,
   - stream headers,
@@ -96,6 +100,8 @@ mako, swaync, dunst).
   - the heartbeat arrives,
   - the lifetime limit closes the stream,
   - a scope restart closes the stream.
+  - the total budget returns 503 and allows a replacement after disconnect,
+  - a registry restart during the first body acknowledgement closes the stream.
 - Poller regression: changes are broadcast *after* the commit. Use the existing
   checkpoint mechanism: a crash at any checkpoint must not have broadcast
   anything that recovery would not also commit.
@@ -179,7 +185,7 @@ whose CI already runs on Ubuntu 24.04 with Swift 6.2.
 | --- | --- | --- |
 | D1 | Client language | **Decided:** Swift, in SpaceStateKit and SpaceStateCLI |
 | D2 | Subscription encoding in the URL | **Decided:** `sub=<endpoint>` and `sub=<endpoint>\|<room>` |
-| D3 | Supervisor placement of the pg scope | **Decided:** last child. A scope crash restarts nothing in the APNs pipeline; streams end and clients reconnect |
+| D3 | Supervisor placement of the volatile stream registry | **Decided:** last child. A registry crash restarts nothing in the APNs pipeline; streams monitor that exact process and reconnect |
 | D4 | Should `/v1/test` also reach streams? | **Decided:** no; `/v1/test` stays unchanged. A separate local `POST /v1/stream/test` sends `event: test` to streams only |
 | D5 | Apply the 5-min notification cooldown to streams? | **Decided:** no; changes are already debounced for 120 s, and the client replaces the notification per topic |
 | D6 | Separate port vs. the same listener | **Decided:** separate listener, off unless `stream_http_port` is set |

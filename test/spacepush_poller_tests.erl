@@ -208,7 +208,7 @@ stream_test_() ->
     {foreach, fun() ->
         setup(),
         application:set_env(spacepush, stream_max_per_client, 10),
-        {ok, Scope} = pg:start_link(spacepush_stream),
+        {ok, Scope} = spacepush_stream:start_link(),
         unlink(Scope),
         Scope
     end, fun(Scope) ->
@@ -228,7 +228,7 @@ confirmed_poll() ->
 confirmed_change_is_streamed_after_commit() ->
     Test = self(),
     Subscriber = spawn(fun() ->
-        ok = spacepush_stream:subscribe([?TOPIC], test_client),
+        {ok, _Monitor} = spacepush_stream:subscribe([?TOPIC], test_client),
         Test ! joined,
         %% Record the outbox at the moment the event arrives.
         receive {spacepush_stream, Event} -> Test ! {streamed, Event, spacepush_outbox:pending()} end

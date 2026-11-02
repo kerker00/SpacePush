@@ -13,7 +13,7 @@ start_link() ->
 %% Pending work survives in the outbox and the tracker file.
 %% The statistics come last: recording uses their optional bounded ETS buffer,
 %% and a crash there restarts nothing else.
-%% The stream scope is last for the same reason: it is volatile, and placing
+%% The stream registry is last for the same reason: it is volatile, and placing
 %% it after the APNs pipeline means its crash never restarts any of it.
 init([]) ->
     Children = [

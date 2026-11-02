@@ -6,8 +6,8 @@ of the subscribed spaces and rooms as server-sent events.
 Each `sub` names a directory endpoint, optionally followed by `|` and a room
 (default `space`), at most `stream_max_topics` of them. Invalid input answers
 400, an unknown endpoint 404, a client over `read_rate_limit_per_minute` or
-`stream_max_per_client` 429, and an unloaded directory 503, all before the
-stream starts.
+`stream_max_per_client` 429, and an unloaded directory, unavailable registry
+or exhausted total stream budget 503, all before the stream starts.
 
 The stream sends a `retry:` hint, then `event: change` (and `event: test`)
 with JSON data, and a `: ping` comment every `stream_heartbeat_ms` so proxies
@@ -37,10 +37,15 @@ start(Client, Req0, Opts) ->
     case check(Req0) of
         {ok, Topics} ->
             case spacepush_stream:subscribe(Topics, Client) of
-                ok -> open(Req0, Opts);
+                {ok, Scope} -> open(Req0, Scope);
                 {error, too_many_streams} ->
                     spacepush_stats:count(<<"stream.rejected">>),
-                    {ok, spacepush_http:error_reply(429, <<"too_many_streams">>, Req0), Opts}
+                    {ok, spacepush_http:error_reply(429, <<"too_many_streams">>, Req0), Opts};
+                {error, full} ->
+                    spacepush_stats:count(<<"stream.rejected">>),
+                    {ok, spacepush_http:error_reply(503, <<"stream_capacity">>, Req0), Opts};
+                {error, unavailable} ->
+                    {ok, spacepush_http:error_reply(503, <<"stream_unavailable">>, Req0), Opts}
             end;
         {error, Status, Reason} ->
             {ok, spacepush_http:error_reply(Status, Reason, Req0), Opts}
@@ -84,7 +89,7 @@ topic(Sub) when is_binary(Sub), byte_size(Sub) > 0, byte_size(Sub) =< 4200 ->
 topic(_) ->
     error.
 
-open(Req0, _Opts) ->
+open(Req0, Scope) ->
     spacepush_stats:request(<<"stream">>, Req0),
     spacepush_stats:count(<<"stream.connects">>),
     Req = cowboy_req:stream_reply(200, #{
@@ -94,7 +99,6 @@ open(Req0, _Opts) ->
         <<"x-content-type-options">> => <<"nosniff">>
     }, Req0),
     ok = cowboy_req:stream_body(<<"retry: ", (integer_to_binary(env(stream_retry_ms)))/binary, "\n\n">>, nofin, Req),
-    Scope = erlang:monitor(process, spacepush_stream),
     erlang:send_after(env(stream_heartbeat_ms), self(), heartbeat),
     erlang:send_after(env(stream_max_lifetime_ms), self(), lifetime),
     {cowboy_loop, Req, #{scope => Scope}, hibernate}.

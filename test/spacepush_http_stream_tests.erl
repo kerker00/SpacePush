@@ -29,7 +29,9 @@ stream_test_() ->
             ?_test(sends_heartbeats(Ports)),
             ?_test(ends_after_lifetime(Ports)),
             ?_test(limits_streams_per_client(Ports)),
+            ?_test(limits_streams_in_total(Ports)),
             ?_test(scope_restart_ends_streams(Ports)),
+            ?_test(scope_restart_during_initial_write_ends_stream()),
             ?_test(test_events_are_local(Ports)),
             ?_test(api_listener_has_no_stream(Ports))
         ]
@@ -39,6 +41,8 @@ start() ->
     spacepush_test_util:setup_env("http_stream"),
     application:set_env(spacepush, http_port, 0),
     application:set_env(spacepush, stream_http_port, 0),
+    application:set_env(spacepush, stream_max_connections, 10000),
+    application:set_env(spacepush, stream_max_per_client, 10),
     application:set_env(spacepush, max_data_age_s, 1000000000),
     {ok, Aggregator} = application:get_env(spacepush, aggregator_url),
     {ok, Mainframe} = application:get_env(spacepush, mainframe_url),
@@ -89,11 +93,28 @@ ends_after_lifetime({_Api, Port}) ->
     end).
 
 limits_streams_per_client({_Api, Port}) ->
+    wait_for_stream_count(0),
     with_env(stream_max_per_client, 1, fun() ->
         Socket = open(Port),
         wait(Socket, <<"retry:">>),
         ?assertMatch({429, _}, request(Port, "GET", "/v1/stream?sub=" ?NERD2NERD_QS)),
         gen_tcp:close(Socket)
+    end).
+
+limits_streams_in_total({_Api, Port}) ->
+    wait_for_stream_count(0),
+    ?assertMatch(#{num_conns_sups := 1}, ranch:get_transport_options(spacepush_stream_http)),
+    with_env(stream_max_connections, 1, fun() ->
+        Socket = open(Port),
+        wait(Socket, <<"retry:">>),
+        {503, Body} = request(Port, "GET", "/v1/stream?sub=" ?NERD2NERD_QS),
+        ?assertEqual(#{<<"error">> => <<"stream_capacity">>}, json:decode(Body)),
+        gen_tcp:close(Socket),
+        wait_for_stream_count(0),
+        Replacement = open(Port),
+        ?assertMatch({_, _}, wait(Replacement, <<"retry:">>)),
+        gen_tcp:close(Replacement),
+        wait_for_stream_count(0)
     end).
 
 scope_restart_ends_streams({_Api, Port}) ->
@@ -106,6 +127,61 @@ scope_restart_ends_streams({_Api, Port}) ->
     gen_tcp:close(Socket),
     %% Only the scope itself restarts; the APNs pipeline keeps its processes.
     ?assertEqual(Before, [Pid || {Id, Pid, _, _} <- supervisor:which_children(spacepush_sup), Id =/= spacepush_stream]).
+
+scope_restart_during_initial_write_ends_stream() ->
+    wait_for_stream_count(0),
+    Parent = self(),
+    %% Hold Cowboy's initial body acknowledgement after admission. A restart
+    %% here must follow the old PID, even if the replacement is already up.
+    Connection = spawn(fun() -> initial_write_peer(Parent) end),
+    Req = #{pid => Connection, streamid => 1, method => <<"GET">>,
+        headers => #{}, peer => {{127, 0, 0, 1}, 12345},
+        qs => <<"sub=" ?NERD2NERD_QS>>},
+    {Handler, HandlerMonitor} = spawn_monitor(fun() ->
+        {cowboy_loop, StreamReq, #{scope := Ref} = State, hibernate} =
+            spacepush_http_stream:init(Req, []),
+        receive
+            Down = {'DOWN', Ref, process, _, _} ->
+                {stop, _, _} = spacepush_http_stream:info(Down, StreamReq, State)
+        after 1000 -> error(stream_lost_its_scope_monitor)
+        end
+    end),
+    try
+        receive {retry_waiting, Handler} -> ok after 2000 -> error(no_retry) end,
+        OldScope = whereis(spacepush_stream),
+        exit(OldScope, kill),
+        wait_until(fun() ->
+            case whereis(spacepush_stream) of
+                undefined -> false;
+                Pid -> Pid =/= OldScope
+            end
+        end),
+        Connection ! release,
+        receive
+            {'DOWN', HandlerMonitor, process, Handler, Reason} -> ?assertEqual(normal, Reason)
+        after 2000 -> error(stream_did_not_close)
+        end,
+        wait_for_stream_count(0)
+    after
+        exit(Handler, kill),
+        exit(Connection, kill),
+        erlang:demonitor(HandlerMonitor, [flush])
+    end.
+
+initial_write_peer(Parent) ->
+    receive
+        {{_, _}, {data, Handler, nofin, _}} ->
+            Parent ! {retry_waiting, Handler},
+            receive release -> Handler ! {data_ack, self()} end,
+            final_write_peer();
+        _ -> initial_write_peer(Parent)
+    end.
+
+final_write_peer() ->
+    receive
+        {{_, _}, {data, Handler, fin, _}} -> Handler ! {data_ack, self()};
+        _ -> final_write_peer()
+    end.
 
 test_events_are_local({_Api, Port}) ->
     Socket = open(Port),
@@ -124,6 +200,25 @@ with_env(Key, Value, Fun) ->
     {ok, Previous} = application:get_env(spacepush, Key),
     application:set_env(spacepush, Key, Value),
     try Fun() after application:set_env(spacepush, Key, Previous) end.
+
+wait_for_stream_count(Count) ->
+    wait_until(fun() ->
+        try sys:get_state(spacepush_stream) of
+            #{subscriptions := Subscriptions} -> map_size(Subscriptions) =:= Count
+        catch exit:_ -> false end
+    end).
+
+wait_until(Predicate) ->
+    wait_until(Predicate, erlang:monotonic_time(millisecond) + 2000).
+
+wait_until(Predicate, Deadline) ->
+    case Predicate() of
+        true -> ok;
+        false ->
+            ?assert(erlang:monotonic_time(millisecond) < Deadline),
+            receive after 1 -> ok end,
+            wait_until(Predicate, Deadline)
+    end.
 
 open(Port) ->
     {ok, Socket} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}]),
