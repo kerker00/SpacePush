@@ -40,6 +40,44 @@ jobs:
       - name: Compile test profile
         run: env -u DEBUG rebar3 as test compile
       - name: Run EUnit regressions
-        run: env -u DEBUG rebar3 eunit
+        run: env -u DEBUG rebar3 eunit --cover
+      - name: Generate coverage report and application metrics
+        run: |
+          env -u DEBUG rebar3 cover --verbose --precision 1
+          escript .github/scripts/coverage.escript _build/test/cover/eunit.coverdata _build/test/lib/spacepush/ebin/spacepush.app _build/test/cover/metrics.json
+      - name: Validate canonical badge data without publishing
+        if: matrix.otp == '28.5.0.7'
+        run: python3 .github/scripts/publish_coverage.py _build/test/cover/metrics.json --dry-run
       - name: Verify dashboard calculations
         run: node --test test/dashboard.test.cjs
+      - name: Save coverage report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-otp-${{ matrix.otp }}
+          path: _build/test/cover/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-coverage:
+    name: Publish main coverage badge
+    needs: build-and-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Check out the tested main commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download canonical OTP 28 coverage
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage-otp-28.5.0.7
+          path: coverage
+      - name: Publish the measured coverage endpoint
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/publish_coverage.py coverage/metrics.json
