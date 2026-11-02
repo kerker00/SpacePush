@@ -4,7 +4,9 @@ Status (2026-11-02):
 - Server: S1–S6, S8 and O4 are done on this branch; S7 is reduced to counters.
   Admission is serialized in a volatile registry with an ETS topic index;
   total/client limits and registry restarts during setup have regressions.
-  O1–O3 (host setup) are still open.
+  O1 and O2 are done: a client stayed connected through the proxy for about an hour,
+  until the stream's end, with the heartbeat unbuffered. O3: the account's limit is
+  1024 soft and 4096 hard, and the deploy files now raise it and bound the streams.
 - SpaceStateKit: K0–K3 are done on `feat/linux-desktop-stream`. K0 showed that
   URLSession on Linux delivers events unbuffered. K4 (a release) is open.
 - SpaceStateCLI: L1, L2 and L4 are done on `feat/linux-desktop-stream`. L3 relies
