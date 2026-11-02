@@ -14,6 +14,8 @@ An Erlang/OTP application that:
 
 ## Architecture
 
+[`docs/architecture.drawio`](docs/architecture.drawio) shows the components, their files and the path of a confirmed state change. It also shows the planned Linux desktop stream, highlighted in green ([plan](docs/linux-desktop-stream-plan.md)). Open it with [diagrams.net](https://app.diagrams.net) or the draw.io desktop app.
+
 | Process | Role |
 | --- | --- |
 | `spacepush_directory` | The list of spaces and allowlist, refreshed hourly and saved to `data/directory.bin` |
@@ -23,6 +25,7 @@ An Erlang/OTP application that:
 | `spacepush_apns` | Sends due deliveries, at most 20 at a time, each with a 15 s deadline; selects ready environments before limiting and shares capacity fairly when both have work |
 | `spacepush_registry` | Device registrations in `data/registry.dets`, with an ETS topic index; renewals atomically replace the visible registration without a lookup gap |
 | `spacepush_ratelimit` | Requests per client and minute for the HTTP API |
+| `spacepush_stream` | Volatile stream registry with atomic total/client admission and an ETS topic index (last child); fed by the poller after the outbox commit |
 
 Confirmed changes first write a versioned intent beside the tracker (`tracker.bin.intent`). The outbox syncs all delivery rows before writing and syncing its commit marker; the tracker snapshot is then saved before the intent is removed. Startup completes pending outbox work before starting APNs and restores the intended tracker before polling. Replaying an applied commit does not requeue deliveries already completed by the sender. Backups must keep the tracker, any intent and the outbox together. Persistent formats carry a version; older registration records are migrated on start.
 
@@ -163,6 +166,54 @@ and restarting does not reset the deadline. A legitimate subscription with no
 accepted notification also expires; a later app launch may register it again
 subject to capacity. APNs acceptance frees its provisional slot.
 
+## Change stream
+
+Desktop clients that keep a connection open can receive the same confirmed
+changes as server-sent events, without APNs:
+
+    GET /v1/stream?sub=<endpoint>&sub=<endpoint>|<room>
+    Accept: text/event-stream
+
+Each `sub` is a directory endpoint, optionally followed by `|` and a room
+(default `space`); at most `stream_max_topics` (50) per stream. Invalid input
+answers `400`, an unknown endpoint `404`, too many requests or more than
+`stream_max_per_client` (10) open streams from one client `429`, and an
+unloaded directory, restarting stream registry or full total stream budget
+`503`, all before the stream starts. Reservations include streams still being
+opened and are released when their handler exits. The stream sends:
+
+```
+retry: 10000
+
+event: change
+data: {"endpoint":"…","room":"space","name":"…","from":"closed","to":"open","at":1793440800}
+
+: ping
+```
+
+`name` is the same cleaned title the APNs alert shows. A `: ping` comment
+follows every `stream_heartbeat_ms` (25 s), so proxies keep the connection.
+The stream ends after `stream_max_lifetime_ms` (1 h) and when its registry
+restarts, including a restart during connection setup; clients reconnect with
+backoff. Nothing is replayed: after every
+(re)connect a client reads the current state through `/v1/spaces` or
+`/v1/mainframe/rooms`, which apply `max_data_age_s`.
+
+Events are sent only after the change has been committed to the APNs outbox,
+and the stream code neither reads nor writes the tracker, outbox or registry.
+The stream listener is separate from the API listener (`stream_http_port`), so
+open streams cannot use up the API's connections. It is disabled while
+`stream_http_port` is unset.
+
+A server-local test event, separate from `/v1/test` and without APNs:
+
+```sh
+curl --request POST 'http://127.0.0.1:<stream port>/v1/stream/test?endpoint=<url-encoded endpoint>'
+```
+
+It answers `202` with the number of open streams that received it. Like
+`/v1/test`, it is only served to loopback requests without forwarding headers.
+
 ## Test notifications
 
 Broadcast a fixed, clearly marked test alert to all active subscribers of one
@@ -263,7 +314,8 @@ Spaces run their own endpoints, and clients are anonymous, so SpacePush treats b
 - Polling and read requests share each space's fetch: attempts start at least a minute apart by default, and failures back off up to 30 minutes. At most 20 combined fetches run at a time. Reads can keep serving the last good response with its original fetch timestamp while refresh is deferred. The poller observes each successful response once, including results obtained by readers; repeated cached responses, responses beyond `max_data_age_s` and failed refreshes do not confirm state changes.
 - Notification titles are stripped of control and direction characters and shortened to 64 characters. Notifications for one space or room are at least five minutes apart; changes in between are merged into the latest.
 - Passed-through documents are served with `X-Content-Type-Options: nosniff`.
-- Behind the proxy, the rate limit uses the last `X-Forwarded-For` entry, the one the proxy added. The listener accepts at most 1024 connections.
+- Behind the proxy, the rate limit uses the last `X-Forwarded-For` entry, the one the proxy added. The API transport uses Ranch's soft `http_max_connections` limit (1024 per connection supervisor by default); inspect the running listener topology when budgeting sockets.
+- The change stream is public and unauthenticated: it carries only the public opening states. It has its own listener with `stream_max_connections`, at most `stream_max_per_client` streams per client and a bounded lifetime.
 
 Clients remain anonymous; APNs acceptance does not establish installation
 authenticity. Space endpoints that offer plain HTTP lack authenticated transport.
@@ -311,6 +363,9 @@ All settings live in the `spacepush` application environment (see `src/spacepush
 | `apns_max_in_flight`, `apns_request_timeout_ms` | Concurrent APNs requests and their deadline |
 | `registry_file`, `outbox_file`, `tracker_file`, `directory_file`, `stats_file` | Where state is kept on disk |
 | `state_max_bytes` | Maximum serialized snapshot or recovery intent size; default 67108864 bytes, also checked for expanded compressed ETF |
+| `stream_http_ip`, `stream_http_port` | Listener for `/v1/stream`; disabled while the port is `undefined` (default) |
+| `stream_max_connections`, `stream_max_per_client`, `stream_max_topics` | Hard admission limits for streams in total (10000) and per client (10), and subscriptions per stream (50); the transport additionally has a soft socket limit |
+| `stream_heartbeat_ms`, `stream_max_lifetime_ms`, `stream_retry_ms` | Heartbeat interval (25000), stream lifetime (3600000) and the reconnect hint sent to clients (10000) |
 
 ## Build and regression checks
 
@@ -459,28 +514,84 @@ It prints the IPv4 and IPv6 address. At the DNS provider (Namecheap: Domain List
 
 Port 52184 stays closed to the outside; Uberspace's proxy forwards HTTPS on 443 to it. Do not open it with `uberspace port add`. The certificate is issued automatically.
 
+Optional, for the change stream: set `stream_http_ip` to `{0, 0, 0, 0}` and
+`stream_http_port` (for example `52185`) in `~/spacepush/sys.config`, restart,
+and route the path to it:
+
+    uberspace web backend set push.grafixmafia.net/v1/stream --http --port 52185
+    curl -sSN --max-time 660 'https://push.grafixmafia.net/v1/stream?sub=https%3A%2F%2Fapi.nerd2nerd.org%2Fstatus.json'
+
+The `curl` must print `retry: 10000` at once and a `: ping` about every 25
+seconds, unbuffered for more than ten minutes. Curl exit code 28 at the chosen
+660-second limit is expected; an earlier disconnect must be investigated.
+If output arrives only in bursts, the proxy buffers streams: leave the stream
+disabled (unset the port and remove the path backend) until the route works.
+Check the running service's file-descriptor limit and current Ranch listener
+topology, allowing headroom for API traffic, in-progress/rejected connections,
+outbound sockets and data files. Ranch's transport limit is soft and applies
+per connection supervisor; the stream listener uses one, and the volatile
+registry independently enforces the total stream admission limit. Shell
+`ulimit -n` alone does not prove the running service has the same limit.
+
 ### Updating to a new release
 
-Build next to the running release, then swap; the interruption is a few seconds:
+Build the reviewed release tag next to the running release. Run the following
+in a dedicated shell, replacing `v2.2.0` with the tag being deployed. Check that
+the external configuration's persistent file paths are all under
+`~/spacepush/data`; include any overridden paths in the stopped backup before
+continuing. Keep the stream disabled for the initial API smoke test.
 
-    cd ~/spacepush/src && git pull
+    set -e
+    umask 077
+    cd ~/spacepush/src
+    test -z "$(git status --porcelain)"
+    git fetch origin --tags
+    git switch --detach v2.2.0
     rebar3 as prod release
-    rm -rf ~/spacepush/release.new && cp -a _build/prod/rel/spacepush ~/spacepush/release.new
+    update_id="$(date -u +%Y%m%dT%H%M%SZ)"
+    staged_release="$HOME/spacepush/release-$update_id"
+    backup_dir="$HOME/spacepush/backups/$update_id"
+    test ! -e "$staged_release"
+    test ! -e "$backup_dir"
+    cp -a _build/prod/rel/spacepush "$staged_release"
+    git rev-parse HEAD > "$staged_release/SOURCE_COMMIT"
+    mkdir -p "$backup_dir"
+    chmod 700 "$backup_dir"
     supervisorctl stop spacepush
-    rm -rf ~/spacepush/release.old
-    mv ~/spacepush/release ~/spacepush/release.old && mv ~/spacepush/release.new ~/spacepush/release
+    cp -a "$HOME/spacepush/data" "$HOME/spacepush/sys.config" "$HOME/spacepush/vm.args" "$backup_dir/"
+    mv "$HOME/spacepush/release" "$backup_dir/release"
+    mv "$staged_release" "$HOME/spacepush/release"
     supervisorctl start spacepush
-    sleep 20 && supervisorctl status spacepush
-    curl -s https://push.grafixmafia.net/health; echo
-    curl -s https://push.grafixmafia.net/v1/directory | head -c 200; echo
+    sleep 20
+    supervisorctl status spacepush
+    curl --fail --silent --show-error https://push.grafixmafia.net/health
+    curl --fail --silent --show-error https://push.grafixmafia.net/v1/directory -o /dev/null
 
-Data, configuration and key are untouched. If the new configuration template gained keys you need (see `src/spacepush.app.src` and the release notes), add them to `~/spacepush/sys.config` before starting; keys missing there fall back to the defaults.
+The stopped backup keeps tracker, any recovery intent, outbox, registry,
+directory and statistics together. Keep it and the old release until the
+upgrade is accepted. If a command fails after the stop, inspect the stopped
+service and available release before continuing; do not discard backup files.
+If the new configuration template gained keys you need (see
+`src/spacepush.app.src` and the release notes), add them to the external
+`~/spacepush/sys.config` before starting; missing keys use application defaults.
+Health is liveness only: check polling freshness and queue progress separately,
+then enable and test SSE through the proxy as above. Real APNs tests need
+chosen recipients and an agreed test window.
 
-To roll back, swap back to the previous release:
+To roll back in that same dedicated shell, keep the failed release and restore
+the saved release and configuration:
 
     supervisorctl stop spacepush
-    mv ~/spacepush/release ~/spacepush/release.broken && mv ~/spacepush/release.old ~/spacepush/release
+    mv "$HOME/spacepush/release" "$HOME/spacepush/release.failed-$update_id"
+    cp -a "$backup_dir/release" "$HOME/spacepush/release"
+    cp -a "$backup_dir/sys.config" "$backup_dir/vm.args" "$HOME/spacepush/"
     supervisorctl start spacepush
+
+Remove a newly added SSE path backend when disabling the stream. Version 2.2.0
+keeps the 2.1.0 persistent formats; restoring old data is not normally required
+for that rollback. If data restoration is needed, stop the service and restore
+the entire consistent backup set, never an individual tracker/intent/outbox
+file. Restoring older data can retry deliveries already accepted by APNs.
 
 ### Updating Erlang or OpenSSL
 
