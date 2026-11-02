@@ -1,6 +1,13 @@
 # SpacePush
 
-Sends push notifications to the [SpaceState](https://github.com/kerker00/SpaceState) apps when a hackerspace opens or closes, and serves the apps the spaces' current state, so by default each space is asked at most once a minute however many people use the apps.
+[![CI](https://github.com/kerker00/SpacePush/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/kerker00/SpacePush/actions/workflows/ci.yml)
+[![EUnit line coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fkerker00%2FSpacePush%2Fbadges%2Fcoverage.json)](https://github.com/kerker00/SpacePush/actions/workflows/ci.yml?query=branch%3Amain)
+[![Erlang/OTP 28 and 29](https://img.shields.io/badge/Erlang%2FOTP-28%20%7C%2029-A90533?logo=erlang&logoColor=white)](#continuous-integration)
+[![Latest release](https://img.shields.io/github/v/release/kerker00/SpacePush)](https://github.com/kerker00/SpacePush/releases/latest)
+[![MIT license](https://img.shields.io/github/license/kerker00/SpacePush)](LICENSE)
+[![API status](https://img.shields.io/website?url=https%3A%2F%2Fpush.grafixmafia.net%2Fhealth&label=API&up_message=online&down_message=offline)](https://push.grafixmafia.net/health)
+
+The Erlang/OTP backend for [SpaceState](https://space.grafixmafia.net/): shared, cached [SpaceAPI](https://spaceapi.io) data and confirmed opening-state changes for hackerspaces. Apple clients receive APNs notifications; Linux desktop clients can subscribe to server-sent events (SSE). The HTTP read API shares upstream fetches across clients, so by default each space is asked at most once a minute however many people use the apps.
 
 An Erlang/OTP application that:
 
@@ -10,11 +17,12 @@ An Erlang/OTP application that:
 - also fetches Mainframe Oldenburg's `openState` endpoint for its rooms (Radstelle, 3D Lab, Machining) and finer states (members only, closing, …),
 - confirms a new state only when fresh data still shows it two minutes later, so short flaps send nothing,
 - queues one delivery per device and topic in a persistent outbox, where a newer state replaces an unsent older one,
-- sends them over APNs HTTP/2 with token-based authentication, retrying temporary failures with backoff for up to an hour.
+- sends them over APNs HTTP/2 with token-based authentication, retrying temporary failures with backoff for up to an hour,
+- streams the same confirmed changes to connected desktop clients through an optional, bounded SSE listener.
 
 ## Architecture
 
-[`docs/architecture.drawio`](docs/architecture.drawio) shows the components, their files and the path of a confirmed state change. It also shows the planned Linux desktop stream, highlighted in green ([plan](docs/linux-desktop-stream-plan.md)). Open it with [diagrams.net](https://app.diagrams.net) or the draw.io desktop app.
+[`docs/architecture.drawio`](docs/architecture.drawio) shows the components, their files and the path of a confirmed state change, including the Linux desktop stream highlighted in green ([design](docs/linux-desktop-stream-plan.md)). Open it with [diagrams.net](https://app.diagrams.net) or the draw.io desktop app.
 
 | Process | Role |
 | --- | --- |
@@ -88,7 +96,11 @@ require its pre-upgrade backup when downgrading.
 
 ## Continuous integration
 
-GitHub CI compiles production code and the test profile and runs the full EUnit suite on Ubuntu 24.04 with patched OTP 28.5.0.7 and 29.1.1 and rebar3 3.27.3. The checkout/setup actions are pinned to verified release commits, use read-only repository permissions and do not persist checkout credentials.
+GitHub CI compiles production code and the test profile and runs the full EUnit suite with coverage on Ubuntu 24.04 with patched OTP 28.5.0.7 and 29.1.1 and rebar3 3.27.3. Test jobs have read-only repository permissions; actions are pinned to verified release commits and checkout credentials are not persisted.
+
+Each runner uploads an HTML coverage report and machine-readable application-line counts as a `coverage-otp-…` artifact, retained for 14 days. The coverage badge uses the OTP 28 result from the latest successful main CI run; the OTP 29 report remains available for comparison. A separate publisher runs only after successful main pushes, validates the source commit and totals, and updates `coverage.json` on the data-only `badges` branch. Only that publisher has repository write permission; no coverage-service account or extra secret is required.
+
+Coverage includes all SpacePush application modules and excludes dependencies and test modules. It measures lines executed in the instrumented EUnit VM; separate crash-test VMs are not merged into that measurement. The API badge checks public `/health` availability through Shields.io and may be cached; it does not measure polling freshness or notification delivery.
 
 Pull requests to `main` and pushes to `main` run the matrix. Draft PRs skip jobs; marking a draft ready triggers them. The tests use mocked responses, temporary files, local loopback HTTP/2 peers and disposable crash-test VMs, without production configuration or genuine pushes. CI validates its runner's source and runtime, not the deployed host's version, proxy settings or release.
 
@@ -374,7 +386,8 @@ For local verification, compile production code and the test profile, then run t
 ```sh
 env -u DEBUG rebar3 compile
 env -u DEBUG rebar3 as test compile
-env -u DEBUG rebar3 eunit
+env -u DEBUG rebar3 eunit --cover
+env -u DEBUG rebar3 cover --verbose --precision 1
 node --test test/dashboard.test.cjs
 ```
 
